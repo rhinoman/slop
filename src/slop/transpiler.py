@@ -35,6 +35,7 @@ class Transpiler:
         self.ffi_includes: List[str] = []  # FFI headers to include
         self.output: List[str] = []
         self.indent = 0
+        self.pointer_vars: Set[str] = set()  # Track variables that are pointers
 
         # Built-in type mappings
         self.builtin_types = {
@@ -64,6 +65,26 @@ class Transpiler:
             self.output.append("    " * self.indent + line)
         else:
             self.output.append("")
+
+    def _is_pointer_type(self, type_expr: SExpr) -> bool:
+        """Check if a type expression is a pointer type"""
+        if isinstance(type_expr, SList) and len(type_expr) >= 1:
+            head = type_expr[0]
+            if isinstance(head, Symbol) and head.name == 'Ptr':
+                return True
+        return False
+
+    def _is_pointer_expr(self, expr: SExpr) -> bool:
+        """Check if an expression is known to return a pointer"""
+        if isinstance(expr, Symbol):
+            return expr.name in self.pointer_vars
+        if isinstance(expr, SList) and len(expr) >= 1:
+            head = expr[0]
+            if isinstance(head, Symbol):
+                # arena-alloc always returns a pointer
+                if head.name == 'arena-alloc':
+                    return True
+        return False
 
     def transpile(self, ast: List[SExpr]) -> str:
         """Transpile SLOP AST to C code"""
@@ -409,6 +430,17 @@ class Transpiler:
         name = self.to_c_name(form[1].name)
         params = form[2] if len(form) > 2 else SList([])
 
+        # Clear pointer tracking for this function scope
+        self.pointer_vars = set()
+
+        # Register pointer parameters
+        for p in params:
+            if isinstance(p, SList) and len(p) >= 2:
+                pname = p[0].name
+                ptype = p[1]
+                if self._is_pointer_type(ptype):
+                    self.pointer_vars.add(pname)
+
         # Extract annotations and body
         annotations = {}
         body_exprs = []
@@ -518,8 +550,15 @@ class Transpiler:
 
         # Emit bindings
         for binding in bindings:
-            var_name = self.to_c_name(binding[0].name)
-            var_expr = self.transpile_expr(binding[1])
+            raw_name = binding[0].name
+            var_name = self.to_c_name(raw_name)
+            init_expr = binding[1]
+
+            # Register pointer variables
+            if self._is_pointer_expr(init_expr):
+                self.pointer_vars.add(raw_name)
+
+            var_expr = self.transpile_expr(init_expr)
             # Type inference would go here; for now use auto
             self.emit(f"__auto_type {var_name} = {var_expr};")
 
@@ -837,10 +876,14 @@ class Transpiler:
                     else_expr = self.transpile_expr(expr[3]) if len(expr) > 3 else "0"
                     return f"(({cond}) ? ({then_expr}) : ({else_expr}))"
 
-                # Field access (value type with .)
+                # Field access
                 if op == '.':
-                    obj = self.transpile_expr(expr[1])
+                    obj_expr = expr[1]
                     field = self.to_c_name(expr[2].name)
+                    obj = self.transpile_expr(obj_expr)
+                    # Use -> for pointer types, . for value types
+                    if self._is_pointer_expr(obj_expr):
+                        return f"{obj}->{field}"
                     return f"({obj}).{field}"
 
                 # Index access

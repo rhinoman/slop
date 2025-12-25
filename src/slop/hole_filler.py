@@ -7,7 +7,7 @@ with automatic escalation on verification failure.
 
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Any
-from slop.parser import SExpr, SList, Symbol, String, parse, find_holes, is_form
+from slop.parser import SExpr, SList, Symbol, String, parse, find_holes, is_form, pretty_print
 from slop.providers import Tier, ModelConfig, Provider, MockProvider, create_default_configs
 
 
@@ -233,6 +233,43 @@ class HoleFiller:
                 if must_normalized not in expr_normalized:
                     return False
         return True
+
+
+def replace_hole_in_expr(expr: SExpr, hole: SList, replacement: SExpr) -> SExpr:
+    """Replace a specific hole in an expression with its filled value"""
+    if expr is hole:
+        return replacement
+
+    if isinstance(expr, SList):
+        new_items = []
+        for item in expr.items:
+            new_items.append(replace_hole_in_expr(item, hole, replacement))
+        return SList(new_items)
+
+    return expr
+
+
+def replace_holes_in_ast(ast: List[SExpr], replacements: Dict[int, SExpr]) -> List[SExpr]:
+    """Replace holes in AST using id-based replacement map"""
+    result = []
+    for form in ast:
+        new_form = _replace_holes_recursive(form, replacements)
+        result.append(new_form)
+    return result
+
+
+def _replace_holes_recursive(expr: SExpr, replacements: Dict[int, SExpr]) -> SExpr:
+    """Recursively replace holes identified by their id()"""
+    if id(expr) in replacements:
+        return replacements[id(expr)]
+
+    if isinstance(expr, SList):
+        new_items = []
+        for item in expr.items:
+            new_items.append(_replace_holes_recursive(item, replacements))
+        return SList(new_items)
+
+    return expr
 
 
 if __name__ == '__main__':

@@ -127,6 +127,10 @@ class MockProvider(Provider):
             return "(crypto-hash-password (. input password))"
         elif "adult" in prompt_lower:
             return "(>= (. user age) 18)"
+        elif "add" in prompt_lower and "x" in prompt_lower and "y" in prompt_lower:
+            return "(+ x y)"
+        elif "sum" in prompt_lower:
+            return "(+ x y)"
         else:
             return "(ok nil)"
 

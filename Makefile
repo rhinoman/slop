@@ -1,19 +1,17 @@
 # SLOP Project Makefile
-# 
+#
 # Usage:
 #   make parse FILE=examples/rate-limiter.slop
 #   make transpile FILE=examples/rate-limiter.slop
 #   make build FILE=examples/rate-limiter.slop
 
-PYTHON ?= python3
+PYTHON ?= .venv/bin/python
 CC ?= cc
 CFLAGS ?= -O2 -Wall -Wextra
 DEBUG_CFLAGS ?= -g -DSLOP_DEBUG -Wall -Wextra
-
-TOOLING = tooling/src
 RUNTIME = runtime
 
-.PHONY: help parse transpile check fill build clean test
+.PHONY: help parse transpile check fill build clean test install
 
 help:
 	@echo "SLOP Build System"
@@ -28,28 +26,32 @@ help:
 	@echo "  fill       Fill holes with LLM"
 	@echo "  build      Full pipeline to binary"
 	@echo "  clean      Remove build artifacts"
-	@echo "  test       Run tests"
+	@echo "  test       Run pytest test suite"
+	@echo "  install    Install package in dev mode"
+
+install:
+	uv pip install -e ".[dev]"
 
 parse:
-	$(PYTHON) $(TOOLING)/slop_cli.py parse $(FILE)
+	$(PYTHON) -m slop.cli parse $(FILE)
 
 holes:
-	$(PYTHON) $(TOOLING)/slop_cli.py parse $(FILE) --holes
+	$(PYTHON) -m slop.cli parse $(FILE) --holes
 
 transpile:
-	$(PYTHON) $(TOOLING)/slop_cli.py transpile $(FILE) -o $(basename $(FILE)).c
+	$(PYTHON) -m slop.cli transpile $(FILE) -o $(basename $(FILE)).c
 
 check:
-	$(PYTHON) $(TOOLING)/slop_cli.py check $(FILE)
+	$(PYTHON) -m slop.cli check $(FILE)
 
 fill:
-	$(PYTHON) $(TOOLING)/slop_cli.py fill $(FILE) -o $(FILE).filled
+	$(PYTHON) -m slop.cli fill $(FILE) -o $(FILE).filled
 
 build:
-	$(PYTHON) $(TOOLING)/slop_cli.py build $(FILE)
+	$(PYTHON) -m slop.cli build $(FILE)
 
 build-debug:
-	$(PYTHON) $(TOOLING)/slop_cli.py build $(FILE) --debug
+	$(PYTHON) -m slop.cli build $(FILE) --debug
 
 # Compile C directly
 %.o: %.c
@@ -60,23 +62,20 @@ build-debug:
 
 clean:
 	rm -f *.o *.c.filled build/*
+	rm -rf __pycache__ .pytest_cache
+	find . -name "*.pyc" -delete
 
 test:
-	@echo "Running parser tests..."
-	$(PYTHON) $(TOOLING)/parser.py
-	@echo ""
-	@echo "Running transpiler tests..."
-	$(PYTHON) $(TOOLING)/transpiler.py
-	@echo ""
-	@echo "Running schema converter tests..."
-	$(PYTHON) $(TOOLING)/schema_converter.py
-	@echo ""
-	@echo "All tests passed!"
+	$(PYTHON) -m pytest tests/ -v
+
+test-quick:
+	$(PYTHON) -m pytest tests/ -q
 
 # Example targets
-example-rate-limiter:
-	$(PYTHON) $(TOOLING)/slop_cli.py transpile examples/rate-limiter.slop -o build/rate_limiter.c
-	$(CC) $(CFLAGS) -I$(RUNTIME) -DRATE_LIMITER_TEST build/rate_limiter.c -o build/rate_limiter
+example-hello:
+	$(PYTHON) -m slop.cli build examples/hello.slop -o build/hello
+	./build/hello
 
-example-run: example-rate-limiter
-	./build/rate_limiter
+example-rate-limiter:
+	$(PYTHON) -m slop.cli transpile examples/rate-limiter.slop -o build/rate_limiter.c
+	$(CC) $(CFLAGS) -Isrc/slop/runtime -DRATE_LIMITER_TEST build/rate_limiter.c -o build/rate_limiter

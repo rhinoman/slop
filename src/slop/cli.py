@@ -15,9 +15,9 @@ import sys
 import os
 from pathlib import Path
 
-from slop.parser import parse, parse_file, pretty_print, find_holes, is_form
+from slop.parser import parse, parse_file, pretty_print, find_holes, is_form, SList
 from slop.transpiler import Transpiler, transpile
-from slop.hole_filler import HoleFiller, extract_hole, classify_tier
+from slop.hole_filler import HoleFiller, extract_hole, classify_tier, replace_holes_in_ast
 from slop.providers import (
     MockProvider, create_default_configs, load_config, create_from_config
 )
@@ -81,16 +81,21 @@ def cmd_fill(args):
     try:
         ast = parse_file(args.input)
 
-        # Count holes
-        total_holes = sum(len(find_holes(form)) for form in ast)
-        if total_holes == 0:
+        # Collect all holes with their parent forms for context
+        all_holes = []
+        for form in ast:
+            holes = find_holes(form)
+            for h in holes:
+                all_holes.append((form, h))
+
+        if not all_holes:
             print("No holes to fill")
             if args.output:
                 with open(args.input) as f:
                     Path(args.output).write_text(f.read())
             return 0
 
-        print(f"Found {total_holes} holes")
+        print(f"Found {len(all_holes)} holes")
 
         # Create filler from config or use mock
         if args.config:
@@ -110,23 +115,80 @@ def cmd_fill(args):
         filler = HoleFiller(configs, provider)
         print("Filling holes...")
 
-        # For now, just report what would be filled
-        for form in ast:
-            holes = find_holes(form)
-            for h in holes:
-                info = extract_hole(h)
-                tier = classify_tier(info)
-                result = filler.fill(info, {})
-                status = "✓" if result.success else "✗"
-                print(f"  {status} {info.prompt[:50]}... ({tier.name})")
+        # Fill holes and track replacements
+        replacements = {}  # id(hole) -> filled_expr
+        success_count = 0
+        fail_count = 0
 
-        return 0
+        for form, hole in all_holes:
+            info = extract_hole(hole)
+            tier = classify_tier(info)
+
+            # Build context from parent function
+            context = _extract_context(form)
+
+            result = filler.fill(info, context)
+            if result.success and result.expression:
+                replacements[id(hole)] = result.expression
+                success_count += 1
+                status = "filled"
+                model_info = f" [{result.model_used}]" if result.model_used else ""
+                print(f"  + {info.prompt[:50]}... ({tier.name}){model_info}")
+            else:
+                fail_count += 1
+                error_info = f": {result.error}" if result.error else ""
+                print(f"  x {info.prompt[:50]}... ({tier.name}){error_info}")
+
+        # Replace holes in AST
+        if replacements:
+            filled_ast = replace_holes_in_ast(ast, replacements)
+        else:
+            filled_ast = ast
+
+        # Generate output
+        output_lines = []
+        for form in filled_ast:
+            output_lines.append(pretty_print(form))
+            output_lines.append("")
+
+        output_text = '\n'.join(output_lines)
+
+        if args.output:
+            Path(args.output).write_text(output_text)
+            print(f"\nWrote {args.output}")
+        else:
+            print("\n--- Filled source ---")
+            print(output_text)
+
+        print(f"\n{success_count} filled, {fail_count} failed")
+        return 0 if fail_count == 0 else 1
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         if args.verbose:
             import traceback
             traceback.print_exc()
         return 1
+
+
+def _extract_context(form: SList) -> dict:
+    """Extract context from a function form for hole filling"""
+    context = {}
+
+    if is_form(form, 'fn') or is_form(form, 'impl'):
+        if len(form) > 1:
+            context['fn_name'] = str(form[1])
+        if len(form) > 2:
+            context['params'] = str(form[2])
+
+        for item in form.items[3:]:
+            if is_form(item, '@intent') and len(item) > 1:
+                context['intent'] = item[1].value if hasattr(item[1], 'value') else str(item[1])
+            elif is_form(item, '@spec') and len(item) > 1:
+                spec = item[1]
+                if hasattr(spec, 'items') and len(spec.items) >= 3:
+                    context['return_type'] = str(spec.items[-1])
+
+    return context
 
 
 def cmd_check(args):
