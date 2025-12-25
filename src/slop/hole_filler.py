@@ -234,6 +234,108 @@ class HoleFiller:
                     return False
         return True
 
+    def fill_batch(
+        self,
+        holes: List[tuple],  # List of (Hole, context_dict) tuples
+        tier: Tier
+    ) -> List[FillResult]:
+        """Fill multiple holes in a single interactive session.
+
+        This is more efficient for interactive providers since it
+        batches all holes into one prompt, minimizing context switches.
+        """
+        if not holes:
+            return []
+
+        config = self.configs.get(tier)
+        if not config:
+            return [FillResult(success=False, error="No config for tier") for _ in holes]
+
+        # Build combined prompt
+        combined = self._build_batch_prompt(holes)
+
+        try:
+            response = self.provider.complete(combined, config)
+            return self._parse_batch_response(response, holes)
+        except Exception as e:
+            return [FillResult(success=False, error=str(e)) for _ in holes]
+
+    def _build_batch_prompt(self, holes: List[tuple]) -> str:
+        """Build a combined prompt for multiple holes"""
+        sections = [
+            "You are filling multiple typed holes in SLOP code.",
+            "SLOP uses S-expression syntax (like Lisp).",
+            "",
+            "For each hole, provide ONLY the expression with no explanation.",
+            "Use the [HOLE N] format for each response.",
+            "",
+        ]
+
+        for i, (hole, context) in enumerate(holes, 1):
+            sections.append(f"## Hole {i}: {context.get('fn_name', 'unknown')}")
+            sections.append(f"Type: {hole.type_expr}")
+            sections.append(f"Intent: {hole.prompt}")
+            if context.get('params'):
+                sections.append(f"Parameters: {context.get('params')}")
+            if hole.must_use:
+                sections.append(f"Must use: {', '.join(hole.must_use)}")
+            sections.append("")
+
+        sections.append("## Response Format")
+        sections.append("```")
+        for i in range(1, len(holes) + 1):
+            sections.append(f"[HOLE {i}]")
+            sections.append("<s-expression>")
+        sections.append("```")
+
+        return '\n'.join(sections)
+
+    def _parse_batch_response(
+        self,
+        response: str,
+        holes: List[tuple]
+    ) -> List[FillResult]:
+        """Parse batch response into individual FillResults"""
+        results = []
+
+        # Strip code block markers if present
+        response = response.strip()
+        if response.startswith('```'):
+            lines = response.split('\n')
+            response = '\n'.join(lines[1:-1] if lines[-1].strip() == '```' else lines[1:])
+
+        # Split by [HOLE N] markers
+        import re
+        parts = re.split(r'\[HOLE\s+\d+\]', response)
+        # First part is usually empty or preamble
+        parts = [p.strip() for p in parts[1:] if p.strip()]
+
+        for i, (hole, context) in enumerate(holes):
+            if i < len(parts):
+                expr_str = parts[i].strip()
+                expr = self._parse_response(expr_str)
+                if expr and self._validate(expr, hole):
+                    results.append(FillResult(
+                        success=True,
+                        expression=expr,
+                        model_used=self.configs.get(Tier.TIER_3, ModelConfig('', '')).model,
+                        attempts=1
+                    ))
+                else:
+                    results.append(FillResult(
+                        success=False,
+                        error=f"Failed to parse or validate: {expr_str[:50]}...",
+                        attempts=1
+                    ))
+            else:
+                results.append(FillResult(
+                    success=False,
+                    error="No response for this hole",
+                    attempts=1
+                ))
+
+        return results
+
 
 def replace_hole_in_expr(expr: SExpr, hole: SList, replacement: SExpr) -> SExpr:
     """Replace a specific hole in an expression with its filled value"""

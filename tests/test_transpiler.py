@@ -21,7 +21,8 @@ class TestTypeDefinitions:
     def test_record_type(self):
         source = "(type User (record (name String) (age Int)))"
         c_code = transpile(source)
-        assert "typedef struct" in c_code
+        # Records use struct Name { ... } syntax (with forward typedef in modules)
+        assert "struct User" in c_code
         assert "User" in c_code
         assert "name" in c_code
         assert "age" in c_code

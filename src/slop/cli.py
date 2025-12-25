@@ -19,7 +19,7 @@ from slop.parser import parse, parse_file, pretty_print, find_holes, is_form, SL
 from slop.transpiler import Transpiler, transpile
 from slop.hole_filler import HoleFiller, extract_hole, classify_tier, replace_holes_in_ast
 from slop.providers import (
-    MockProvider, create_default_configs, load_config, create_from_config
+    MockProvider, create_default_configs, load_config, create_from_config, Tier
 )
 from slop.type_checker import TypeChecker, check_file
 
@@ -120,24 +120,81 @@ def cmd_fill(args):
         success_count = 0
         fail_count = 0
 
-        for form, hole in all_holes:
-            info = extract_hole(hole)
-            tier = classify_tier(info)
+        # Check if batch mode should be used
+        batch_mode = getattr(args, 'batch_interactive', False)
 
-            # Build context from parent function
-            context = _extract_context(form)
+        if batch_mode and hasattr(provider, 'is_interactive'):
+            # Group holes by tier for batch processing
+            tier_groups = {}  # tier -> [(form, hole, info, context), ...]
+            for form, hole in all_holes:
+                info = extract_hole(hole)
+                tier = classify_tier(info)
+                context = _extract_context(form)
+                if tier not in tier_groups:
+                    tier_groups[tier] = []
+                tier_groups[tier].append((form, hole, info, context))
 
-            result = filler.fill(info, context)
-            if result.success and result.expression:
-                replacements[id(hole)] = result.expression
-                success_count += 1
-                status = "filled"
-                model_info = f" [{result.model_used}]" if result.model_used else ""
-                print(f"  + {info.prompt[:50]}... ({tier.name}){model_info}")
-            else:
-                fail_count += 1
-                error_info = f": {result.error}" if result.error else ""
-                print(f"  x {info.prompt[:50]}... ({tier.name}){error_info}")
+            # Process each tier
+            for tier in sorted(tier_groups.keys(), key=lambda t: t.value):
+                group = tier_groups[tier]
+                tier_config = configs.get(tier)
+
+                # Check if this tier uses an interactive provider
+                is_interactive = (
+                    tier_config and
+                    hasattr(provider, 'is_interactive') and
+                    provider.is_interactive(tier_config.provider)
+                )
+
+                if is_interactive and len(group) > 1:
+                    # Batch fill for interactive providers
+                    print(f"\n{tier.name} ({len(group)} holes): Batching for interactive provider...")
+                    batch_data = [(info, context) for (form, hole, info, context) in group]
+                    results = filler.fill_batch(batch_data, tier)
+
+                    for i, (form, hole, info, context) in enumerate(group):
+                        result = results[i] if i < len(results) else None
+                        if result and result.success and result.expression:
+                            replacements[id(hole)] = result.expression
+                            success_count += 1
+                            print(f"  + {info.prompt[:50]}...")
+                        else:
+                            fail_count += 1
+                            error_info = f": {result.error}" if result and result.error else ""
+                            print(f"  x {info.prompt[:50]}...{error_info}")
+                else:
+                    # Individual fill for non-interactive or single holes
+                    print(f"\n{tier.name} ({len(group)} holes):")
+                    for form, hole, info, context in group:
+                        result = filler.fill(info, context)
+                        if result.success and result.expression:
+                            replacements[id(hole)] = result.expression
+                            success_count += 1
+                            model_info = f" [{result.model_used}]" if result.model_used else ""
+                            print(f"  + {info.prompt[:50]}...{model_info}")
+                        else:
+                            fail_count += 1
+                            error_info = f": {result.error}" if result.error else ""
+                            print(f"  x {info.prompt[:50]}...{error_info}")
+        else:
+            # Original sequential mode
+            for form, hole in all_holes:
+                info = extract_hole(hole)
+                tier = classify_tier(info)
+
+                # Build context from parent function
+                context = _extract_context(form)
+
+                result = filler.fill(info, context)
+                if result.success and result.expression:
+                    replacements[id(hole)] = result.expression
+                    success_count += 1
+                    model_info = f" [{result.model_used}]" if result.model_used else ""
+                    print(f"  + {info.prompt[:50]}... ({tier.name}){model_info}")
+                else:
+                    fail_count += 1
+                    error_info = f": {result.error}" if result.error else ""
+                    print(f"  x {info.prompt[:50]}... ({tier.name}){error_info}")
 
         # Replace holes in AST
         if replacements:
@@ -364,6 +421,8 @@ def main():
     p.add_argument('-o', '--output')
     p.add_argument('-c', '--config', help='Path to TOML config file')
     p.add_argument('-v', '--verbose', action='store_true')
+    p.add_argument('--batch-interactive', action='store_true',
+        help='Batch interactive provider holes into single sessions')
 
     # check
     p = subparsers.add_parser('check', help='Validate')

@@ -123,9 +123,10 @@ literal     = number | string | 'true | 'false | 'nil
   annotations*
   body)
 
-; Parameter modes
+; Parameter modes **[PLANNED]**
+; Note: Parameter modes are not yet implemented. All parameters are currently pass-by-value.
 (fn name ((in param Type)      ; Read-only (default) - pass by value or const pointer
-          (out param Type)     ; Write-only - pointer to uninitialized  
+          (out param Type)     ; Write-only - pointer to uninitialized
           (mut param Type))    ; Read-write - pointer to initialized
   ...)
 
@@ -192,17 +193,26 @@ identifier               ; Variable reference
 (name arg1 arg2...)              ; Application
 
 ; Data construction
-(array e1 e2...)                 ; Fixed array literal
-(list e1 e2...)                  ; Dynamic list
-(map (k1 v1) (k2 v2)...)         ; Map literal
-(record Type (f1 v1) (f2 v2)...) ; Struct construction
-(union Tag value)                ; Tagged union construction
+(array e1 e2...)                     ; Fixed array literal
+(list e1 e2...)                      ; Dynamic list
+(map (k1 v1) (k2 v2)...)             ; Map literal **[PLANNED]**
+(record-new Type (f1 v1) (f2 v2)...) ; Struct construction
+(union-new Type Tag value)           ; Tagged union construction
 
 ; Data access
-(. expr field)                   ; Field access: expr.field
+(. expr field)                   ; Field access (see semantics below)
 (@ expr index)                   ; Index access: expr[index]
 (put expr field value)           ; Functional update (returns new)
 (set! expr field value)          ; Mutation (modifies in place)
+
+; Field Access Semantics:
+; The transpiler automatically selects -> vs . based on pointer tracking:
+;   (. value-var field)   → value_var.field   (struct value)
+;   (. pointer-var field) → pointer_var->field (pointer to struct)
+;
+; Pointer types are detected from:
+;   - Function parameters declared as (Ptr T)
+;   - Variables assigned from arena-alloc
 
 ; Arithmetic
 (+ a b) (- a b) (* a b) (/ a b) (% a b)
@@ -263,11 +273,13 @@ literal                      ; Literal match
 
 ## 4. Module System
 
+> **Note**: Module exports are parsed but linking is not yet implemented. Imports are **[PLANNED]**.
+
 ```
 (module user-service
   (export (create 1) (find 1) (update 2) (delete 1))
-  (import core (arena-new 1) (arena-free 1))
-  (import strings (concat 2) (len 1))
+  (import core (arena-new 1) (arena-free 1))      ; [PLANNED]
+  (import strings (concat 2) (len 1))             ; [PLANNED]
   
   (type UserId (Int 1 ..))
   (type User (record
@@ -283,30 +295,32 @@ literal                      ; Literal match
     ...))
 ```
 
-## 5. Structure/Logic Separation
+## 5. Structure/Logic Separation **[PLANNED]**
+
+> **Note**: `structure`/`logic` blocks and `sig`/`impl` separation are planned features not yet implemented in the transpiler. Currently, use `fn` definitions directly.
 
 ```
 ; Structure block - deterministic generation
 (structure
   (module payment
     (export (process 1) (refund 1))
-    
+
     (type Payment (record ...))
     (type Receipt (record ...))
-    
-    (sig process ((arena Arena) (payment (Ptr Payment))) 
+
+    (sig process ((arena Arena) (payment (Ptr Payment)))
          (Result (Ptr Receipt) Error))
-    (sig refund ((arena Arena) (id PaymentId)) 
+    (sig refund ((arena Arena) (id PaymentId))
          (Result (Ptr Receipt) Error))))
 
-; Logic block - LLM generation  
+; Logic block - LLM generation
 (logic
   (impl process ((arena Arena) (payment (Ptr Payment)))
     (@intent "Process payment through gateway")
     (@pre (!= payment nil))
     (@pre (== (. payment status) 'pending))
     (@alloc arena)
-    
+
     ; Implementation with holes
     ...))
 ```
@@ -380,6 +394,20 @@ SLOP                    C
 (OwnPtr T)              T* (with cleanup)
 (Fn (A B) -> R)         R (*)(A, B)
 ```
+
+#### Range Type Optimization
+
+The transpiler automatically selects the smallest C integer type that fits the range:
+
+```
+(Int 0 .. 255)          → uint8_t
+(Int 0 .. 65535)        → uint16_t
+(Int -128 .. 127)       → int8_t
+(Int -32768 .. 32767)   → int16_t
+(Int 0 ..)              → int64_t (unbounded)
+```
+
+Range constructors (e.g., `TypeName_new(v)`) are generated with `SLOP_PRE` checks to validate bounds at runtime.
 
 ### 7.2 Contracts
 

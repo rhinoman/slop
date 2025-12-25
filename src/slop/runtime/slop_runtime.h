@@ -166,6 +166,45 @@ static inline slop_string slop_string_slice(slop_string s, size_t start, size_t 
     return (slop_string){end - start, s.data + start};
 }
 
+static inline size_t string_len(slop_string s) {
+    return s.len;
+}
+
+static inline int32_t string_char_at(slop_string s, size_t index) {
+    if (index >= s.len) return 0;
+    return (int32_t)(unsigned char)s.data[index];
+}
+
+static inline slop_string string_slice(slop_string s, size_t start, size_t end) {
+    return slop_string_slice(s, start, end);
+}
+
+static inline int64_t string_to_int(slop_string s) {
+    int64_t result = 0;
+    int negative = 0;
+    size_t i = 0;
+    if (s.len > 0 && s.data[0] == '-') {
+        negative = 1;
+        i = 1;
+    }
+    for (; i < s.len; i++) {
+        if (s.data[i] >= '0' && s.data[i] <= '9') {
+            result = result * 10 + (s.data[i] - '0');
+        }
+    }
+    return negative ? -result : result;
+}
+
+static inline slop_string int_to_string(slop_arena* arena, int64_t n) {
+    char buf[32];
+    int len = snprintf(buf, sizeof(buf), "%ld", (long)n);
+    return slop_string_new_len(arena, buf, len);
+}
+
+static inline slop_string string_concat(slop_arena* arena, slop_string a, slop_string b) {
+    return slop_string_concat(arena, a, b);
+}
+
 /* ============================================================
  * Bytes Type (mutable, length + capacity)
  * ============================================================ */

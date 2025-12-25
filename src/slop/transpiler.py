@@ -36,6 +36,8 @@ class Transpiler:
         self.output: List[str] = []
         self.indent = 0
         self.pointer_vars: Set[str] = set()  # Track variables that are pointers
+        self.record_fields: Dict[str, Dict[str, bool]] = {}  # type_name -> {field_name -> is_pointer}
+        self.func_returns_pointer: Dict[str, bool] = {}  # func_name -> returns_pointer
 
         # Built-in type mappings
         self.builtin_types = {
@@ -81,9 +83,24 @@ class Transpiler:
         if isinstance(expr, SList) and len(expr) >= 1:
             head = expr[0]
             if isinstance(head, Symbol):
+                op = head.name
                 # arena-alloc always returns a pointer
-                if head.name == 'arena-alloc':
+                if op == 'arena-alloc':
                     return True
+                # Field access: (. obj field) - check if field is a pointer type
+                if op == '.' and len(expr) >= 3:
+                    obj_expr = expr[1]
+                    field = expr[2]
+                    if isinstance(field, Symbol):
+                        field_name = field.name
+                        # Look up field type in known record types
+                        for type_name, fields in self.record_fields.items():
+                            if field_name in fields and fields[field_name]:
+                                return True
+                    return False
+                # Function call: check if function returns a pointer
+                if op in self.func_returns_pointer:
+                    return self.func_returns_pointer[op]
         return False
 
     def transpile(self, ast: List[SExpr]) -> str:
@@ -246,9 +263,26 @@ class Transpiler:
             elif is_form(item, 'fn'):
                 functions.append(item)
 
+        # Emit forward declarations for record types (needed for mutual references)
+        record_types = []
+        for t in types:
+            if len(t) > 2 and is_form(t[2], 'record'):
+                type_name = t[1].name
+                record_types.append(type_name)
+                self.emit(f"typedef struct {type_name} {type_name};")
+        if record_types:
+            self.emit("")
+
         # First pass: emit types
         for t in types:
             self.transpile_type(t)
+
+        # Pre-pass for functions: track which return pointers
+        for fn in functions:
+            raw_name = fn[1].name
+            ret_type_expr = self._get_return_type_expr(fn)
+            if ret_type_expr and self._is_pointer_type(ret_type_expr):
+                self.func_returns_pointer[raw_name] = True
 
         # Second pass: emit forward declarations for functions
         if functions:
@@ -285,6 +319,15 @@ class Transpiler:
                     return self.to_c_type(spec[-1])
         return 'void'
 
+    def _get_return_type_expr(self, form: SList) -> SExpr:
+        """Extract return type expression from function form (for pointer detection)"""
+        for item in form.items[3:]:
+            if is_form(item, '@spec'):
+                spec = item[1] if len(item) > 1 else None
+                if spec and isinstance(spec, SList) and len(spec) >= 3:
+                    return spec[-1]
+        return None
+
     def transpile_type(self, form: SList):
         """Transpile type definition"""
         name = form[1].name
@@ -302,17 +345,25 @@ class Transpiler:
 
     def transpile_record(self, name: str, form: SList):
         """Transpile record to C struct"""
-        self.emit(f"typedef struct {{")
+        # Use struct tag name so it works with forward declarations
+        self.emit(f"struct {name} {{")
         self.indent += 1
+
+        # Track field types for pointer detection
+        self.record_fields[name] = {}
 
         for field in form.items[1:]:
             if isinstance(field, SList) and len(field) >= 2:
-                field_name = self.to_c_name(field[0].name)
-                field_type = self.to_c_type(field[1])
+                raw_field_name = field[0].name
+                field_name = self.to_c_name(raw_field_name)
+                field_type_expr = field[1]
+                field_type = self.to_c_type(field_type_expr)
                 self.emit(f"{field_type} {field_name};")
+                # Track if this field is a pointer
+                self.record_fields[name][raw_field_name] = self._is_pointer_type(field_type_expr)
 
         self.indent -= 1
-        self.emit(f"}} {name};")
+        self.emit(f"}};")
         self.emit("")
 
         self.types[name] = TypeInfo(name, name)
@@ -427,7 +478,8 @@ class Transpiler:
 
     def transpile_function(self, form: SList):
         """Transpile function definition"""
-        name = self.to_c_name(form[1].name)
+        raw_name = form[1].name
+        name = self.to_c_name(raw_name)
         params = form[2] if len(form) > 2 else SList([])
 
         # Clear pointer tracking for this function scope
@@ -440,6 +492,11 @@ class Transpiler:
                 ptype = p[1]
                 if self._is_pointer_type(ptype):
                     self.pointer_vars.add(pname)
+
+        # Track if this function returns a pointer
+        ret_type_expr = self._get_return_type_expr(form)
+        if ret_type_expr and self._is_pointer_type(ret_type_expr):
+            self.func_returns_pointer[raw_name] = True
 
         # Extract annotations and body
         annotations = {}
@@ -471,13 +528,17 @@ class Transpiler:
         if 'intent' in annotations:
             self.emit(f"/* {annotations['intent']} */")
 
-        # Emit function signature
+        # Emit function signature and track pointer parameters
         param_strs = []
         for p in params:
             if isinstance(p, SList) and len(p) >= 2:
-                pname = self.to_c_name(p[0].name)
+                raw_pname = p[0].name
+                pname = self.to_c_name(raw_pname)
                 ptype = self.to_c_type(p[1])
                 param_strs.append(f"{ptype} {pname}")
+                # Track pointer parameters
+                if self._is_pointer_type(p[1]):
+                    self.pointer_vars.add(raw_pname)
 
         self.emit(f"{return_type} {name}({', '.join(param_strs) or 'void'}) {{")
         self.indent += 1
@@ -488,12 +549,55 @@ class Transpiler:
                 cond = self.transpile_expr(pre)
                 self.emit(f'SLOP_PRE({cond}, "{self.expr_to_str(pre)}");')
 
+        # Check if we have postconditions
+        has_post = bool(annotations.get('post'))
+        needs_retval = has_post and return_type != 'void'
+
+        # Declare return value variable if needed for postconditions
+        if needs_retval:
+            self.emit(f"{return_type} _retval;")
+
         # Emit body
         if body_exprs:
-            # If multiple expressions, wrap in block
             for i, expr in enumerate(body_exprs):
                 is_last = (i == len(body_exprs) - 1)
-                self.transpile_statement(expr, is_last and return_type != 'void')
+                if is_last and needs_retval:
+                    # Capture final expression into _retval instead of returning
+                    # Check if it's a statement-like form that needs special handling
+                    if is_form(expr, 'let') or is_form(expr, 'let*'):
+                        self.transpile_let_with_capture(expr, '_retval')
+                    elif is_form(expr, 'if'):
+                        self.transpile_if_with_capture(expr, '_retval')
+                    elif is_form(expr, 'do'):
+                        # Emit all but last, then capture last
+                        for item in expr.items[1:-1]:
+                            self.transpile_statement(item, False)
+                        if len(expr.items) > 1:
+                            last = expr.items[-1]
+                            if is_form(last, 'let') or is_form(last, 'let*'):
+                                self.transpile_let_with_capture(last, '_retval')
+                            elif is_form(last, 'if'):
+                                self.transpile_if_with_capture(last, '_retval')
+                            else:
+                                code = self.transpile_expr(last)
+                                self.emit(f"_retval = {code};")
+                    else:
+                        code = self.transpile_expr(expr)
+                        self.emit(f"_retval = {code};")
+                else:
+                    self.transpile_statement(expr, is_last and return_type != 'void' and not has_post)
+
+        # Emit postconditions
+        for post in annotations.get('post', []):
+            if post:
+                cond = self.transpile_expr(post)
+                # Replace $result with _retval
+                cond = cond.replace('_result', '_retval')
+                self.emit(f'SLOP_POST({cond}, "{self.expr_to_str(post)}");')
+
+        # Emit return after postconditions
+        if needs_retval:
+            self.emit("return _retval;")
 
         self.indent -= 1
         self.emit("}")
@@ -567,6 +671,39 @@ class Transpiler:
             is_last = (i == len(body) - 1)
             self.transpile_statement(item, is_return and is_last)
 
+    def transpile_let_with_capture(self, expr: SList, capture_var: str):
+        """Transpile let binding, capturing the final value in a variable"""
+        bindings = expr[1]
+        body = expr.items[2:]
+
+        # Emit bindings
+        for binding in bindings:
+            raw_name = binding[0].name
+            var_name = self.to_c_name(raw_name)
+            init_expr = binding[1]
+
+            # Register pointer variables
+            if self._is_pointer_expr(init_expr):
+                self.pointer_vars.add(raw_name)
+
+            var_expr = self.transpile_expr(init_expr)
+            self.emit(f"__auto_type {var_name} = {var_expr};")
+
+        # Emit body, capturing the last expression
+        for i, item in enumerate(body):
+            is_last = (i == len(body) - 1)
+            if is_last:
+                # Capture the final value
+                if is_form(item, 'let') or is_form(item, 'let*'):
+                    self.transpile_let_with_capture(item, capture_var)
+                elif is_form(item, 'if'):
+                    self.transpile_if_with_capture(item, capture_var)
+                else:
+                    code = self.transpile_expr(item)
+                    self.emit(f"{capture_var} = {code};")
+            else:
+                self.transpile_statement(item, False)
+
     def transpile_if(self, expr: SList, is_return: bool):
         """Transpile if expression"""
         cond = self.transpile_expr(expr[1])
@@ -604,6 +741,32 @@ class Transpiler:
                 self.indent -= 1
             self.emit("}")
 
+    def transpile_if_with_capture(self, expr: SList, capture_var: str):
+        """Transpile if expression, capturing the result in a variable"""
+        cond = self.transpile_expr(expr[1])
+        then_branch = expr[2]
+        else_branch = expr[3] if len(expr) > 3 else None
+
+        def capture_branch(branch):
+            if is_form(branch, 'let') or is_form(branch, 'let*'):
+                self.transpile_let_with_capture(branch, capture_var)
+            elif is_form(branch, 'if'):
+                self.transpile_if_with_capture(branch, capture_var)
+            else:
+                code = self.transpile_expr(branch)
+                self.emit(f"{capture_var} = {code};")
+
+        self.emit(f"if ({cond}) {{")
+        self.indent += 1
+        capture_branch(then_branch)
+        self.indent -= 1
+        if else_branch:
+            self.emit("} else {")
+            self.indent += 1
+            capture_branch(else_branch)
+            self.indent -= 1
+        self.emit("}")
+
     def transpile_when(self, expr: SList):
         """Transpile when (if without else)"""
         cond = self.transpile_expr(expr[1])
@@ -638,10 +801,16 @@ class Transpiler:
                 parts = target.name.split('.')
                 resolved = self._resolve_field_chain(parts)
                 self.emit(f"{resolved} = {value};")
+            # Check if target is an array access: (@ arr i)
+            elif is_form(target, '@'):
+                arr = self.transpile_expr(target[1])
+                idx = self.transpile_expr(target[2])
+                self.emit(f"{arr}[{idx}] = {value};")
+            # Simple variable assignment
             else:
                 target_code = self.transpile_expr(target)
-                # Dereference if it's a pointer variable
-                self.emit(f"*{target_code} = {value};")
+                # No dereference - direct assignment
+                self.emit(f"{target_code} = {value};")
 
     def transpile_while(self, expr: SList):
         """Transpile while loop"""
@@ -817,9 +986,8 @@ class Transpiler:
                 if enum_val in self.enums:
                     return self.enums[enum_val]
                 return self.to_c_name(enum_val)
-            # Check if it's an enum value without quote
-            if name in self.enums:
-                return self.enums[name]
+            # NOTE: Don't check for unquoted enum values here - they should use 'quote syntax
+            # Bare identifiers are always variable names
             # Handle dot notation for field access (e.g., resp.data, addr.sin_addr.s_addr)
             if '.' in name:
                 parts = name.split('.')
@@ -856,14 +1024,14 @@ class Transpiler:
                     return f"({a} {op} {b})"
 
                 if op == 'and':
-                    a = self.transpile_expr(expr[1])
-                    b = self.transpile_expr(expr[2])
-                    return f"({a} && {b})"
+                    # Handle variadic and: (and a b c ...) -> (a && b && c && ...)
+                    parts = [self.transpile_expr(e) for e in expr.items[1:]]
+                    return f"({' && '.join(parts)})"
 
                 if op == 'or':
-                    a = self.transpile_expr(expr[1])
-                    b = self.transpile_expr(expr[2])
-                    return f"({a} || {b})"
+                    # Handle variadic or: (or a b c ...) -> (a || b || c || ...)
+                    parts = [self.transpile_expr(e) for e in expr.items[1:]]
+                    return f"({' || '.join(parts)})"
 
                 if op == 'not':
                     a = self.transpile_expr(expr[1])
@@ -892,29 +1060,43 @@ class Transpiler:
                     idx = self.transpile_expr(expr[2])
                     return f"{arr}[{idx}]"
 
+                # Address-of operator: (addr expr) -> &expr
+                if op == 'addr':
+                    inner = self.transpile_expr(expr[1])
+                    return f"(&{inner})"
+
                 # Built-in functions
                 if op == 'arena-alloc':
                     arena = self.transpile_expr(expr[1])
                     size_expr = expr[2]
-                    # Extract type from sizeof(Type) to cast the result
-                    if is_form(size_expr, 'sizeof'):
-                        type_name = size_expr[1].name
-                        # Map to C type
-                        c_type = self.builtin_types.get(type_name, type_name)
-                        if type_name in self.ffi_structs:
-                            c_type = self.ffi_structs[type_name]['c_name']
-                        return f"({c_type}*)slop_arena_alloc({arena}, sizeof({c_type}))"
+
+                    # Try to extract type from the size expression for casting
+                    def extract_type_from_sizeof(e):
+                        """Extract type name from sizeof or n*sizeof expressions"""
+                        if is_form(e, 'sizeof'):
+                            return e[1]
+                        if is_form(e, '*') and len(e) >= 3:
+                            # Check (* n (sizeof T)) or (* (sizeof T) n)
+                            if is_form(e[1], 'sizeof'):
+                                return e[1][1]
+                            if is_form(e[2], 'sizeof'):
+                                return e[2][1]
+                        return None
+
+                    type_ref = extract_type_from_sizeof(size_expr)
+                    if type_ref:
+                        # Get the C type
+                        c_type = self.to_c_type(type_ref)
+                        size = self.transpile_expr(size_expr)
+                        return f"({c_type}*)slop_arena_alloc({arena}, {size})"
                     else:
                         size = self.transpile_expr(size_expr)
                         return f"slop_arena_alloc({arena}, {size})"
 
                 if op == 'sizeof':
-                    type_name = expr[1].name
-                    # Map SLOP types to C types for sizeof
-                    c_type = self.builtin_types.get(type_name, type_name)
-                    # Handle FFI structs
-                    if type_name in self.ffi_structs:
-                        c_type = self.ffi_structs[type_name]['c_name']
+                    type_expr = expr[1]
+                    # Handle both simple and complex type expressions
+                    c_type = self.to_c_type(type_expr)
                     return f"sizeof({c_type})"
 
                 if op == 'now-ms':
@@ -983,6 +1165,28 @@ class Transpiler:
                     elements = [self.transpile_expr(e) for e in expr.items[1:]]
                     elems_str = ", ".join(elements)
                     return f"{{{elems_str}}}"
+
+                # Record construction: (record-new Type (field1 val1) (field2 val2) ...)
+                if op == 'record-new':
+                    type_name = expr[1].name
+                    fields = []
+                    for i in range(2, len(expr)):
+                        field = expr[i]
+                        if isinstance(field, SList) and len(field) >= 2:
+                            fname = self.to_c_name(field[0].name)
+                            fval = self.transpile_expr(field[1])
+                            fields.append(f".{fname} = {fval}")
+                    return f"(({type_name}){{{', '.join(fields)}}})"
+
+                # Union construction: (union-new Type Tag value?)
+                if op == 'union-new':
+                    type_name = expr[1].name
+                    tag = self.to_c_name(expr[2].name)
+                    tag_const = f"{type_name}_{tag}_TAG"
+                    if len(expr) > 3:
+                        value = self.transpile_expr(expr[3])
+                        return f"(({type_name}){{ .tag = {tag_const}, .data.{tag} = {value} }})"
+                    return f"(({type_name}){{ .tag = {tag_const} }})"
 
                 if op == 'put':
                     # Functional update: (put expr field value)
@@ -1162,7 +1366,7 @@ class Transpiler:
 
     def to_c_name(self, name: str) -> str:
         """Convert SLOP identifier to valid C name"""
-        return name.replace('-', '_').replace('?', '_p').replace('!', '_x')
+        return name.replace('-', '_').replace('?', '_p').replace('!', '_x').replace('$', '_')
 
     def expr_to_str(self, expr: SExpr) -> str:
         """Convert expression to string for error messages"""

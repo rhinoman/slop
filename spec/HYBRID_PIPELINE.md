@@ -241,24 +241,52 @@ models:
     provider: ollama
     model: phi3:mini
     context: 2048
-    
+
   tier-2:
     provider: ollama
     model: llama3:8b
     context: 4096
-    
+
   tier-3:
-    provider: ollama
-    model: llama3:70b-q4
-    context: 8192
-    
+    provider: interactive      # Use Claude Code subscription
+    command: claude
+    mode: clipboard
+
   tier-4:
-    provider: anthropic
+    provider: anthropic        # Or interactive for subscription-only
     model: claude-sonnet-4-20250514
 
 routing:
   max_retries: 2
   escalate_on_failure: true
+  batch_interactive: true      # Batch interactive tier holes together
+```
+
+### 2.4 Provider Types
+
+| Provider | Description | Use Case |
+|----------|-------------|----------|
+| `ollama` | Local Ollama instance | Fast, private, tier-1/2 |
+| `openai-compatible` | OpenAI API format | Hosted LLMs, enterprise |
+| `anthropic` | Anthropic API | High-quality tier-4 |
+| `interactive` | External tools (Claude Code, Cursor, Aider) | Use existing subscriptions |
+
+**Interactive providers** route holes to external AI tools, avoiding API costs:
+- `clipboard` mode: Copies prompt to clipboard, waits for pasted response
+- `file` mode: Writes prompt to `.slop-hole-request`, reads response from `.slop-hole-response`
+- Use `--batch-interactive` flag to batch multiple holes into a single session
+
+Example workflow with interactive provider:
+```
+$ slop fill app.slop --batch-interactive
+
+Tier 1-2 (local): 18 holes filled in 12s
+Tier 3-4 (interactive): 5 holes batched
+
+→ Prompt copied to clipboard. Paste into claude
+← [user pastes response]
+
+✓ All holes filled
 ```
 
 ## Phase 3: Verification

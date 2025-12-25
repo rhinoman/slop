@@ -79,3 +79,11 @@ example-hello:
 example-rate-limiter:
 	$(PYTHON) -m slop.cli transpile examples/rate-limiter.slop -o build/rate_limiter.c
 	$(CC) $(CFLAGS) -Isrc/slop/runtime -DRATE_LIMITER_TEST build/rate_limiter.c -o build/rate_limiter
+
+# Self-hosted parser
+parser-transpile:
+	$(PYTHON) -m slop.cli transpile lib/parser/slop-parser.slop -o build/slop_parser.c
+
+parser-test: parser-transpile
+	$(CC) $(CFLAGS) -Isrc/slop/runtime lib/parser/test-parser.c -o build/test-parser
+	./build/test-parser

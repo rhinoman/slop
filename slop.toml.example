@@ -39,6 +39,19 @@ type = "openai-compatible"
 base_url = "https://openrouter.ai/api/v1"
 api_key = "${OPENROUTER_API_KEY}"
 
+# Interactive - Route to Claude Code, Cursor, Aider, etc.
+# Uses your existing AI tool subscriptions instead of API calls.
+[providers.claude-code]
+type = "interactive"
+command = "claude"      # Tool name shown in prompts
+mode = "clipboard"      # "clipboard" or "file"
+
+# Alternate: file-based handoff
+# [providers.cursor]
+# type = "interactive"
+# command = "cursor"
+# mode = "file"
+
 # ============================================================================
 # TIERS
 # Configure which provider and model to use for each complexity tier.
@@ -81,3 +94,54 @@ temperature = 0.6
 [routing]
 max_retries = 2
 escalate_on_failure = true
+
+# ============================================================================
+# EXAMPLE: SUBSCRIPTION-MAXIMIZING CONFIG
+# Use local models for simple tasks, leverage your Claude Code subscription
+# for complex ones. Run with: slop fill app.slop --batch-interactive
+# ============================================================================
+#
+# [tiers.tier-1]
+# provider = "ollama"
+# model = "phi3:mini"
+# context_length = 2048
+# temperature = 0.3
+#
+# [tiers.tier-2]
+# provider = "ollama"
+# model = "llama3:8b"
+# context_length = 4096
+# temperature = 0.4
+#
+# [tiers.tier-3]
+# provider = "claude-code"
+# model = "interactive"
+# context_length = 128000
+# temperature = 0.5
+#
+# [tiers.tier-4]
+# provider = "claude-code"
+# model = "interactive"
+# context_length = 128000
+# temperature = 0.6
+
+# ============================================================================
+# EXAMPLE: PRIVACY-FIRST CONFIG
+# Never leaves your machine. Requires sufficient VRAM for larger models.
+# ============================================================================
+#
+# [tiers.tier-1]
+# provider = "ollama"
+# model = "phi3:mini"
+#
+# [tiers.tier-2]
+# provider = "ollama"
+# model = "llama3:8b"
+#
+# [tiers.tier-3]
+# provider = "ollama"
+# model = "deepseek-coder:33b"
+#
+# [tiers.tier-4]
+# provider = "ollama"
+# model = "llama3:70b-q4"

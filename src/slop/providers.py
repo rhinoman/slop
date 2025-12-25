@@ -135,6 +135,81 @@ class MockProvider(Provider):
             return "(ok nil)"
 
 
+class InteractiveProvider(Provider):
+    """Route holes to interactive tools like Claude Code, Cursor, or Aider.
+
+    This allows users to leverage their existing AI tool subscriptions
+    instead of making direct API calls.
+
+    Modes:
+        clipboard: Copy prompt to clipboard, wait for user to paste response
+        file: Write prompt to file, wait for user to indicate response file ready
+    """
+
+    def __init__(self, command: str = "claude", mode: str = "clipboard"):
+        self.command = command
+        self.mode = mode
+
+    def complete(self, prompt: str, config: ModelConfig) -> str:
+        if self.mode == "clipboard":
+            return self._clipboard_mode(prompt)
+        elif self.mode == "file":
+            return self._file_mode(prompt)
+        else:
+            raise ValueError(f"Unknown interactive mode: {self.mode}")
+
+    def _clipboard_mode(self, prompt: str) -> str:
+        """Copy prompt to clipboard, wait for user to paste response"""
+        try:
+            import pyperclip
+            pyperclip.copy(prompt)
+            print(f"\n→ Prompt copied to clipboard ({len(prompt)} chars)")
+            print(f"  Paste into {self.command} and copy the response")
+        except ImportError:
+            # Fallback: write to temp file if pyperclip not available
+            from pathlib import Path
+            request_file = Path(".slop-hole-request")
+            request_file.write_text(prompt)
+            print(f"\n→ Prompt written to {request_file} ({len(prompt)} chars)")
+            print(f"  Copy contents to {self.command}")
+
+        print()
+        response = input("← Paste response (or enter file path): ").strip()
+
+        # Handle file path input
+        if response.startswith("/") or response.startswith("./") or response.startswith("~"):
+            from pathlib import Path
+            path = Path(response).expanduser()
+            if path.exists():
+                return path.read_text()
+            else:
+                print(f"  Warning: File not found: {path}")
+                return response
+
+        return response
+
+    def _file_mode(self, prompt: str) -> str:
+        """Write prompt to file, wait for response file"""
+        from pathlib import Path
+        request_file = Path(".slop-hole-request")
+        response_file = Path(".slop-hole-response")
+
+        request_file.write_text(prompt)
+        print(f"\n→ Prompt written to {request_file}")
+        print(f"  Write response to {response_file}")
+
+        input(f"← Press Enter when {response_file} is ready: ")
+
+        if response_file.exists():
+            return response_file.read_text()
+        else:
+            raise RuntimeError(f"Response file not found: {response_file}")
+
+    def is_interactive(self) -> bool:
+        """Returns True - this provider requires user interaction"""
+        return True
+
+
 # --- Configuration Loading ---
 
 def expand_env_vars(value: str) -> str:
@@ -190,6 +265,11 @@ def create_provider(provider_config: dict) -> Provider:
         api_key = provider_config.get('api_key', '')
         return OpenAICompatibleProvider(base_url, api_key)
 
+    elif provider_type == 'interactive':
+        command = provider_config.get('command', 'claude')
+        mode = provider_config.get('mode', 'clipboard')
+        return InteractiveProvider(command, mode)
+
     elif provider_type == 'mock':
         return MockProvider()
 
@@ -215,6 +295,13 @@ class MultiProvider(Provider):
         if provider_name not in self.providers:
             raise ValueError(f"Provider '{provider_name}' not configured")
         return self.providers[provider_name].complete(prompt, config)
+
+    def is_interactive(self, provider_name: str) -> bool:
+        """Check if a provider is interactive (requires user input)"""
+        if provider_name not in self.providers:
+            return False
+        provider = self.providers[provider_name]
+        return hasattr(provider, 'is_interactive') and provider.is_interactive()
 
 
 def create_from_config(config: dict) -> tuple[Dict[Tier, ModelConfig], Provider]:
