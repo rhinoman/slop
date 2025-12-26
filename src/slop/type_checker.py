@@ -1546,6 +1546,18 @@ class TypeChecker:
         if isinstance(a, RangeType) and isinstance(b, RangeType) and a.base == b.base:
             return RangeType(a.base, a.bounds.union(b.bounds))
 
+        # Result type unification with TypeVars
+        # (Result Pet E) + (Result T ApiError) => (Result Pet ApiError)
+        if isinstance(a, ResultType) and isinstance(b, ResultType):
+            ok_type = self._unify_types(a.ok_type, b.ok_type)
+            err_type = self._unify_types(a.err_type, b.err_type)
+            return ResultType(ok_type, err_type)
+
+        # Option type unification
+        if isinstance(a, OptionType) and isinstance(b, OptionType):
+            inner = self._unify_types(a.inner, b.inner)
+            return OptionType(inner)
+
         # One is subtype of other
         if a.is_subtype_of(b):
             return b
@@ -1554,6 +1566,29 @@ class TypeChecker:
 
         # Different types - return union (simplified to first type with warning)
         self.warning(f"Branch types differ: {a} vs {b}")
+        return a
+
+    def _unify_types(self, a: Type, b: Type) -> Type:
+        """Unify two types, resolving TypeVars to concrete types."""
+        # If either is a TypeVar, prefer the concrete type
+        if isinstance(a, TypeVar):
+            if a.bound:
+                return self._unify_types(a.bound, b)
+            return b  # Unbound TypeVar takes the other type
+        if isinstance(b, TypeVar):
+            if b.bound:
+                return self._unify_types(a, b.bound)
+            return a  # Unbound TypeVar takes the other type
+
+        # Both are concrete - check compatibility
+        if a.equals(b):
+            return a
+        if a.is_subtype_of(b):
+            return b
+        if b.is_subtype_of(a):
+            return a
+
+        # Incompatible - return first (caller may warn)
         return a
 
     # ========================================================================
