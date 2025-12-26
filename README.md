@@ -19,8 +19,8 @@ SLOP inverts the traditional programming model:
 
 ## Design Choices
 
-- **S-expression syntax**: Zero parsing ambiguity, trivial for LLMs (I also like Lisp)
-- **Range types**: `(Int 0 .. 100)` catches bounds errors at compile time (Ada-inspired)
+- **S-expression syntax**: Zero parsing ambiguity, trivial for LLMs (I like Lisp)
+- **Range types**: `(Int 0 .. 100)` catches bounds errors at compile time (I also like Ada)
 - **Mandatory contracts**: `@intent`, `@spec`, `@pre`, `@post` define correctness 
 - **Typed holes**: Explicit markers for LLM generation with complexity tiers
 - **Transpiles to C**: Maximum performance, universal FFI, minimal runtime 
@@ -67,38 +67,44 @@ slop/
 ├── spec/                    Language specifications
 │   ├── LANGUAGE.md          Grammar, types, semantics
 │   └── HYBRID_PIPELINE.md   Generation architecture
-├── runtime/
-│   └── slop_runtime.h       Minimal C runtime (~400 lines)
+├── src/slop/
+│   ├── runtime/
+│   │   └── slop_runtime.h   Minimal C runtime (~400 lines)
+│   ├── parser.py            S-expression parser
+│   ├── transpiler.py        SLOP → C transpiler (with type flow analysis)
+│   ├── type_checker.py      Type inference with range propagation
+│   ├── hole_filler.py       LLM integration with tiered routing
+│   ├── providers.py         LLM providers (Ollama, OpenAI, etc.)
+│   ├── schema_converter.py  JSON Schema → SLOP types
+│   └── cli.py               Command-line interface
 ├── examples/
 │   ├── rate-limiter.slop    Complete example
-│   ├── user-service-hybrid.slop  Hybrid generation demo
-│   └── generated/           Example C output
-├── tooling/src/
-│   ├── parser.py            S-expression parser
-│   ├── transpiler.py        SLOP → C transpiler
-│   ├── hole_filler.py       LLM integration
-│   ├── schema_converter.py  JSON Schema → SLOP types
-│   └── slop_cli.py          Command-line interface
-└── skill/                   Claude skill for SLOP generation
+│   └── hello.slop           Minimal example
+├── skill/                   Claude skill for SLOP generation
+│   └── references/          Built-ins, patterns, types docs
+└── tests/                   Test suite
 ```
 
 ## Usage
 
 ```bash
+# Install
+pip install -e .
+
 # Parse and inspect
-python tooling/src/slop_cli.py parse examples/rate-limiter.slop
+slop parse examples/rate-limiter.slop
 
 # Show holes
-python tooling/src/slop_cli.py parse examples/user-service-hybrid.slop --holes
+slop parse examples/rate-limiter.slop --holes
 
 # Transpile to C
-python tooling/src/slop_cli.py transpile examples/rate-limiter.slop -o rate_limiter.c
+slop transpile examples/rate-limiter.slop -o rate_limiter.c
 
-# Validate
-python tooling/src/slop_cli.py check examples/rate-limiter.slop
+# Type check
+slop check examples/rate-limiter.slop
 
 # Full build (requires cc)
-python tooling/src/slop_cli.py build examples/rate-limiter.slop -o rate_limiter
+slop build examples/rate-limiter.slop -o rate_limiter
 ```
 
 ## Hybrid Generation Pipeline
@@ -170,6 +176,11 @@ C's benefits remain:
 - 50 years of optimizer engineering
 - Runs everywhere
 
+## Other Targets
+
+Aside from C, an obvious choice for another target would be typescript.
+WASM would also be easy to do since we're already transpiling to C.
+
 ## Memory Model
 
 Arena allocation handles 90% of cases:
@@ -187,19 +198,20 @@ Arena allocation handles 90% of cases:
 
 **Implemented:**
 - ✓ Language specification
-- ✓ S-expression parser
-- ✓ SLOP → C transpiler
-- ✓ Hole extraction and classification
-- ✓ Mock LLM provider
-- ✓ CLI tooling
-- ✓ Runtime header
+- ✓ S-expression parser with pretty-printing
+- ✓ SLOP → C transpiler with type flow analysis
+- ✓ Type checker with range inference and path-sensitive analysis
+- ✓ Hole extraction, classification, and tiered model routing
+- ✓ LLM providers (Ollama, OpenAI-compatible, Interactive, Multi-provider)
+- ✓ Hole filler with quality scoring and pattern library
+- ✓ CLI tooling (`slop` command)
+- ✓ Runtime header with arena allocation
+- ✓ Test suite (74 tests)
 
 **Not Yet Implemented:**
-- Type checker with range inference
-- Contract verification (SMT solver)
-- Real LLM provider integration
-- Property-based testing
+- Contract verification (SMT solver integration)
+- Property-based testing generation
 
 ## License
 
-MIT
+Apache 2.0
