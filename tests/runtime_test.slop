@@ -1,0 +1,130 @@
+;; ============================================================
+;; Runtime Test - Compile and Execute Verification
+;; ============================================================
+;;
+;; This module tests that transpiled C code actually compiles
+;; and runs correctly. Each test function returns 0 on success,
+;; non-zero on failure. main() sums all results - exit code 0
+;; means all tests passed.
+
+(module runtime-test
+  (export (main 0))
+
+  ;; --- Arithmetic Tests (using variadic +) ---
+
+  (fn test-arithmetic ()
+    (@intent "Test basic arithmetic operations")
+    (@spec (() -> Int))
+    (let ((add-ok (if (== (+ 2 3) 5) 0 1))
+          (sub-ok (if (== (- 10 4) 6) 0 1))
+          (mul-ok (if (== (* 3 4) 12) 0 1))
+          (div-ok (if (== (/ 15 3) 5) 0 1)))
+      (+ add-ok sub-ok mul-ok div-ok)))  ;; variadic +
+
+  ;; --- Bitwise Tests ---
+
+  (fn test-bitwise ()
+    (@intent "Test bitwise operations")
+    (@spec (() -> Int))
+    (let ((and-ok (if (== (& 6 3) 2) 0 1))
+          (or-ok (if (== (| 4 2) 6) 0 1))
+          (xor-ok (if (== (^ 5 3) 6) 0 1))
+          (shl-ok (if (== (<< 1 3) 8) 0 1)))
+      (+ and-ok or-ok xor-ok shl-ok)))  ;; variadic +
+
+  ;; --- Comparison Tests ---
+
+  (fn test-comparison ()
+    (@intent "Test comparison operations")
+    (@spec (() -> Int))
+    (let ((lt-ok (if (< 3 5) 0 1))
+          (gt-ok (if (> 5 3) 0 1))
+          (le-ok (if (<= 3 3) 0 1))
+          (ge-ok (if (>= 5 5) 0 1))
+          (eq-ok (if (== 42 42) 0 1))
+          (ne-ok (if (!= 1 2) 0 1)))
+      (+ lt-ok gt-ok le-ok ge-ok eq-ok ne-ok)))  ;; variadic +
+
+  ;; --- Boolean Tests ---
+
+  (fn test-boolean ()
+    (@intent "Test boolean operations")
+    (@spec (() -> Int))
+    (let ((and-ok (if (and true true) 0 1))
+          (or-ok (if (or false true) 0 1))
+          (not-ok (if (not false) 0 1)))
+      (+ and-ok or-ok not-ok)))  ;; variadic +
+
+  ;; --- For Loop Test ---
+
+  (fn test-for-loop ()
+    (@intent "Test for loop iteration")
+    (@spec (() -> Int))
+    (let ((sum 0))
+      (for (i 0 5)
+        (set! sum (+ sum i)))
+      ;; 0+1+2+3+4 = 10
+      (if (== sum 10) 0 1)))
+
+  ;; --- While Loop Test ---
+
+  (fn test-while-loop ()
+    (@intent "Test while loop iteration")
+    (@spec (() -> Int))
+    (let ((n 5) (count 0))
+      (while (> n 0)
+        (set! count (+ count 1))
+        (set! n (- n 1)))
+      (if (== count 5) 0 1)))
+
+  ;; --- Cond as Expression Test ---
+  ;; Tests that cond works as an expression inside let bindings
+
+  (fn test-cond-expr ()
+    (@intent "Test cond as expression in let bindings")
+    (@spec (() -> Int))
+    (let ((neg (cond ((< -5 0) -1) ((== -5 0) 0) (else 1)))
+          (zero (cond ((< 0 0) -1) ((== 0 0) 0) (else 1)))
+          (pos (cond ((< 5 0) -1) ((== 5 0) 0) (else 1))))
+      (+ (if (== neg -1) 0 1)
+         (if (== zero 0) 0 1)
+         (if (== pos 1) 0 1))))
+
+  ;; --- C Keyword Test ---
+  ;; Tests that C reserved keywords are properly escaped
+  ;; (double becomes slop_double in generated C)
+
+  (fn double ((x Int))
+    (@intent "Test C keyword escaping")
+    (@spec ((Int) -> Int))
+    (* x 2))
+
+  (fn test-keyword-escape ()
+    (@intent "Test that C keywords work as function names")
+    (@spec (() -> Int))
+    (if (== (double (double 3)) 12) 0 1))
+
+  ;; --- Let Binding Test ---
+
+  (fn test-let-binding ()
+    (@intent "Test let bindings")
+    (@spec (() -> Int))
+    (let ((a 10)
+          (b 20))
+      (let ((c (+ a b)))
+        (if (== c 30) 0 1))))
+
+  ;; --- Main Entry Point ---
+
+  (fn main ()
+    (@intent "Run all tests, return 0 if all pass")
+    (@spec (() -> Int))
+    (+ (test-arithmetic)
+       (test-bitwise)
+       (test-comparison)
+       (test-boolean)
+       (test-for-loop)
+       (test-while-loop)
+       (test-cond-expr)
+       (test-keyword-escape)
+       (test-let-binding))))

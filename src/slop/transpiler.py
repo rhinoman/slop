@@ -27,6 +27,18 @@ class TypeInfo:
 class Transpiler:
     """Transpile SLOP to C"""
 
+    # C reserved keywords that cannot be used as identifiers
+    C_KEYWORDS = {
+        'auto', 'break', 'case', 'char', 'const', 'continue', 'default', 'do',
+        'double', 'else', 'enum', 'extern', 'float', 'for', 'goto', 'if',
+        'int', 'long', 'register', 'return', 'short', 'signed', 'sizeof',
+        'static', 'struct', 'switch', 'typedef', 'union', 'unsigned', 'void',
+        'volatile', 'while', '_Bool', '_Complex', '_Imaginary',
+        # C99/C11 additions
+        'inline', 'restrict', '_Alignas', '_Alignof', '_Atomic', '_Generic',
+        '_Noreturn', '_Static_assert', '_Thread_local',
+    }
+
     def __init__(self):
         self.types: Dict[str, TypeInfo] = {}
         self.enums: Dict[str, str] = {}  # value -> qualified name
@@ -1498,11 +1510,15 @@ class Transpiler:
             if isinstance(head, Symbol):
                 op = head.name
 
-                # Arithmetic/comparison operators
+                # Arithmetic/comparison operators (variadic)
                 if op in ['+', '-', '*', '/', '%', '&', '|', '^', '<<', '>>']:
-                    a = self.transpile_expr(expr[1])
-                    b = self.transpile_expr(expr[2])
-                    return f"({a} {op} {b})"
+                    args = [self.transpile_expr(e) for e in expr.items[1:]]
+                    if len(args) == 1:
+                        return args[0]
+                    result = args[0]
+                    for arg in args[1:]:
+                        result = f"({result} {op} {arg})"
+                    return result
 
                 if op == '==' or op == '=':
                     a = self.transpile_expr(expr[1])
@@ -1578,6 +1594,24 @@ class Transpiler:
                 # Match as expression (GCC statement expression with switch)
                 if op == 'match':
                     return self._transpile_match_expr(expr)
+
+                # Cond as expression (GCC statement expression)
+                if op == 'cond':
+                    parts = ["({ int64_t _cond_result; "]
+                    first = True
+                    for clause in expr.items[1:]:
+                        if isinstance(clause, SList) and len(clause) >= 2:
+                            test = clause[0]
+                            body = clause.items[-1]  # Last item is the result
+                            if isinstance(test, Symbol) and test.name == 'else':
+                                parts.append(f"}} else {{ _cond_result = {self.transpile_expr(body)}; ")
+                            elif first:
+                                parts.append(f"if ({self.transpile_expr(test)}) {{ _cond_result = {self.transpile_expr(body)}; ")
+                                first = False
+                            else:
+                                parts.append(f"}} else if ({self.transpile_expr(test)}) {{ _cond_result = {self.transpile_expr(body)}; ")
+                    parts.append("} _cond_result; })")
+                    return ''.join(parts)
 
                 # Field access
                 if op == '.':
@@ -2057,7 +2091,10 @@ class Transpiler:
 
     def to_c_name(self, name: str) -> str:
         """Convert SLOP identifier to valid C name"""
-        return name.replace('-', '_').replace('?', '_p').replace('!', '_x').replace('$', '_')
+        result = name.replace('-', '_').replace('?', '_p').replace('!', '_x').replace('$', '_')
+        if result in self.C_KEYWORDS:
+            return f"slop_{result}"
+        return result
 
     def expr_to_str(self, expr: SExpr) -> str:
         """Convert expression to string for error messages"""
