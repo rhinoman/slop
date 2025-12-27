@@ -181,6 +181,33 @@ slop build examples/rate-limiter.slop -o rate_limiter
 └─────────────────┘
 ```
 
+## Typed Holes
+
+Holes are placeholders where LLMs generate code, constrained by types and contracts:
+
+```lisp
+(fn validate-age ((age Int))
+  (@intent "Check if age is valid for registration")
+  (@spec ((Int) -> (Result (Int 18 .. 120) String)))
+
+  (hole (Result (Int 18 .. 120) String)
+    "validate age is between 18 and 120, return error message if invalid"
+    :complexity tier-2))
+```
+
+The hole specifies:
+- **Return type**: `(Result (Int 18 .. 120) String)` — must return this exact type
+- **Prompt**: Natural language description of what to generate
+- **Complexity**: `tier-2` — routes to an appropriately-sized model
+
+Running `slop fill` replaces the hole with a valid implementation:
+
+```lisp
+(if (and (>= age 18) (<= age 120))
+    (union-new Result ok age)
+    (union-new Result error "Age must be between 18 and 120"))
+```
+
 ## Model Tiering
 
 Holes are routed to appropriately-sized models:
