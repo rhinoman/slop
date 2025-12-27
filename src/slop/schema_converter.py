@@ -651,6 +651,10 @@ class OpenApiConverter:
 
         # For stub/map modes, add state as first parameter
         if self.storage_mode in ('stub', 'map') and self.resource_types:
+            # POST operations need arena for state-insert-*
+            if method.lower() == 'post':
+                params.append(('arena', 'Arena'))
+                must_use.append('arena')
             params.append(('state', '(Ptr State)'))
             must_use.append('state')
             preconditions.append("(!= state nil)")

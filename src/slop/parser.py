@@ -14,11 +14,15 @@ import re
 @dataclass
 class Symbol:
     name: str
+    line: int = 0
+    col: int = 0
     def __repr__(self): return self.name
 
 @dataclass
 class String:
     value: str
+    line: int = 0
+    col: int = 0
     def __repr__(self):
         escaped = self.value.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace('\t', '\\t')
         return f'"{escaped}"'
@@ -26,11 +30,15 @@ class String:
 @dataclass
 class Number:
     value: Union[int, float]
+    line: int = 0
+    col: int = 0
     def __repr__(self): return str(self.value)
 
 @dataclass
 class SList:
     items: List['SExpr']
+    line: int = 0
+    col: int = 0
 
     def __repr__(self):
         return f"({' '.join(repr(x) for x in self.items)})"
@@ -154,29 +162,29 @@ class Parser:
             return self.parse_list()
         elif kind == 'NUMBER':
             self.pos += 1
-            return Number(float(value) if '.' in value else int(value))
+            return Number(float(value) if '.' in value else int(value), line, col)
         elif kind == 'STRING':
             self.pos += 1
-            return String(_unescape_string(value[1:-1]))
+            return String(_unescape_string(value[1:-1]), line, col)
         elif kind == 'QUOTE':
             self.pos += 1
-            return SList([Symbol('quote'), self.parse_expr()])
+            return SList([Symbol('quote', line, col), self.parse_expr()], line, col)
         elif kind == 'SYMBOL':
             self.pos += 1
-            return Symbol(value)
+            return Symbol(value, line, col)
         elif kind == 'OPERATOR':
             self.pos += 1
-            return Symbol(value)
+            return Symbol(value, line, col)
         elif kind == 'COLON':
             self.pos += 1
             if self.pos < len(self.tokens):
                 _, next_val, _, _ = self.tokens[self.pos]
                 self.pos += 1
-                return Symbol(':' + next_val)
+                return Symbol(':' + next_val, line, col)
             raise ParseError("Expected symbol after ':'", line, col)
         elif kind == 'RANGE':
             self.pos += 1
-            return Symbol('..')
+            return Symbol('..', line, col)
         else:
             raise ParseError(f"Unexpected token: {value}", line, col)
 
@@ -192,7 +200,7 @@ class Parser:
             kind, _, _, _ = self.tokens[self.pos]
             if kind == 'RPAREN':
                 self.pos += 1
-                return SList(items)
+                return SList(items, line, col)
             items.append(self.parse_expr())
 
         raise ParseError("Unclosed list", line, col)

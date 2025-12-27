@@ -614,25 +614,72 @@ def cmd_build(args):
 
         runtime_path = _get_runtime_path()
 
-        compile_cmd = [
-            "cc",
-            "-O2",
-            "-I", str(runtime_path),
-            "-o", output,
-            c_file,
-        ]
+        library_mode = getattr(args, 'library', None)
 
-        if args.debug:
-            compile_cmd.insert(1, "-g")
-            compile_cmd.insert(2, "-DSLOP_DEBUG")
+        if library_mode == 'static':
+            # Compile to object file, then create static library
+            obj_file = f"{output}.o"
+            lib_file = f"{output}.a"
 
-        result = subprocess.run(compile_cmd, capture_output=True, text=True)
+            compile_cmd = ["cc", "-c", "-O2", "-I", str(runtime_path), "-o", obj_file, c_file]
+            if args.debug:
+                compile_cmd.insert(1, "-g")
+                compile_cmd.insert(2, "-DSLOP_DEBUG")
 
-        if result.returncode != 0:
-            print(f"Compilation failed:\n{result.stderr}")
-            return 1
+            result = subprocess.run(compile_cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"Compilation failed:\n{result.stderr}")
+                return 1
 
-        print(f"✓ Built {output}")
+            ar_cmd = ["ar", "rcs", lib_file, obj_file]
+            result = subprocess.run(ar_cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"Archive failed:\n{result.stderr}")
+                return 1
+
+            # Clean up object file
+            Path(obj_file).unlink(missing_ok=True)
+            print(f"✓ Built {lib_file}")
+
+        elif library_mode == 'shared':
+            # Compile to shared library
+            ext = ".dylib" if sys.platform == "darwin" else ".so"
+            lib_file = f"{output}{ext}"
+
+            compile_cmd = ["cc", "-shared", "-fPIC", "-O2", "-I", str(runtime_path),
+                          "-o", lib_file, c_file]
+            if args.debug:
+                compile_cmd.insert(1, "-g")
+                compile_cmd.insert(2, "-DSLOP_DEBUG")
+
+            result = subprocess.run(compile_cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"Compilation failed:\n{result.stderr}")
+                return 1
+
+            print(f"✓ Built {lib_file}")
+
+        else:
+            # Default: build executable
+            compile_cmd = [
+                "cc",
+                "-O2",
+                "-I", str(runtime_path),
+                "-o", output,
+                c_file,
+            ]
+
+            if args.debug:
+                compile_cmd.insert(1, "-g")
+                compile_cmd.insert(2, "-DSLOP_DEBUG")
+
+            result = subprocess.run(compile_cmd, capture_output=True, text=True)
+
+            if result.returncode != 0:
+                print(f"Compilation failed:\n{result.stderr}")
+                return 1
+
+            print(f"✓ Built {output}")
         return 0
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
@@ -756,6 +803,8 @@ def main():
     p.add_argument('-o', '--output')
     p.add_argument('-c', '--config', help='Path to TOML config file')
     p.add_argument('--debug', action='store_true')
+    p.add_argument('--library', choices=['static', 'shared'],
+                   help='Build as library instead of executable')
 
     # derive
     p = subparsers.add_parser('derive', help='Generate SLOP from schemas')

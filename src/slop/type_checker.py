@@ -556,13 +556,17 @@ class TypeChecker:
         self._type_var_counter += 1
         return TypeVar(self._type_var_counter, name)
 
-    def error(self, message: str, hint: Optional[str] = None):
+    def error(self, message: str, node: Optional[SExpr] = None, hint: Optional[str] = None):
+        line = getattr(node, 'line', 0) if node else 0
+        col = getattr(node, 'col', 0) if node else 0
         self.diagnostics.append(TypeDiagnostic('error', message,
-                                               SourceLocation(self.filename), hint))
+                                               SourceLocation(self.filename, line, col), hint))
 
-    def warning(self, message: str, hint: Optional[str] = None):
+    def warning(self, message: str, node: Optional[SExpr] = None, hint: Optional[str] = None):
+        line = getattr(node, 'line', 0) if node else 0
+        col = getattr(node, 'col', 0) if node else 0
         self.diagnostics.append(TypeDiagnostic('warning', message,
-                                               SourceLocation(self.filename), hint))
+                                               SourceLocation(self.filename, line, col), hint))
 
     # ========================================================================
     # Path-Sensitive Refinement
@@ -876,7 +880,7 @@ class TypeChecker:
             if base_type is None:
                 base_type = self.env.lookup_var(parts[0])
             if base_type is None:
-                self.error(f"Undefined variable: {parts[0]}")
+                self.error(f"Undefined variable: {parts[0]}", sym)
                 return UNKNOWN
 
             current_type = base_type
@@ -890,7 +894,7 @@ class TypeChecker:
                     if field_type:
                         current_type = field_type
                     else:
-                        self.error(f"Record '{actual_type.name}' has no field '{field}'")
+                        self.error(f"Record '{actual_type.name}' has no field '{field}'", sym)
                         return UNKNOWN
                 else:
                     # Can't access field on non-record type
@@ -926,7 +930,7 @@ class TypeChecker:
         if fn_type:
             return fn_type
 
-        self.error(f"Undefined variable: {name}")
+        self.error(f"Undefined variable: {name}", sym)
         return UNKNOWN
 
     def _infer_compound(self, expr: SList) -> Type:
@@ -953,7 +957,8 @@ class TypeChecker:
             return PrimitiveType('Bool')
         if op == 'not':
             if len(expr) > 1:
-                self._expect_type(expr[1], PrimitiveType('Bool'), "not operand")
+                operand_type = self.infer_expr(expr[1])
+                self._expect_type(operand_type, PrimitiveType('Bool'), "not operand", expr[1])
             return PrimitiveType('Bool')
 
         # Conditionals
@@ -1030,7 +1035,7 @@ class TypeChecker:
     def _infer_arithmetic(self, op: str, expr: SList) -> Type:
         """Infer type of arithmetic expression with range propagation"""
         if len(expr) < 3:
-            self.error(f"Arithmetic operator '{op}' requires 2 operands")
+            self.error(f"Arithmetic operator '{op}' requires 2 operands", expr)
             return PrimitiveType('Int')
 
         left = self.infer_expr(expr[1])
@@ -1159,7 +1164,7 @@ class TypeChecker:
         right = self.infer_expr(expr[2])
         # Allow comparison between compatible numeric types
         if not self._types_comparable(left, right):
-            self.warning(f"Comparing potentially incompatible types: {left} vs {right}")
+            self.warning(f"Comparing potentially incompatible types: {left} vs {right}", expr)
 
     def _types_comparable(self, a: Type, b: Type) -> bool:
         """Check if two types can be compared"""
@@ -1176,7 +1181,7 @@ class TypeChecker:
         for operand in expr.items[1:]:
             typ = self.infer_expr(operand)
             if not isinstance(typ, PrimitiveType) or typ.name != 'Bool':
-                self.warning(f"Boolean operator expects Bool, got {typ}")
+                self.warning(f"Boolean operator expects Bool, got {typ}", operand)
 
     def _infer_if(self, expr: SList) -> Type:
         """Infer type of if expression with path-sensitive refinement."""
@@ -1187,7 +1192,7 @@ class TypeChecker:
 
         # Check condition is Bool
         cond_type = self.infer_expr(cond)
-        self._expect_type(cond_type, PrimitiveType('Bool'), "if condition")
+        self._expect_type(cond_type, PrimitiveType('Bool'), "if condition", cond)
 
         # Extract constraint for path-sensitive refinement
         constraint = self._extract_constraint(cond)
@@ -1223,7 +1228,7 @@ class TypeChecker:
         self._pop_refinements()
 
         # Result is union of branch types
-        return self._unify_branch_types(then_type, else_type)
+        return self._unify_branch_types(then_type, else_type, expr)
 
     def _lookup_var_for_refinement(self, var_path: str) -> Optional[Type]:
         """Look up type of a variable (or field path) for refinement."""
@@ -1281,7 +1286,7 @@ class TypeChecker:
 
         result = branch_types[0]
         for t in branch_types[1:]:
-            result = self._unify_branch_types(result, t)
+            result = self._unify_branch_types(result, t, expr)
         return result
 
     def _bind_pattern(self, pattern: SExpr, scrutinee_type: Type):
@@ -1370,7 +1375,7 @@ class TypeChecker:
             field_type = actual_type.get_field(field_name)
             if field_type:
                 return field_type
-            self.error(f"Record '{actual_type.name}' has no field '{field_name}'")
+            self.error(f"Record '{actual_type.name}' has no field '{field_name}'", expr)
         else:
             # Might be FFI struct - allow it
             pass
@@ -1388,17 +1393,17 @@ class TypeChecker:
         # Check index is integral
         index_range = self._get_range_bounds(index_type)
         if index_range is None:
-            self.warning("Array index should be an integer type")
+            self.warning("Array index should be an integer type", expr[2])
 
         # Bounds checking
         if isinstance(array_type, ArrayType):
             if index_range:
                 if index_range.min_val is not None and index_range.min_val < 0:
                     self.error(f"Array index may be negative: {index_range.min_val}",
-                              hint="Add a bounds check before indexing")
+                              expr[2], hint="Add a bounds check before indexing")
                 if index_range.max_val is not None and index_range.max_val >= array_type.size:
                     self.error(f"Array index may exceed bounds: {index_range.max_val} >= {array_type.size}",
-                              hint="Ensure index is less than array size")
+                              expr[2], hint="Ensure index is less than array size")
             return array_type.element_type
 
         if isinstance(array_type, ListType):
@@ -1406,7 +1411,7 @@ class TypeChecker:
                 if (index_range.max_val is not None and
                     array_type.length_bounds.max_val is not None and
                     index_range.max_val >= array_type.length_bounds.max_val):
-                    self.warning(f"List index may exceed length bounds")
+                    self.warning(f"List index may exceed length bounds", expr[2])
             return array_type.element_type
 
         return UNKNOWN
@@ -1423,12 +1428,12 @@ class TypeChecker:
                     # Handle dotted field access: (set! obj.field value)
                     target_type = self._infer_symbol(target)
                     if not isinstance(target_type, UnknownType):
-                        self._check_assignable(value_type, target_type, f"assignment to '{name}'")
+                        self._check_assignable(value_type, target_type, f"assignment to '{name}'", expr[2])
                 else:
                     # Simple variable assignment
                     expected = self.env.lookup_var(name)
                     if expected:
-                        self._check_assignable(value_type, expected, f"assignment to '{name}'")
+                        self._check_assignable(value_type, expected, f"assignment to '{name}'", expr[2])
         elif len(expr) == 4:
             # (set! obj field value)
             obj_type = self.infer_expr(expr[1])
@@ -1442,7 +1447,7 @@ class TypeChecker:
             if isinstance(actual_type, RecordType):
                 field_type = actual_type.get_field(field_name)
                 if field_type:
-                    self._check_assignable(value_type, field_type, f"field '{field_name}'")
+                    self._check_assignable(value_type, field_type, f"field '{field_name}'", expr[3])
 
         return PrimitiveType('Unit')
 
@@ -1476,12 +1481,12 @@ class TypeChecker:
 
         # Check argument count
         if len(args) != len(fn_type.param_types):
-            self.error(f"Function '{fn_name}' expects {len(fn_type.param_types)} arguments, got {len(args)}")
+            self.error(f"Function '{fn_name}' expects {len(fn_type.param_types)} arguments, got {len(args)}", expr)
 
         # Check argument types
         for i, (arg, expected) in enumerate(zip(args, fn_type.param_types)):
             arg_type = self.infer_expr(arg)
-            self._check_assignable(arg_type, expected, f"argument {i+1} to '{fn_name}'")
+            self._check_assignable(arg_type, expected, f"argument {i+1} to '{fn_name}'", arg)
 
         return fn_type.return_type
 
@@ -1489,12 +1494,12 @@ class TypeChecker:
     # Type Checking Helpers
     # ========================================================================
 
-    def _expect_type(self, actual: Type, expected: Type, context: str):
+    def _expect_type(self, actual: Type, expected: Type, context: str, node: Optional[SExpr] = None):
         """Check that actual type matches expected"""
         if isinstance(actual, Type) and not isinstance(actual, UnknownType):
-            self._check_assignable(actual, expected, context)
+            self._check_assignable(actual, expected, context, node)
 
-    def _check_assignable(self, source: Type, target: Type, context: str):
+    def _check_assignable(self, source: Type, target: Type, context: str, node: Optional[SExpr] = None):
         """Check if source type can be assigned to target type"""
         if isinstance(source, UnknownType) or isinstance(target, UnknownType):
             return  # Can't check unknown types
@@ -1513,7 +1518,7 @@ class TypeChecker:
             if source.base == target.base:
                 if not source.bounds.is_subrange_of(target.bounds):
                     self.error(f"{context}: range {source} does not fit in {target}",
-                              hint="Value may exceed target range bounds")
+                              node, hint="Value may exceed target range bounds")
                     return
 
         # Range type assignable to unbounded base type
@@ -1531,13 +1536,13 @@ class TypeChecker:
                 if target.nullable and not source.nullable:
                     return  # Non-null to nullable is OK
                 if not target.nullable and source.nullable:
-                    self.warning(f"{context}: assigning nullable pointer to non-nullable")
+                    self.warning(f"{context}: assigning nullable pointer to non-nullable", node)
                     return
                 return
 
-        self.error(f"{context}: expected {target}, got {source}")
+        self.error(f"{context}: expected {target}, got {source}", node)
 
-    def _unify_branch_types(self, a: Type, b: Type) -> Type:
+    def _unify_branch_types(self, a: Type, b: Type, node: Optional[SExpr] = None) -> Type:
         """Unify types from different branches (if/match)"""
         if a.equals(b):
             return a
@@ -1565,7 +1570,7 @@ class TypeChecker:
             return a
 
         # Different types - return union (simplified to first type with warning)
-        self.warning(f"Branch types differ: {a} vs {b}")
+        self.warning(f"Branch types differ: {a} vs {b}", node)
         return a
 
     def _unify_types(self, a: Type, b: Type) -> Type:
@@ -1734,9 +1739,9 @@ class TypeChecker:
             last_type = self.infer_expr(expr)
 
         # Check return type
-        if not isinstance(fn_type.return_type, UnknownType):
+        if not isinstance(fn_type.return_type, UnknownType) and body_exprs:
             self._check_assignable(last_type, fn_type.return_type,
-                                  f"return value of '{name}'")
+                                  f"return value of '{name}'", body_exprs[-1])
 
         self.env.pop_scope()
 
