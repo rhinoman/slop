@@ -71,10 +71,10 @@
 
         (with-arena 256
           (let ((addr (arena-alloc arena (sizeof sockaddr_in)))
-                (opt (arena-alloc arena (sizeof Int))))
+                (opt (cast (Ptr Int) (arena-alloc arena (sizeof Int)))))
 
             ;; Set SO_REUSEADDR (SOL_SOCKET=1, SO_REUSEADDR=2)
-            (set! opt 1)
+            (set! (deref opt) 1)
             (setsockopt sock 1 2 opt 4)
 
             ;; Zero out sockaddr_in

@@ -1279,6 +1279,10 @@ class Transpiler:
                 arr = self.transpile_expr(target[1])
                 idx = self.transpile_expr(target[2])
                 self.emit(f"{arr}[{idx}] = {value};")
+            # Check if target is a deref: (deref ptr)
+            elif is_form(target, 'deref'):
+                ptr = self.transpile_expr(target[1])
+                self.emit(f"(*{ptr}) = {value};")
             # Simple variable assignment
             else:
                 target_code = self.transpile_expr(target)
