@@ -18,6 +18,44 @@ Humans: Specify WHAT (intent, contracts, types, examples)
 Machines: Handle HOW (implementation, verification, compilation)
 ```
 
+## Default Workflow: Scaffolding First
+
+When generating SLOP code, **always start with scaffolding**:
+
+1. **Types First** - Define all types (`type`, `record`, `enum`, `union`)
+2. **Function Signatures** - Create functions with full annotations but hole bodies:
+   ```lisp
+   (fn process-order ((arena Arena) (order (Ptr Order)))
+     (@intent "Validate and process a customer order")
+     (@spec ((Arena (Ptr Order)) -> (Result Receipt OrderError)))
+     (@pre (!= order nil))
+     (@post (match $result ((ok r) (!= r nil)) ((error _) true)))
+     (hole (Result Receipt OrderError) "validate order, calculate total, create receipt"
+       :complexity tier-3
+       :must-use (order)))
+   ```
+3. **Review** - Let user review types and signatures before filling holes
+4. **Fill Holes** - Only implement after scaffolding is approved
+
+**Handling Ambiguity:**
+When something is unclear (storage approach, external dependencies, etc.):
+- **Ask the user** if they can decide now
+- **Use `@requires`** if they want to defer the decision:
+  ```lisp
+  (@requires storage
+    :prompt "Which storage approach?"
+    :options (("In-memory Map" map) ("Database FFI" db) ("Custom" custom))
+    (get-item ((id ItemId)) -> (Option Item))
+    (save-item ((item Item)) -> Bool))
+  ```
+This lets the scaffolding proceed while deferring implementation details.
+
+**Why scaffolding first?**
+- Catches type/API design issues early
+- User can adjust contracts before implementation
+- Holes can be filled incrementally or by `slop fill`
+- Reduces wasted effort on wrong implementations
+
 ## Quick Reference
 
 ### Syntax
@@ -333,20 +371,21 @@ are available. If not, warn the user that the @requires must be resolved first.
 
 ## Generation Guidelines
 
-1. **ALWAYS include @intent and @spec on EVERY function** - without @spec, type checking fails
-2. **Use ALL applicable annotations** - @pre/@post/@example improve verification and LLM accuracy
-3. **Add @pre for input validation** - e.g., `(@pre (!= ptr nil))`, `(@pre (> id 0))`
-4. **Add @post for output guarantees** - e.g., `(@post (>= $result 0))`, `(@post (!= $result nil))`
-5. **Add @example for clarity** - concrete input/output pairs guide implementation
-6. **Mark pure functions with @pure** - enables optimizations, documents no side effects
-7. Use range types to constrain values
-8. Pass Arena as first param for allocating functions
-9. Use (Result T E) for fallible operations
-10. ALWAYS specify `:complexity` on holes (tier-1: no branching, tier-2: branching, tier-3: loops, tier-4: nested/complex)
-11. Prefer (. x field) over direct pointer syntax
-12. ONLY use functions from references/builtins.md or defined via FFI
-13. When unsure if a function exists, check builtins.md first
-14. SLOP is minimal - no convenience functions. Convert types explicitly.
+1. **START WITH SCAFFOLDING** - Never one-shot complete implementations. Create types and annotated function signatures with holes first. Let user review before filling.
+2. **ALWAYS include @intent and @spec on EVERY function** - without @spec, type checking fails
+3. **Use ALL applicable annotations** - @pre/@post/@example improve verification and LLM accuracy
+4. **Add @pre for input validation** - e.g., `(@pre (!= ptr nil))`, `(@pre (> id 0))`
+5. **Add @post for output guarantees** - e.g., `(@post (>= $result 0))`, `(@post (!= $result nil))`
+6. **Add @example for clarity** - concrete input/output pairs guide implementation
+7. **Mark pure functions with @pure** - enables optimizations, documents no side effects
+8. Use range types to constrain values
+9. Pass Arena as first param for allocating functions
+10. Use (Result T E) for fallible operations
+11. ALWAYS specify `:complexity` on holes (tier-1: no branching, tier-2: branching, tier-3: loops, tier-4: nested/complex)
+12. Prefer (. x field) over direct pointer syntax
+13. ONLY use functions from references/builtins.md or defined via FFI
+14. When unsure if a function exists, check builtins.md first
+15. SLOP is minimal - no convenience functions. Convert types explicitly.
 
 ## See Also
 
