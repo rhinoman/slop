@@ -225,6 +225,69 @@ def is_form(expr: SExpr, keyword: str) -> bool:
 def get_forms(ast: List[SExpr], keyword: str) -> List[SList]:
     return [e for e in ast if is_form(e, keyword)]
 
+def get_imports(ast: List[SExpr]) -> List[SList]:
+    """Get all import declarations from AST.
+
+    Import form: (import module-name (name arity)*)
+    """
+    return get_forms(ast, 'import')
+
+def get_exports(ast: List[SExpr]) -> List[SList]:
+    """Get all export declarations from AST.
+
+    Export form: (export (name arity)*)
+    """
+    return get_forms(ast, 'export')
+
+@dataclass
+class ImportSpec:
+    """Parsed import specification."""
+    module_name: str
+    symbols: List[tuple]  # [(name, arity), ...]
+    line: int = 0
+    col: int = 0
+
+def parse_import(form: SList) -> ImportSpec:
+    """Parse an import form into ImportSpec.
+
+    (import module-name (sym1 arity1) (sym2 arity2) ...)
+    """
+    if len(form) < 2:
+        raise ParseError("import requires module name", form.line, form.col)
+
+    module_name = form[1].name if isinstance(form[1], Symbol) else str(form[1])
+    symbols = []
+
+    for item in form.items[2:]:
+        if isinstance(item, SList) and len(item) >= 2:
+            name = item[0].name if isinstance(item[0], Symbol) else str(item[0])
+            arity = int(item[1].value) if isinstance(item[1], Number) else 0
+            symbols.append((name, arity))
+
+    return ImportSpec(module_name, symbols, form.line, form.col)
+
+@dataclass
+class ExportSpec:
+    """Parsed export specification."""
+    symbols: List[tuple]  # [(name, arity), ...]
+    line: int = 0
+    col: int = 0
+
+def parse_export(form: SList) -> ExportSpec:
+    """Parse an export form into ExportSpec.
+
+    (export (sym1 arity1) (sym2 arity2) ...)
+    """
+    symbols = []
+
+    for item in form.items[1:]:
+        if isinstance(item, SList) and len(item) >= 2:
+            name = item[0].name if isinstance(item[0], Symbol) else str(item[0])
+            arity = int(item[1].value) if isinstance(item[1], Number) else 0
+            symbols.append((name, arity))
+
+    return ExportSpec(symbols, form.line, form.col)
+
 def find_all(expr: SExpr, predicate) -> List[SExpr]:
     results = []
     def walk(e):

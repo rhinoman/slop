@@ -10,7 +10,7 @@ Performs compile-time type checking including:
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Union, List, Dict, Optional, Tuple, Any
+from typing import Union, List, Dict, Optional, Tuple, Any, Set
 from slop.parser import SExpr, SList, Symbol, String, Number, is_form
 
 
@@ -225,6 +225,21 @@ class ArrayType(Type):
         if isinstance(other, ArrayType):
             return (self.element_type.equals(other.element_type) and
                     self.size == other.size)
+        return False
+
+
+@dataclass(frozen=True)
+class MapType(Type):
+    """Map type: (Map K V)"""
+    key_type: Type
+    value_type: Type
+
+    def __str__(self) -> str:
+        return f"(Map {self.key_type} {self.value_type})"
+
+    def equals(self, other: Type) -> bool:
+        if isinstance(other, MapType):
+            return self.key_type.equals(other.key_type) and self.value_type.equals(other.value_type)
         return False
 
 
@@ -455,6 +470,8 @@ class TypeEnv:
         self.current_scope = Scope()
         self.type_registry: Dict[str, Type] = {}
         self.function_sigs: Dict[str, FnType] = {}
+        self.imported_functions: Dict[str, FnType] = {}  # imported fn name -> type
+        self.imported_types: Dict[str, Type] = {}  # imported type name -> type
         self._init_builtins()
 
     def _init_builtins(self):
@@ -494,7 +511,20 @@ class TypeEnv:
         self.function_sigs[name] = sig
 
     def lookup_function(self, name: str) -> Optional[FnType]:
-        return self.function_sigs.get(name)
+        # Check local functions first
+        if name in self.function_sigs:
+            return self.function_sigs[name]
+        # Then check imports
+        return self.imported_functions.get(name)
+
+    def register_import(self, name: str, fn_type: FnType):
+        """Register an imported function's type signature."""
+        self.imported_functions[name] = fn_type
+
+    def register_imported_type(self, name: str, typ: Type):
+        """Register an imported type."""
+        self.imported_types[name] = typ
+        self.type_registry[name] = typ
 
     def lookup_enum_variant(self, variant_name: str) -> Optional[EnumType]:
         """Look up which enum type contains a given variant."""
@@ -551,6 +581,10 @@ class TypeChecker:
         self._type_var_counter = 0
         # Path-sensitive refinement context: stack of (var -> refined_type) dicts
         self._refinements: List[Dict[str, Type]] = [{}]
+        # Parameter mode tracking for current function: var -> mode
+        self._param_modes: Dict[str, str] = {}
+        # Track which 'out' parameters have been initialized (written to)
+        self._out_initialized: Set[str] = set()
 
     def fresh_type_var(self, name: Optional[str] = None) -> TypeVar:
         self._type_var_counter += 1
@@ -588,6 +622,36 @@ class TypeChecker:
             if var in ctx:
                 return ctx[var]
         return None
+
+    # ========================================================================
+    # Parameter Mode Handling
+    # ========================================================================
+
+    def _parse_parameter_mode(self, param: SExpr) -> Tuple[str, Optional[str], Optional[SExpr]]:
+        """Extract (mode, name, type_expr) from parameter form.
+
+        Handles:
+        - (name Type)           -> ('in', 'name', Type)
+        - (in name Type)        -> ('in', 'name', Type)
+        - (out name Type)       -> ('out', 'name', Type)
+        - (mut name Type)       -> ('mut', 'name', Type)
+        """
+        if isinstance(param, SList) and len(param) >= 2:
+            first = param[0]
+
+            # Check if first element is a mode keyword
+            if isinstance(first, Symbol) and first.name in ('in', 'out', 'mut'):
+                mode = first.name
+                name = param[1].name if isinstance(param[1], Symbol) else None
+                type_expr = param[2] if len(param) > 2 else None
+                return (mode, name, type_expr)
+            else:
+                # No explicit mode -> default to 'in'
+                name = first.name if isinstance(first, Symbol) else None
+                type_expr = param[1] if len(param) > 1 else None
+                return ('in', name, type_expr)
+
+        return ('in', None, None)
 
     def _extract_constraint(self, cond: SExpr) -> Optional[Constraint]:
         """Extract a type constraint from a condition expression.
@@ -707,6 +771,11 @@ class TypeChecker:
                     ok_type = self.parse_type_expr(expr[1]) if len(expr) > 1 else UNKNOWN
                     err_type = self.parse_type_expr(expr[2]) if len(expr) > 2 else PrimitiveType('Error')
                     return ResultType(ok_type, err_type)
+
+                if name == 'Map':
+                    key_type = self.parse_type_expr(expr[1]) if len(expr) > 1 else UNKNOWN
+                    value_type = self.parse_type_expr(expr[2]) if len(expr) > 2 else UNKNOWN
+                    return MapType(key_type, value_type)
 
                 if name == 'Ptr':
                     pointee = self.parse_type_expr(expr[1]) if len(expr) > 1 else UNKNOWN
@@ -923,6 +992,11 @@ class TypeChecker:
         # Variable lookup
         typ = self.env.lookup_var(name)
         if typ:
+            # Check for uninitialized 'out' parameter read
+            if name in self._param_modes and self._param_modes[name] == 'out':
+                if name not in self._out_initialized:
+                    self.warning(f"Reading from 'out' parameter '{name}' before initialization", sym,
+                                hint="'out' parameters must be written to before reading.")
             return typ
 
         # Function lookup (for first-class functions)
@@ -1001,6 +1075,10 @@ class TypeChecker:
             return OptionType(inner)
         if op == 'none':
             return OptionType(self.fresh_type_var('T'))
+
+        # Map literal: (map (k1 v1) (k2 v2) ...)
+        if op == 'map':
+            return self._infer_map_literal(expr)
 
         # Quote - check if it's an enum variant
         if op == 'quote':
@@ -1182,6 +1260,39 @@ class TypeChecker:
             typ = self.infer_expr(operand)
             if not isinstance(typ, PrimitiveType) or typ.name != 'Bool':
                 self.warning(f"Boolean operator expects Bool, got {typ}", operand)
+
+    def _infer_map_literal(self, expr: SList) -> Type:
+        """Infer type of map literal: (map (k1 v1) (k2 v2) ...)"""
+        pairs = expr.items[1:]
+
+        if not pairs:
+            # Empty map - use type variables for key/value types
+            return MapType(self.fresh_type_var('K'), self.fresh_type_var('V'))
+
+        # Get types from first pair
+        first = pairs[0]
+        if not isinstance(first, SList) or len(first) < 2:
+            self.error("Map literal requires (key value) pairs", first if isinstance(first, SList) else expr)
+            return MapType(UNKNOWN, UNKNOWN)
+
+        key_type = self.infer_expr(first[0])
+        value_type = self.infer_expr(first[1])
+
+        # Check remaining pairs for type consistency
+        for pair in pairs[1:]:
+            if not isinstance(pair, SList) or len(pair) < 2:
+                self.error("Map literal requires (key value) pairs", pair if isinstance(pair, SList) else expr)
+                continue
+
+            k_type = self.infer_expr(pair[0])
+            v_type = self.infer_expr(pair[1])
+
+            if not k_type.equals(key_type):
+                self.error(f"Map key type mismatch: expected {key_type}, got {k_type}", pair[0])
+            if not v_type.equals(value_type):
+                self.error(f"Map value type mismatch: expected {value_type}, got {v_type}", pair[1])
+
+        return MapType(key_type, value_type)
 
     def _infer_if(self, expr: SList) -> Type:
         """Infer type of if expression with path-sensitive refinement."""
@@ -1431,6 +1542,15 @@ class TypeChecker:
                         self._check_assignable(value_type, target_type, f"assignment to '{name}'", expr[2])
                 else:
                     # Simple variable assignment
+                    # Check parameter mode constraints
+                    if name in self._param_modes:
+                        mode = self._param_modes[name]
+                        if mode == 'in':
+                            self.error(f"Cannot assign to 'in' parameter '{name}'", target,
+                                      hint="'in' parameters are read-only. Use 'mut' mode for read-write access.")
+                        elif mode == 'out':
+                            # Mark out parameter as initialized
+                            self._out_initialized.add(name)
                     expected = self.env.lookup_var(name)
                     if expected:
                         self._check_assignable(value_type, expected, f"assignment to '{name}'", expr[2])
@@ -1680,12 +1800,14 @@ class TypeChecker:
         name = form[1].name if isinstance(form[1], Symbol) else str(form[1])
         params = form[2] if len(form) > 2 and isinstance(form[2], SList) else SList([])
 
-        # Extract parameter types
+        # Extract parameter types (mode-aware)
         param_types: List[Type] = []
         for param in params:
             if isinstance(param, SList) and len(param) >= 2:
-                param_type = self.parse_type_expr(param[1])
-                param_types.append(param_type)
+                mode, pname, ptype_expr = self._parse_parameter_mode(param)
+                if ptype_expr:
+                    param_type = self.parse_type_expr(ptype_expr)
+                    param_types.append(param_type)
 
         # Extract return type from @spec
         return_type: Type = PrimitiveType('Unit')
@@ -1717,16 +1839,23 @@ class TypeChecker:
 
         self.env.push_scope()
 
-        # Bind parameters
+        # Clear parameter mode tracking for this function
+        self._param_modes = {}
+        self._out_initialized = set()
+
+        # Bind parameters with mode tracking
         param_types_iter = iter(fn_type.param_types)
         for param in params:
             if isinstance(param, SList) and len(param) >= 1:
-                param_name = param[0].name if isinstance(param[0], Symbol) else str(param[0])
-                try:
-                    param_type = next(param_types_iter)
-                except StopIteration:
-                    param_type = UNKNOWN
-                self.env.bind_var(param_name, param_type)
+                mode, param_name, _ = self._parse_parameter_mode(param)
+                if param_name:
+                    try:
+                        param_type = next(param_types_iter)
+                    except StopIteration:
+                        param_type = UNKNOWN
+                    self.env.bind_var(param_name, param_type)
+                    # Track parameter mode
+                    self._param_modes[param_name] = mode
 
         # Check body expressions
         body_exprs = [item for item in form.items[3:]
@@ -1750,6 +1879,32 @@ class TypeChecker:
 # Public API
 # ============================================================================
 
+def parse_type_expr(expr: SExpr, type_registry: Optional[Dict[str, 'Type']] = None) -> Type:
+    """Parse an AST type expression into a Type object.
+
+    This is a convenience function for external callers (like hole_filler)
+    that need to parse type expressions without a full TypeChecker context.
+
+    Args:
+        expr: The type expression AST (Symbol or SList)
+        type_registry: Optional dict of known type names -> Type objects.
+                      If not provided, only built-in types are recognized.
+
+    Returns:
+        The parsed Type object
+
+    Examples:
+        parse_type_expr(Symbol('Int')) -> PrimitiveType('Int')
+        parse_type_expr(SList([Symbol('Ptr'), Symbol('User')])) -> PtrType(...)
+        parse_type_expr(SList([Symbol('Option'), Symbol('Int')])) -> OptionType(...)
+    """
+    # Create minimal checker just for type parsing
+    checker = TypeChecker()
+    if type_registry:
+        checker.env.type_registry.update(type_registry)
+    return checker.parse_type_expr(expr)
+
+
 def check_file(path: str) -> List[TypeDiagnostic]:
     """Type check a SLOP file"""
     from slop.parser import parse_file
@@ -1764,3 +1919,57 @@ def check_source(source: str, filename: str = "<string>") -> List[TypeDiagnostic
     ast = parse(source)
     checker = TypeChecker(filename)
     return checker.check_module(ast)
+
+
+def check_modules(modules: dict, order: list) -> Dict[str, List[TypeDiagnostic]]:
+    """Type check multiple modules in dependency order.
+
+    Args:
+        modules: Dict mapping module name to ModuleInfo (from resolver)
+        order: List of module names in topological order (dependencies first)
+
+    Returns:
+        Dict mapping module_name to list of diagnostics
+    """
+    from slop.parser import is_form, get_imports, parse_import
+
+    results: Dict[str, List[TypeDiagnostic]] = {}
+    # Track exported function signatures for cross-module checking
+    exported_sigs: Dict[str, Dict[str, FnType]] = {}  # module_name -> {fn_name -> sig}
+    exported_types: Dict[str, Dict[str, Type]] = {}  # module_name -> {type_name -> type}
+
+    for mod_name in order:
+        info = modules[mod_name]
+        checker = TypeChecker(str(info.path))
+
+        # Register imported functions from already-checked modules
+        for imp in info.imports:
+            source_mod = imp.module_name
+            if source_mod in exported_sigs:
+                for fn_name, _ in imp.symbols:
+                    if fn_name in exported_sigs[source_mod]:
+                        checker.env.register_import(fn_name, exported_sigs[source_mod][fn_name])
+
+            # Register imported types
+            if source_mod in exported_types:
+                for type_name, typ in exported_types[source_mod].items():
+                    checker.env.register_imported_type(type_name, typ)
+
+        # Type check this module
+        diagnostics = checker.check_module(info.ast)
+        results[mod_name] = diagnostics
+
+        # Collect exported signatures for dependent modules
+        exported_sigs[mod_name] = {}
+        exported_types[mod_name] = {}
+
+        for fn_name, arity in info.exports.items():
+            if fn_name in checker.env.function_sigs:
+                exported_sigs[mod_name][fn_name] = checker.env.function_sigs[fn_name]
+
+        # Export all types defined in this module
+        for type_name, typ in checker.env.type_registry.items():
+            if type_name not in checker.env.imported_types:
+                exported_types[mod_name][type_name] = typ
+
+    return results

@@ -1,0 +1,15 @@
+(module strings
+  (export (concat 2) (len 1))
+
+  ;; Error type - should become strings_Error in C output
+  (type Error (enum not-found invalid-utf8))
+
+  (fn concat ((a String) (b String))
+    (@intent "Concatenate two strings")
+    (@spec ((String String) -> String))
+    (hole String "concatenate strings" :complexity tier-1))
+
+  (fn len ((s String))
+    (@intent "Get string length")
+    (@spec ((String) -> Int))
+    (hole Int "get length" :complexity tier-1)))

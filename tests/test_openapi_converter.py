@@ -119,7 +119,7 @@ class TestOpenApiConverter:
         # Check function name uses 'create' prefix
         assert "create-users" in output
         # Check body parameter
-        assert "(body (Ptr Createuser))" in output
+        assert "(body (Ptr CreateUser))" in output
         # Check precondition for body
         assert "(@pre (!= body nil))" in output
         # Check must-use

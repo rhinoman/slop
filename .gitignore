@@ -44,3 +44,5 @@ htmlcov/
 
 # code tools
 .claude/
+
+james-tests/

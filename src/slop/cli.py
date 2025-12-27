@@ -16,13 +16,14 @@ import sys
 import os
 from pathlib import Path
 
-from slop.parser import parse, parse_file, pretty_print, find_holes, is_form, SList
-from slop.transpiler import Transpiler, transpile
+from slop.parser import parse, parse_file, pretty_print, find_holes, is_form, SList, get_imports
+from slop.transpiler import Transpiler, transpile, transpile_multi
 from slop.hole_filler import HoleFiller, extract_hole, classify_tier, replace_holes_in_ast
 from slop.providers import (
     MockProvider, create_default_configs, load_config, create_from_config, Tier
 )
-from slop.type_checker import TypeChecker, check_file
+from slop.type_checker import TypeChecker, check_file, check_modules
+from slop.resolver import ModuleResolver, ResolverError
 
 
 def extract_requires_blocks(ast):
@@ -141,6 +142,66 @@ def _extract_fn_spec(form: SList) -> dict:
             break
 
     return {'name': name, 'params': params, 'return_type': return_type}
+
+
+def _extract_ffi_functions(ast) -> list:
+    """Extract function names from FFI declarations.
+
+    Handles both top-level (ffi ...) and (module ... (ffi ...)) forms.
+    """
+    from slop.parser import Symbol
+    ffi_functions = []
+
+    for form in ast:
+        if is_form(form, 'ffi'):
+            # (ffi "header.h" (func1 ...) (func2 ...) ...)
+            for item in form.items[2:]:  # Skip 'ffi' and header
+                if isinstance(item, SList) and len(item) >= 1:
+                    if isinstance(item[0], Symbol):
+                        ffi_functions.append(item[0].name)
+        elif is_form(form, 'module'):
+            # Look inside module for ffi declarations
+            for subform in form.items:
+                if is_form(subform, 'ffi'):
+                    for item in subform.items[2:]:
+                        if isinstance(item, SList) and len(item) >= 1:
+                            if isinstance(item[0], Symbol):
+                                ffi_functions.append(item[0].name)
+
+    return ffi_functions
+
+
+def _extract_imported_functions(ast) -> list:
+    """Extract function and type names from import declarations.
+
+    Handles both top-level (import ...) and (module ... (import ...)) forms.
+    Returns both function names (from (fn-name arity)) and type names (bare symbols).
+    """
+    from slop.parser import Symbol
+    imported_names = []
+
+    for form in ast:
+        if is_form(form, 'import'):
+            # (import module-name (fn1 arity) (fn2 arity) Type1 Type2 ...)
+            for item in form.items[2:]:  # Skip 'import' and module name
+                if isinstance(item, SList) and len(item) >= 1:
+                    # Function import: (fn-name arity)
+                    if isinstance(item[0], Symbol):
+                        imported_names.append(item[0].name)
+                elif isinstance(item, Symbol):
+                    # Type import: bare symbol
+                    imported_names.append(item.name)
+        elif is_form(form, 'module'):
+            for subform in form.items:
+                if is_form(subform, 'import'):
+                    for item in subform.items[2:]:
+                        if isinstance(item, SList) and len(item) >= 1:
+                            if isinstance(item[0], Symbol):
+                                imported_names.append(item[0].name)
+                        elif isinstance(item, Symbol):
+                            imported_names.append(item.name)
+
+    return imported_names
 
 
 def cmd_fill(args):
@@ -285,6 +346,10 @@ def cmd_fill(args):
                         if spec:
                             fn_specs.append(spec)
 
+        # Collect FFI function names and imported names for validation
+        ffi_functions = _extract_ffi_functions(ast)
+        imported_names = _extract_imported_functions(ast)
+
         # Collect all holes with their parent function forms for context
         all_holes = []
         for form in ast:
@@ -351,7 +416,7 @@ def cmd_fill(args):
                 context['type_defs'] = type_defs
                 context['fn_specs'] = fn_specs
                 context['requires_fns'] = requires_fns
-                context['defined_functions'] = [s['name'] for s in fn_specs] + type_names
+                context['defined_functions'] = [s['name'] for s in fn_specs] + type_names + ffi_functions + imported_names
                 context['error_variants'] = error_variants
                 if tier not in tier_groups:
                     tier_groups[tier] = []
@@ -418,7 +483,7 @@ def cmd_fill(args):
                 context['type_defs'] = type_defs
                 context['fn_specs'] = fn_specs
                 context['requires_fns'] = requires_fns
-                context['defined_functions'] = [s['name'] for s in fn_specs] + type_names
+                context['defined_functions'] = [s['name'] for s in fn_specs] + type_names + ffi_functions + imported_names
                 context['error_variants'] = error_variants
 
                 result = filler.fill(info, context)
@@ -450,7 +515,11 @@ def cmd_fill(args):
 
         output_text = '\n'.join(output_lines)
 
-        if args.output:
+        if args.inplace:
+            Path(args.input).write_text(output_text)
+            if not quiet:
+                print(f"\nWrote {args.input}")
+        elif args.output:
             Path(args.output).write_text(output_text)
             if not quiet:
                 print(f"\nWrote {args.output}")
@@ -561,6 +630,18 @@ def _get_runtime_path() -> Path:
         return Path(__file__).parent / "runtime"
 
 
+def _has_imports(ast) -> bool:
+    """Check if AST contains import declarations."""
+    for form in ast:
+        if is_form(form, 'module'):
+            for item in form.items[2:]:
+                if is_form(item, 'import'):
+                    return True
+        elif is_form(form, 'import'):
+            return True
+    return False
+
+
 def cmd_build(args):
     """Full build pipeline"""
     try:
@@ -573,36 +654,99 @@ def cmd_build(args):
         print("  Parsing...")
         ast = parse_file(args.input)
 
-        # Check for holes
-        total_holes = sum(len(find_holes(form)) for form in ast)
-        if total_holes > 0:
-            print(f"  Warning: {total_holes} unfilled holes")
+        # Check if this is a multi-module build
+        search_paths = [Path(p) for p in (args.include or [])]
+        is_multi_module = _has_imports(ast)
 
-        # Type check
-        print("  Type checking...")
-        diagnostics = check_file(args.input)
-        type_errors = [d for d in diagnostics if d.severity == 'error']
-        type_warnings = [d for d in diagnostics if d.severity == 'warning']
+        if is_multi_module:
+            # Multi-module build
+            print("  Resolving modules...")
+            resolver = ModuleResolver(search_paths)
+            try:
+                graph = resolver.build_dependency_graph(input_path)
+                order = resolver.topological_sort(graph)
+                print(f"    Build order: {', '.join(order)}")
+            except ResolverError as e:
+                print(f"  Module resolution failed: {e}")
+                return 1
 
-        for w in type_warnings:
-            print(f"    {w}")
+            # Validate imports
+            errors = resolver.validate_imports(graph)
+            if errors:
+                for e in errors:
+                    print(f"    {e}")
+                print(f"  Import validation failed: {len(errors)} error(s)")
+                return 1
 
-        if type_errors:
-            for e in type_errors:
-                print(f"    {e}")
-            print(f"  Type check failed: {len(type_errors)} error(s)")
-            return 1
+            # Check for holes across all modules
+            total_holes = 0
+            for mod_name in order:
+                info = graph.modules[mod_name]
+                for form in info.ast:
+                    total_holes += len(find_holes(form))
+            if total_holes > 0:
+                print(f"  Warning: {total_holes} unfilled holes")
 
-        if type_warnings:
-            print(f"  Type check passed with {len(type_warnings)} warning(s)")
+            # Type check all modules
+            print("  Type checking...")
+            all_diagnostics = check_modules(graph.modules, order)
+            total_errors = 0
+            total_warnings = 0
+            for mod_name, diagnostics in all_diagnostics.items():
+                type_errors = [d for d in diagnostics if d.severity == 'error']
+                type_warnings = [d for d in diagnostics if d.severity == 'warning']
+                for w in type_warnings:
+                    print(f"    [{mod_name}] {w}")
+                for e in type_errors:
+                    print(f"    [{mod_name}] {e}")
+                total_errors += len(type_errors)
+                total_warnings += len(type_warnings)
+
+            if total_errors > 0:
+                print(f"  Type check failed: {total_errors} error(s)")
+                return 1
+
+            if total_warnings > 0:
+                print(f"  Type check passed with {total_warnings} warning(s)")
+            else:
+                print("  Type check passed")
+
+            # Transpile all modules
+            print("  Transpiling to C...")
+            c_code = transpile_multi(graph.modules, order)
+
         else:
-            print("  Type check passed")
+            # Single-file build (backward compatible)
+            # Check for holes
+            total_holes = sum(len(find_holes(form)) for form in ast)
+            if total_holes > 0:
+                print(f"  Warning: {total_holes} unfilled holes")
 
-        # Transpile
-        print("  Transpiling to C...")
-        with open(args.input) as f:
-            source = f.read()
-        c_code = transpile(source)
+            # Type check
+            print("  Type checking...")
+            diagnostics = check_file(args.input)
+            type_errors = [d for d in diagnostics if d.severity == 'error']
+            type_warnings = [d for d in diagnostics if d.severity == 'warning']
+
+            for w in type_warnings:
+                print(f"    {w}")
+
+            if type_errors:
+                for e in type_errors:
+                    print(f"    {e}")
+                print(f"  Type check failed: {len(type_errors)} error(s)")
+                return 1
+
+            if type_warnings:
+                print(f"  Type check passed with {len(type_warnings)} warning(s)")
+            else:
+                print("  Type check passed")
+
+            # Transpile
+            print("  Transpiling to C...")
+            with open(args.input) as f:
+                source = f.read()
+            c_code = transpile(source)
 
         c_file = f"{output}.c"
         with open(c_file, 'w') as f:
@@ -763,6 +907,39 @@ def _load_spec(path: str) -> dict:
             return json.load(f)
 
 
+def cmd_format(args):
+    """Format SLOP source code."""
+    from slop.formatter import format_source
+
+    exit_code = 0
+    for filepath in args.input:
+        try:
+            source = Path(filepath).read_text()
+            formatted = format_source(source)
+
+            if args.check:
+                # Check mode - just report if file needs formatting
+                if source != formatted:
+                    print(f"{filepath}: needs formatting")
+                    exit_code = 1
+            elif args.stdout:
+                # Print to stdout
+                print(formatted, end='')
+            else:
+                # Default - format in place
+                if source != formatted:
+                    Path(filepath).write_text(formatted)
+                    print(f"Formatted {filepath}")
+                else:
+                    print(f"{filepath} unchanged")
+
+        except Exception as e:
+            print(f"Error formatting {filepath}: {e}", file=sys.stderr)
+            exit_code = 1
+
+    return exit_code
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='SLOP - Symbolic LLM-Optimized Programming',
@@ -786,6 +963,8 @@ def main():
     p = subparsers.add_parser('fill', help='Fill holes with LLM')
     p.add_argument('input')
     p.add_argument('-o', '--output')
+    p.add_argument('-i', '--inplace', action='store_true',
+        help='Modify input file in place')
     p.add_argument('-c', '--config', help='Path to TOML config file')
     p.add_argument('-v', '--verbose', action='store_true')
     p.add_argument('-q', '--quiet', action='store_true',
@@ -802,6 +981,8 @@ def main():
     p.add_argument('input')
     p.add_argument('-o', '--output')
     p.add_argument('-c', '--config', help='Path to TOML config file')
+    p.add_argument('-I', '--include', action='append',
+                   help='Add search path for imports (can be repeated)')
     p.add_argument('--debug', action='store_true')
     p.add_argument('--library', choices=['static', 'shared'],
                    help='Build as library instead of executable')
@@ -818,6 +999,14 @@ def main():
         default='stub',
         help='Storage mode for OpenAPI: stub (default, with @requires), map (in-memory), none (holes only)')
 
+    # format
+    p = subparsers.add_parser('format', help='Format SLOP source code')
+    p.add_argument('input', nargs='+', help='Input file(s)')
+    p.add_argument('--stdout', action='store_true',
+        help='Print to stdout instead of modifying files')
+    p.add_argument('--check', action='store_true',
+        help='Check if files are formatted (exit 1 if not)')
+
     args = parser.parse_args()
 
     if not args.command:
@@ -831,6 +1020,7 @@ def main():
         'check': cmd_check,
         'build': cmd_build,
         'derive': cmd_derive,
+        'format': cmd_format,
     }
 
     return commands[args.command](args)

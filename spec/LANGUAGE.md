@@ -54,12 +54,28 @@ literal     = number | string | 'true | 'false | 'nil
 (export (name arity)*)
 (import module-name (name arity)*)
 (type name type-expr)
+(const name Type const-expr)
 (fn name params body)
 (structure form*)
 (logic form*)
 ```
 
-### 3.2 Type Expressions
+### 3.2 Constants
+
+```
+(const name Type const-expr)
+
+; const-expr: literals, other constants, arithmetic/bitwise on constants, sizeof
+; NOT allowed: function calls, variable references, runtime expressions
+
+(const MAX_CONN Int 128)
+(const BUF_SIZE U64 (* 4 1024))
+(const FLAGS Int (| FLAG_A FLAG_B))
+```
+
+**C Mapping:** Integers → `#define`, others → `static const`.
+
+### 3.3 Type Expressions
 
 ```
 ; Primitives with ranges
@@ -116,16 +132,15 @@ literal     = number | string | 'true | 'false | 'nil
 (alias Name Type)
 ```
 
-### 3.3 Function Definitions
+### 3.4 Function Definitions
 
 ```
 (fn name ((param1 Type1) (param2 Type2) ...) 
   annotations*
   body)
 
-; Parameter modes **[PLANNED]**
-; Note: Parameter modes are not yet implemented. All parameters are currently pass-by-value.
-(fn name ((in param Type)      ; Read-only (default) - pass by value or const pointer
+; Parameter modes
+(fn name ((in param Type)      ; Read-only (default) - pass by value
           (out param Type)     ; Write-only - pointer to uninitialized
           (mut param Type))    ; Read-write - pointer to initialized
   ...)
@@ -135,7 +150,7 @@ literal     = number | string | 'true | 'false | 'nil
   ...)  ; Allocations use arena
 ```
 
-### 3.4 Annotations
+### 3.5 Annotations
 
 ```
 ; Required annotations
@@ -169,7 +184,7 @@ literal     = number | string | 'true | 'false | 'nil
   ...)
 ```
 
-### 3.5 Expressions
+### 3.6 Expressions
 
 ```
 ; Literals
@@ -203,7 +218,7 @@ identifier               ; Variable reference
 ; Data construction
 (array e1 e2...)                     ; Fixed array literal
 (list e1 e2...)                      ; Dynamic list
-(map (k1 v1) (k2 v2)...)             ; Map literal **[PLANNED]**
+(map (k1 v1) (k2 v2)...)             ; Map literal
 (record-new Type (f1 v1) (f2 v2)...) ; Struct construction
 (union-new Type Tag value)           ; Tagged union construction
 
@@ -249,7 +264,7 @@ identifier               ; Variable reference
 (? expr)                         ; Early return on error
 ```
 
-### 3.6 Holes (Hybrid Generation)
+### 3.7 Holes (Hybrid Generation)
 
 ```
 (hole Type "prompt")
@@ -267,7 +282,7 @@ identifier               ; Variable reference
 ; tier-4: 70B+ models (algorithms, complex logic)
 ```
 
-### 3.7 Requirements (Scaffold Dependencies)
+### 3.8 Requirements (Scaffold Dependencies)
 
 The `@requires` annotation declares external dependencies that must be provided
 before code can be filled or compiled. This is used by code generators (like
@@ -311,7 +326,7 @@ before code can be filled or compiled. This is used by code generators (like
 3. **Type checker**: Can verify that `:must-use` in holes references functions
    declared in `@requires`
 
-### 3.8 Patterns
+### 3.9 Patterns
 
 ```
 _                            ; Wildcard
@@ -326,13 +341,11 @@ literal                      ; Literal match
 
 ## 4. Module System
 
-> **Note**: Module exports are parsed but linking is not yet implemented. Imports are **[PLANNED]**.
-
 ```
 (module user-service
   (export (create 1) (find 1) (update 2) (delete 1))
-  (import core (arena-new 1) (arena-free 1))      ; [PLANNED]
-  (import strings (concat 2) (len 1))             ; [PLANNED]
+  (import core (arena-new 1) (arena-free 1))
+  (import strings (concat 2) (len 1))
   
   (type UserId (Int 1 ..))
   (type User (record
@@ -348,39 +361,9 @@ literal                      ; Literal match
     ...))
 ```
 
-## 5. Structure/Logic Separation **[PLANNED]**
+## 5. Memory Model
 
-> **Note**: `structure`/`logic` blocks and `sig`/`impl` separation are planned features not yet implemented in the transpiler. Currently, use `fn` definitions directly.
-
-```
-; Structure block - deterministic generation
-(structure
-  (module payment
-    (export (process 1) (refund 1))
-
-    (type Payment (record ...))
-    (type Receipt (record ...))
-
-    (sig process ((arena Arena) (payment (Ptr Payment)))
-         (Result (Ptr Receipt) Error))
-    (sig refund ((arena Arena) (id PaymentId))
-         (Result (Ptr Receipt) Error))))
-
-; Logic block - LLM generation
-(logic
-  (impl process ((arena Arena) (payment (Ptr Payment)))
-    (@intent "Process payment through gateway")
-    (@pre (!= payment nil))
-    (@pre (== (. payment status) 'pending))
-    (@alloc arena)
-
-    ; Implementation with holes
-    ...))
-```
-
-## 6. Memory Model
-
-### 6.1 Arena Allocation (Primary)
+### 5.1 Arena Allocation (Primary)
 
 Most allocations use arenas for simplicity and performance:
 
@@ -394,7 +377,7 @@ Most allocations use arenas for simplicity and performance:
 ; Arena automatically freed at end of with-arena
 ```
 
-### 6.2 Ownership (When Needed)
+### 5.2 Ownership (When Needed)
 
 For data that outlives a request:
 
@@ -409,7 +392,7 @@ For data that outlives a request:
   ...)
 ```
 
-### 6.3 Borrowing (Views)
+### 5.3 Borrowing (Views)
 
 For read-only access without ownership:
 
@@ -421,9 +404,9 @@ For read-only access without ownership:
   ...)
 ```
 
-## 7. C Mapping
+## 6. C Mapping
 
-### 7.1 Types
+### 6.1 Types
 
 ```
 SLOP                    C
@@ -462,7 +445,7 @@ The transpiler automatically selects the smallest C integer type that fits the r
 
 Range constructors (e.g., `TypeName_new(v)`) are generated with `SLOP_PRE` checks to validate bounds at runtime.
 
-### 7.2 Contracts
+### 6.2 Contracts
 
 ```
 SLOP                    C
@@ -474,7 +457,7 @@ SLOP                    C
 ; In release mode: removed or __assume()
 ```
 
-## 8. Verification Levels
+## 7. Verification Levels
 
 ```
 1. Parse-time
@@ -503,7 +486,7 @@ SLOP                    C
    - Null checks
 ```
 
-## 9. Standard Library
+## 8. Standard Library
 
 Minimal runtime (~500 lines of C):
 
@@ -547,11 +530,11 @@ Minimal runtime (~500 lines of C):
 (sleep-ms ms) -> Unit
 ```
 
-## 10. FFI
+## 9. FFI
 
 SLOP provides direct access to C libraries through FFI declarations. C libraries are the SLOP ecosystem.
 
-### 10.1 Function Declarations
+### 9.1 Function Declarations
 
 ```
 (ffi "header.h"
@@ -576,7 +559,7 @@ Example:
     (bytes-from-ptr out 32)))
 ```
 
-### 10.2 Struct Declarations
+### 9.2 Struct Declarations
 
 Map C structs for field access:
 
@@ -596,7 +579,7 @@ Map C structs for field access:
     addr))
 ```
 
-### 10.3 C Inline Escape Hatch
+### 9.3 C Inline Escape Hatch
 
 For C expressions SLOP doesn't model yet:
 
@@ -606,7 +589,7 @@ For C expressions SLOP doesn't model yet:
 (c-inline "((struct foo){.x = 1})")        ; Compound literal
 ```
 
-### 10.4 Build Integration
+### 9.4 Build Integration
 
 Link required libraries when building:
 

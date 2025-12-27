@@ -35,7 +35,7 @@
   (identifier) @keyword
   (#any-of? @keyword
     "fn" "sig" "impl" "module" "export" "import"
-    "type" "record" "enum" "union"
+    "type" "const" "record" "enum" "union"
     "structure" "logic"
     "let" "let*"
     "if" "cond" "match" "when"
@@ -73,6 +73,14 @@
   (#eq? @_type "type")
   .
   (type_name) @type.definition)
+
+; Constant name in const definition
+(list
+  .
+  (identifier) @_const
+  (#eq? @_const "const")
+  .
+  (identifier) @constant)
 
 ; Module name
 (list

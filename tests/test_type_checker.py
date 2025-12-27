@@ -214,3 +214,65 @@ class TestDiagnostics:
         warnings = [d for d in diagnostics if d.severity == 'warning']
         # Should have warnings about undefined variable
         assert len(warnings) >= 0  # May or may not produce warning
+
+
+class TestParameterModes:
+    """Test parameter mode type checking"""
+
+    def test_in_mode_assignment_error(self):
+        """Assigning to 'in' parameter should produce error"""
+        source = """
+        (module test
+          (fn bad ((in x Int))
+            (@spec ((Int) -> Int))
+            (set! x 42)
+            x))
+        """
+        diagnostics = check_source(source)
+        errors = [d for d in diagnostics if d.severity == 'error']
+        # Should have error about assigning to 'in' parameter
+        assert len(errors) >= 1
+        assert any("'in' parameter" in str(e.message) for e in errors)
+
+    def test_out_mode_uninitialized_warning(self):
+        """Reading uninitialized 'out' parameter should warn"""
+        source = """
+        (module test
+          (fn bad ((out result Int))
+            (@spec ((Int) -> Int))
+            result))
+        """
+        diagnostics = check_source(source)
+        warnings = [d for d in diagnostics if d.severity == 'warning']
+        # Should have warning about reading uninitialized 'out' parameter
+        assert len(warnings) >= 1
+        assert any("'out' parameter" in str(w.message) for w in warnings)
+
+    def test_out_mode_initialized_ok(self):
+        """Reading 'out' parameter after initialization should be fine"""
+        source = """
+        (module test
+          (fn ok ((out result Int))
+            (@spec ((Int) -> Int))
+            (set! result 42)
+            result))
+        """
+        diagnostics = check_source(source)
+        warnings = [d for d in diagnostics if d.severity == 'warning']
+        # No warning about uninitialized read
+        out_warnings = [w for w in warnings if "'out' parameter" in str(w.message)]
+        assert len(out_warnings) == 0
+
+    def test_mut_mode_read_write_ok(self):
+        """'mut' mode allows both read and write"""
+        source = """
+        (module test
+          (fn ok ((mut counter Int))
+            (@spec ((Int) -> Int))
+            (set! counter (+ counter 1))
+            counter))
+        """
+        diagnostics = check_source(source)
+        errors = [d for d in diagnostics if d.severity == 'error']
+        # No errors for mut read/write
+        assert len(errors) == 0

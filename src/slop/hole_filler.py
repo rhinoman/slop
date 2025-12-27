@@ -29,7 +29,7 @@ VALID_EXPRESSION_FORMS = {
     'array', 'list', 'map', 'record-new', 'union-new',
     'ok', 'error', 'some', 'none',
     # Data access
-    '.', '@', 'put', 'set!',
+    '.', '@', 'put', 'set!', 'deref',
     # Arithmetic
     '+', '-', '*', '/', '%', '&', '|', '^', '<<', '>>',
     # Comparison
@@ -49,6 +49,12 @@ VALID_EXPRESSION_FORMS = {
     'do',
     # FFI
     'c-inline',
+    # Type constructors (appear in cast, sizeof, type expressions)
+    # These are not functions but can appear as heads of nested lists
+    'Ptr', 'OwnPtr', 'OptPtr', 'Option', 'Result', 'List', 'Array', 'Map',
+    'Int', 'U8', 'U16', 'U32', 'U64', 'I8', 'I16', 'I32', 'I64',
+    'String', 'Bool', 'Float', 'Void', 'Unit', 'Arena',
+    'ffi-struct',  # Nested FFI struct type
 }
 
 
@@ -488,7 +494,7 @@ def build_prompt(hole: Hole, context: Dict[str, Any], failed_attempts: List[tupl
         "   - string-find, string-index, substring, string-slice",
         "   - parse-int, atoi, str-to-int (use FFI if needed)",
         "   - read, write (use recv, send for sockets)",
-        "   - ref, deref (no references)",
+        "   - ref (no references - use deref for pointer dereferencing)",
         "   - list-invoices, find-invoice, create-invoice (define these yourself)",
         "3. Use (do expr1 expr2 ...) for sequencing multiple expressions",
         "4. Use match with bare enum names: (match x (Foo ...) (Bar ...)) not ((Foo v) ...)",
@@ -504,6 +510,11 @@ def build_prompt(hole: Hole, context: Dict[str, Any], failed_attempts: List[tupl
         "   - If return type is (Result T ApiError), use (error 'bad-request) or (error 'not-found)",
         "   - The error variant MUST come from the declared error enum in the @spec",
         "   - Remember: 'bad-request is ONE token, not (quote bad-request)",
+        "9. POINTER ALLOCATION: To allocate and cast to a pointer type:",
+        "   - CORRECT: (cast (Ptr User) (arena-alloc arena (sizeof User)))",
+        "   - WRONG: (Ptr User (arena-alloc ...))  -- Ptr is NOT a function!",
+        "   - The pattern is: (cast (Ptr Type) allocation-expression)",
+        "   - Always use 'cast' to convert (Ptr Void) from arena-alloc to specific pointer type",
     ])
 
     # Add type-specific syntax hints
@@ -804,7 +815,135 @@ class HoleFiller:
                     error = f"Expression must use '{must}' but it was not found"
                     logger.debug(error)
                     return False, error
+
+        # Type check the filled expression against expected type
+        type_error = self._check_type(expr, hole, context)
+        if type_error:
+            return False, type_error
+
         return True, None
+
+    def _check_type(self, expr: SExpr, hole: Hole, context: dict) -> Optional[str]:
+        """Type check filled expression against hole's expected type.
+
+        Returns error message if type mismatch, None if valid.
+
+        Policy (strict with exceptions):
+        - FAIL on clear type mismatches (wrong type, missing cast)
+        - ALLOW unknown types (?) from c-inline expressions
+        - ALLOW unresolved type variables
+        """
+        from slop.type_checker import (
+            TypeChecker, TypeEnv,
+            Type, PrimitiveType, PtrType, OptionType, ResultType,
+            TypeVar, UNKNOWN
+        )
+
+        if not hole.type_expr:
+            return None  # No type constraint to check
+
+        try:
+            # Create type checker
+            checker = TypeChecker()
+
+            # Parse and register types from type_defs (pretty-printed strings)
+            type_defs = context.get('type_defs', [])
+            for type_def_str in type_defs:
+                try:
+                    type_ast = parse(type_def_str)
+                    if type_ast and is_form(type_ast[0], 'type') and len(type_ast[0]) > 2:
+                        name = type_ast[0][1].name if isinstance(type_ast[0][1], Symbol) else str(type_ast[0][1])
+                        typ = checker.parse_type_expr(type_ast[0][2])
+                        checker.env.register_type(name, typ)
+                except Exception:
+                    pass  # Skip malformed type defs
+
+            # Parse parameters from context['params'] string like "((arena Arena) (buf (Ptr U8)))"
+            params_str = context.get('params', '')
+            if params_str:
+                try:
+                    params_ast = parse(params_str)
+                    if params_ast and isinstance(params_ast[0], SList):
+                        for param in params_ast[0].items:
+                            if isinstance(param, SList) and len(param) >= 2:
+                                param_name = param[0].name if isinstance(param[0], Symbol) else str(param[0])
+                                param_type = checker.parse_type_expr(param[1])
+                                checker.env.bind_var(param_name, param_type)
+                except Exception:
+                    pass  # Skip if params can't be parsed
+
+            # Register functions from fn_specs
+            fn_specs = context.get('fn_specs', [])
+            for spec in fn_specs:
+                try:
+                    fn_name = spec.get('name', '')
+                    if fn_name and spec.get('return_type'):
+                        # Parse return type and register as function
+                        ret_ast = parse(spec['return_type'])
+                        if ret_ast:
+                            ret_type = checker.parse_type_expr(ret_ast[0])
+                            # Create a simple FnType (we don't have full param info but that's ok)
+                            from slop.type_checker import FnType
+                            checker.env.register_function(fn_name, FnType((), ret_type))
+                except Exception:
+                    pass
+
+            # Parse expected type
+            expected = checker.parse_type_expr(hole.type_expr)
+
+            # Infer actual type of expression
+            inferred = checker.infer_expr(expr)
+
+            # Check compatibility
+            if not self._types_compatible(inferred, expected):
+                # Check for allowable unknowns (c-inline, type vars)
+                if self._is_allowable_unknown(inferred):
+                    logger.warning(f"Type check warning: inferred unknown type {inferred} for expected {expected}")
+                    return None  # Allow but warn
+                return f"Type mismatch: expected {expected}, got {inferred}"
+
+            return None  # Types are compatible
+
+        except Exception as e:
+            # Type checking failed - log but don't fail validation
+            # (might be missing context for complex expressions)
+            logger.warning(f"Type check exception (allowing): {e}")
+            return None
+
+    def _types_compatible(self, inferred: 'Type', expected: 'Type') -> bool:
+        """Check if inferred type is compatible with expected type.
+
+        Uses subtype checking where available, falls back to equality.
+        """
+        from slop.type_checker import TypeVar, UNKNOWN, PtrType, PrimitiveType
+
+        # Unknown always compatible (can't verify)
+        if inferred == UNKNOWN or expected == UNKNOWN:
+            return True
+
+        # Type variables are compatible (unresolved)
+        if isinstance(inferred, TypeVar) or isinstance(expected, TypeVar):
+            return True
+
+        # Check subtype relationship
+        if hasattr(inferred, 'is_subtype_of'):
+            return inferred.is_subtype_of(expected)
+
+        # Fall back to equality
+        if hasattr(inferred, 'equals'):
+            return inferred.equals(expected)
+
+        return str(inferred) == str(expected)
+
+    def _is_allowable_unknown(self, typ: 'Type') -> bool:
+        """Check if type is an allowable unknown (c-inline, type var)."""
+        from slop.type_checker import TypeVar, UNKNOWN
+
+        if typ == UNKNOWN:
+            return True
+        if isinstance(typ, TypeVar):
+            return True
+        return False
 
     def _calculate_quality(self, expr: SExpr, hole: Hole, context: dict, attempts: int) -> Dict[str, float]:
         """Calculate quality metrics for a successful fill"""

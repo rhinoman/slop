@@ -1,0 +1,15 @@
+(module core
+  (export (arena-new 1) (arena-free 1))
+
+  ;; Error type - should become core_Error in C output
+  (type Error (enum out-of-memory allocation-failed))
+
+  (fn arena-new ((size Int))
+    (@intent "Create a new arena")
+    (@spec ((Int) -> Arena))
+    (hole Arena "allocate arena" :complexity tier-1))
+
+  (fn arena-free ((arena Arena))
+    (@intent "Free an arena")
+    (@spec ((Arena) -> Unit))
+    (hole Unit "free arena" :complexity tier-1)))

@@ -10,7 +10,15 @@ Handles:
 
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Set
-from slop.parser import SExpr, SList, Symbol, String, Number, is_form, parse
+from slop.parser import SExpr, SList, Symbol, String, Number, is_form, parse, find_holes
+
+
+class UnfilledHoleError(Exception):
+    """Raised when transpilation is attempted with unfilled holes"""
+    def __init__(self, holes: List[SList]):
+        self.holes = holes
+        count = len(holes)
+        super().__init__(f"Cannot transpile: {count} unfilled hole(s) found")
 
 
 @dataclass
@@ -57,6 +65,13 @@ class Transpiler:
         self.generated_option_types: Set[str] = set()  # Track generated Option<T> types
         self.generated_result_types: Set[str] = set()  # Track generated Result<T, E> types
         self.generated_list_types: Set[str] = set()  # Track generated List<T> types
+        self.generated_map_types: Set[tuple] = set()  # Track generated Map<K, V> types: (type_name, key_c_type, value_c_type)
+
+        # Module system support
+        self.current_module: Optional[str] = None  # Current module being transpiled
+        self.import_map: Dict[str, str] = {}  # local_name -> qualified_c_name
+        self.local_functions: Set[str] = set()  # Functions defined in current module
+        self.enable_prefixing: bool = False  # Enable module prefixing (for multi-module builds)
 
         # Built-in type mappings
         self.builtin_types = {
@@ -134,6 +149,50 @@ class Transpiler:
                 if op in self.func_returns_pointer:
                     return self.func_returns_pointer[op]
         return False
+
+    def _parse_parameter_mode(self, param: SExpr) -> tuple:
+        """Extract (mode, name, type) from parameter form.
+
+        Handles:
+        - (name Type)           -> ('in', 'name', Type)
+        - (in name Type)        -> ('in', 'name', Type)
+        - (out name Type)       -> ('out', 'name', Type)
+        - (mut name Type)       -> ('mut', 'name', Type)
+        """
+        if isinstance(param, SList) and len(param) >= 2:
+            first = param[0]
+
+            # Check if first element is a mode keyword
+            if isinstance(first, Symbol) and first.name in ('in', 'out', 'mut'):
+                mode = first.name
+                name = param[1].name if isinstance(param[1], Symbol) else None
+                type_expr = param[2] if len(param) > 2 else None
+                return (mode, name, type_expr)
+            else:
+                # No explicit mode -> default to 'in'
+                name = first.name if isinstance(first, Symbol) else None
+                type_expr = param[1] if len(param) > 1 else None
+                return ('in', name, type_expr)
+
+        return ('in', None, None)
+
+    def _apply_parameter_mode(self, mode: str, c_type: str) -> str:
+        """Transform C type based on parameter mode.
+
+        - 'in':  Pass by value (default, unchanged)
+        - 'out': Always pointer (uninitialized)
+        - 'mut': Always pointer (initialized/mutable)
+        """
+        if mode == 'in':
+            # Pass by value - no change
+            return c_type
+        elif mode == 'out' or mode == 'mut':
+            # Always pointer for out/mut
+            if not c_type.endswith('*'):
+                return f"{c_type}*"
+            return c_type
+
+        return c_type
 
     def _get_type_name(self, type_expr: SExpr) -> Optional[str]:
         """Extract the type name from a type expression for tracking"""
@@ -454,12 +513,22 @@ class Transpiler:
         return False
 
     def transpile(self, ast: List[SExpr]) -> str:
-        """Transpile SLOP AST to C code"""
+        """Transpile SLOP AST to C code.
+
+        Raises UnfilledHoleError if any holes remain in the AST.
+        """
         self.output = []
         self.ffi_funcs = {}
         self.ffi_structs = {}
         self.ffi_struct_fields = {}
         self.ffi_includes = []
+
+        # Check for unfilled holes - cannot transpile incomplete code
+        all_holes = []
+        for form in ast:
+            all_holes.extend(find_holes(form))
+        if all_holes:
+            raise UnfilledHoleError(all_holes)
 
         # First pass: collect FFI declarations from all modules
         for form in ast:
@@ -484,14 +553,17 @@ class Transpiler:
         self.emit("#include <stdbool.h>")
         self.emit("")
 
-        # Collect types and functions separately
+        # Collect types, constants, and functions separately
         types = []
+        constants = []
         functions = []
         modules = []
 
         for form in ast:
             if is_form(form, 'module'):
                 modules.append(form)
+            elif is_form(form, 'const'):
+                constants.append(form)
             elif is_form(form, 'type'):
                 types.append(form)
             elif is_form(form, 'record'):
@@ -504,6 +576,10 @@ class Transpiler:
         # Process modules (they have their own type/function handling)
         for form in modules:
             self.transpile_module(form)
+
+        # Process constants first (before types, since types may reference them)
+        for form in constants:
+            self.transpile_const(form)
 
         # Process all type definitions first
         for form in types:
@@ -634,18 +710,29 @@ class Transpiler:
         self.emit(f"/* Module: {module_name} */")
         self.emit("")
 
-        # Collect types and functions
+        # Collect constants, types and functions
+        constants = []
         types = []
         functions = []
         for item in form.items[2:]:
             if is_form(item, 'export'):
                 continue  # Skip exports, handled at link time
+            elif is_form(item, 'import'):
+                continue  # Skip imports, handled at link time
             elif is_form(item, 'ffi') or is_form(item, 'ffi-struct'):
                 continue  # Already processed in first pass
+            elif is_form(item, 'const'):
+                constants.append(item)
             elif is_form(item, 'type'):
                 types.append(item)
             elif is_form(item, 'fn'):
                 functions.append(item)
+
+        # Emit constants first (before types, since types may reference them)
+        for c in constants:
+            self.transpile_const(c)
+        if constants:
+            self.emit("")
 
         # Emit forward declarations for record types (needed for mutual references)
         record_types = []
@@ -657,7 +744,7 @@ class Transpiler:
         if record_types:
             self.emit("")
 
-        # First pass: emit types
+        # Emit types
         for t in types:
             self.transpile_type(t)
 
@@ -688,12 +775,13 @@ class Transpiler:
 
     def emit_forward_declaration(self, form: SList):
         """Emit function forward declaration"""
-        name = self.to_c_name(form[1].name)
+        raw_name = form[1].name
+        name = self.to_qualified_c_name(raw_name)
         params = form[2] if len(form) > 2 else SList([])
         return_type = self._get_return_type(form)
 
         # C requires main to return int
-        if name == 'main':
+        if raw_name == 'main':
             return_type = 'int'
 
         param_strs = []
@@ -723,22 +811,101 @@ class Transpiler:
                     return spec[-1]
         return None
 
+    def transpile_const(self, form: SList):
+        """Transpile constant definition: (const NAME Type value)
+
+        Integers emit as #define, others as static const.
+        """
+        if len(form) < 4:
+            return
+
+        name = form[1].name if isinstance(form[1], Symbol) else str(form[1])
+        type_expr = form[2]
+        value_expr = form[3]
+
+        c_name = self.to_c_name(name)
+        c_type = self.to_c_type(type_expr)
+        c_value = self._eval_const_expr(value_expr)
+
+        # Check if it's an integer type for #define
+        type_name = type_expr.name if isinstance(type_expr, Symbol) else None
+        is_int_type = type_name in ('Int', 'I8', 'I16', 'I32', 'I64', 'U8', 'U16', 'U32', 'U64')
+
+        if is_int_type:
+            self.emit(f"#define {c_name} ({c_value})")
+        else:
+            self.emit(f"static const {c_type} {c_name} = {c_value};")
+
+    def _eval_const_expr(self, expr: SExpr) -> str:
+        """Evaluate a constant expression to C code.
+
+        Handles: literals, other constants, arithmetic/bitwise ops, sizeof.
+        """
+        if isinstance(expr, Number):
+            return str(expr.value)
+
+        if isinstance(expr, String):
+            # Escape the string properly
+            escaped = expr.value.replace('\\', '\\\\').replace('"', '\\"')
+            return f'"{escaped}"'
+
+        if isinstance(expr, Symbol):
+            name = expr.name
+            if name == 'true':
+                return '1'
+            elif name == 'false':
+                return '0'
+            else:
+                # Reference to another constant
+                return self.to_c_name(name)
+
+        if isinstance(expr, SList) and len(expr) >= 1:
+            head = expr[0]
+            if isinstance(head, Symbol):
+                op = head.name
+
+                # sizeof
+                if op == 'sizeof' and len(expr) >= 2:
+                    type_arg = expr[1]
+                    c_type = self.to_c_type(type_arg)
+                    return f"sizeof({c_type})"
+
+                # Binary arithmetic/bitwise ops
+                if op in ('+', '-', '*', '/', '%', '&', '|', '^', '<<', '>>') and len(expr) >= 3:
+                    left = self._eval_const_expr(expr[1])
+                    right = self._eval_const_expr(expr[2])
+                    return f"({left} {op} {right})"
+
+                # Unary not
+                if op == 'not' and len(expr) >= 2:
+                    arg = self._eval_const_expr(expr[1])
+                    return f"(!{arg})"
+
+                # Unary minus (- x)
+                if op == '-' and len(expr) == 2:
+                    arg = self._eval_const_expr(expr[1])
+                    return f"(-{arg})"
+
+        # Fallback: stringify
+        return str(expr)
+
     def transpile_type(self, form: SList):
         """Transpile type definition"""
-        name = form[1].name
+        raw_name = form[1].name
+        qualified_name = self.to_qualified_type_name(raw_name)
         type_expr = form[2]
 
         if is_form(type_expr, 'record'):
-            self.transpile_record(name, type_expr)
+            self.transpile_record(raw_name, qualified_name, type_expr)
         elif is_form(type_expr, 'enum'):
-            self.transpile_enum(name, type_expr)
+            self.transpile_enum(raw_name, qualified_name, type_expr)
         elif is_form(type_expr, 'union'):
-            self.transpile_union(name, type_expr)
+            self.transpile_union(raw_name, qualified_name, type_expr)
         else:
             # Range type or alias
-            self.transpile_range_type(name, type_expr)
+            self.transpile_range_type(raw_name, qualified_name, type_expr)
 
-    def transpile_record(self, name: str, form: SList):
+    def transpile_record(self, raw_name: str, qualified_name: str, form: SList):
         """Transpile record to C struct
 
         Handles both syntaxes:
@@ -746,11 +913,11 @@ class Transpiler:
         - Bare: (record Name (field Type) ...) - top-level form
         """
         # Use struct tag name so it works with forward declarations
-        self.emit(f"struct {name} {{")
+        self.emit(f"struct {qualified_name} {{")
         self.indent += 1
 
         # Track field types for pointer detection
-        self.record_fields[name] = {}
+        self.record_fields[raw_name] = {}
 
         # Determine start index: skip name if bare form
         start_idx = 1
@@ -766,17 +933,18 @@ class Transpiler:
                 field_type = self.to_c_type(field_type_expr)
                 self.emit(f"{field_type} {field_name};")
                 # Track if this field is a pointer
-                self.record_fields[name][raw_field_name] = self._is_pointer_type(field_type_expr)
+                self.record_fields[raw_name][raw_field_name] = self._is_pointer_type(field_type_expr)
 
         self.indent -= 1
         self.emit(f"}};")
         # Add typedef so we can use just 'Name' instead of 'struct Name'
-        self.emit(f"typedef struct {name} {name};")
+        self.emit(f"typedef struct {qualified_name} {qualified_name};")
         self.emit("")
 
-        self.types[name] = TypeInfo(name, name)
+        # Track with raw name for lookup, but store qualified C type
+        self.types[raw_name] = TypeInfo(raw_name, qualified_name)
 
-    def transpile_enum(self, name: str, form: SList):
+    def transpile_enum(self, raw_name: str, qualified_name: str, form: SList):
         """Transpile enum
 
         Handles both syntaxes:
@@ -788,7 +956,7 @@ class Transpiler:
 
         # Determine start index: skip name if bare form
         start_idx = 1
-        if len(form) > 1 and isinstance(form[1], Symbol) and form[1].name == name:
+        if len(form) > 1 and isinstance(form[1], Symbol) and form[1].name == raw_name:
             # First element is the name in bare form, skip it
             start_idx = 2
 
@@ -797,21 +965,22 @@ class Transpiler:
             if not isinstance(val, Symbol):
                 continue
             val_c_name = self.to_c_name(val.name)
-            qualified_name = f"{name}_{val_c_name}"
+            qualified_variant = f"{qualified_name}_{val_c_name}"
             comma = "," if i < len(values) - 1 else ""
-            self.emit(f"{qualified_name}{comma}")
+            self.emit(f"{qualified_variant}{comma}")
             # Store enum value for lookup
-            self.enums[val.name] = qualified_name
-            self.enums[val_c_name] = qualified_name
+            self.enums[val.name] = qualified_variant
+            self.enums[val_c_name] = qualified_variant
 
         self.indent -= 1
-        self.emit(f"}} {name};")
+        self.emit(f"}} {qualified_name};")
         self.emit("")
 
-        self.types[name] = TypeInfo(name, name)
-        self.simple_enums.add(name)
+        # Track with raw name for lookup, but store qualified C type
+        self.types[raw_name] = TypeInfo(raw_name, qualified_name)
+        self.simple_enums.add(raw_name)
 
-    def transpile_union(self, name: str, form: SList):
+    def transpile_union(self, raw_name: str, qualified_name: str, form: SList):
         """Transpile tagged union"""
         self.emit(f"typedef struct {{")
         self.indent += 1
@@ -830,19 +999,20 @@ class Transpiler:
         self.indent -= 1
         self.emit("} data;")
         self.indent -= 1
-        self.emit(f"}} {name};")
+        self.emit(f"}} {qualified_name};")
         self.emit("")
 
-        # Generate tag constants
+        # Generate tag constants with qualified name
         for i, variant in enumerate(form.items[1:]):
             if isinstance(variant, SList):
                 tag = variant[0].name
-                self.emit(f"#define {name}_{tag}_TAG {i}")
+                self.emit(f"#define {qualified_name}_{tag}_TAG {i}")
         self.emit("")
 
-        self.types[name] = TypeInfo(name, name)
+        # Track with raw name for lookup, but store qualified C type
+        self.types[raw_name] = TypeInfo(raw_name, qualified_name)
 
-    def transpile_range_type(self, name: str, type_expr: SExpr):
+    def transpile_range_type(self, raw_name: str, qualified_name: str, type_expr: SExpr):
         """Transpile range type to typedef + constructor"""
         min_val, max_val = None, None
         base_type = 'int64_t'
@@ -855,9 +1025,9 @@ class Transpiler:
                 inner_type = self.to_c_type(type_expr[1])
                 size = int(type_expr[2].value) if isinstance(type_expr[2], Number) else 100
                 # For array types, create a typedef to the array
-                self.emit(f"typedef {inner_type} {name}[{size}];")
+                self.emit(f"typedef {inner_type} {qualified_name}[{size}];")
                 self.emit("")
-                self.types[name] = TypeInfo(name, f"{inner_type}*", is_array=True)
+                self.types[raw_name] = TypeInfo(raw_name, f"{inner_type}*", is_array=True)
                 return
 
             # Parse (Int min .. max) or similar
@@ -890,49 +1060,50 @@ class Transpiler:
                 base_type = 'int16_t'
 
         # Emit typedef (simple typedef, not wrapped struct)
-        self.emit(f"typedef {base_type} {name};")
+        self.emit(f"typedef {base_type} {qualified_name};")
         self.emit("")
 
         # Emit constructor with range check
-        self.emit(f"static inline {name} {name}_new(int64_t v) {{")
+        self.emit(f"static inline {qualified_name} {qualified_name}_new(int64_t v) {{")
         self.indent += 1
 
         if min_val is not None and max_val is not None:
-            self.emit(f'SLOP_PRE(v >= {min_val} && v <= {max_val}, "{name} in range {min_val}..{max_val}");')
+            self.emit(f'SLOP_PRE(v >= {min_val} && v <= {max_val}, "{qualified_name} in range {min_val}..{max_val}");')
         elif min_val is not None:
-            self.emit(f'SLOP_PRE(v >= {min_val}, "{name} >= {min_val}");')
+            self.emit(f'SLOP_PRE(v >= {min_val}, "{qualified_name} >= {min_val}");')
         elif max_val is not None:
-            self.emit(f'SLOP_PRE(v <= {max_val}, "{name} <= {max_val}");')
+            self.emit(f'SLOP_PRE(v <= {max_val}, "{qualified_name} <= {max_val}");')
 
-        self.emit(f"return ({name})v;")
+        self.emit(f"return ({qualified_name})v;")
         self.indent -= 1
         self.emit("}")
         self.emit("")
 
-        self.types[name] = TypeInfo(name, name, True, min_val, max_val)
+        self.types[raw_name] = TypeInfo(raw_name, qualified_name, True, min_val, max_val)
 
     def transpile_function(self, form: SList):
         """Transpile function definition"""
         raw_name = form[1].name
-        name = self.to_c_name(raw_name)
+        name = self.to_qualified_c_name(raw_name)
+        self.local_functions.add(raw_name)  # Track for local call resolution
         params = form[2] if len(form) > 2 else SList([])
 
         # Clear pointer and type tracking for this function scope
         self.pointer_vars = set()
         self.var_types = {}
 
-        # Register parameter types and track pointers
+        # Register parameter types and track pointers (mode-aware)
         for p in params:
             if isinstance(p, SList) and len(p) >= 2:
-                pname = p[0].name
-                ptype = p[1]
-                # Track type for type flow analysis
-                type_name = self._get_type_name(ptype)
-                if type_name:
-                    self.var_types[pname] = type_name
-                # Track pointers
-                if self._is_pointer_type(ptype):
-                    self.pointer_vars.add(pname)
+                mode, pname, ptype = self._parse_parameter_mode(p)
+                if pname and ptype:
+                    # Track type for type flow analysis
+                    type_name = self._get_type_name(ptype)
+                    if type_name:
+                        self.var_types[pname] = type_name
+                    # Track pointers: explicit Ptr types, or out/mut modes
+                    if self._is_pointer_type(ptype) or mode in ('out', 'mut'):
+                        self.pointer_vars.add(pname)
 
         # Track if this function returns a pointer
         ret_type_expr = self._get_return_type_expr(form)
@@ -980,17 +1151,20 @@ class Transpiler:
         if 'intent' in annotations:
             self.emit(f"/* {annotations['intent']} */")
 
-        # Emit function signature and track pointer parameters
+        # Emit function signature and track pointer parameters (mode-aware)
         param_strs = []
         for p in params:
             if isinstance(p, SList) and len(p) >= 2:
-                raw_pname = p[0].name
-                pname = self.to_c_name(raw_pname)
-                ptype = self.to_c_type(p[1])
-                param_strs.append(f"{ptype} {pname}")
-                # Track pointer parameters
-                if self._is_pointer_type(p[1]):
-                    self.pointer_vars.add(raw_pname)
+                mode, raw_pname, ptype_expr = self._parse_parameter_mode(p)
+                if raw_pname and ptype_expr:
+                    pname = self.to_c_name(raw_pname)
+                    ptype = self.to_c_type(ptype_expr)
+                    # Apply mode transformation
+                    ptype = self._apply_parameter_mode(mode, ptype)
+                    param_strs.append(f"{ptype} {pname}")
+                    # Track pointer parameters (including out/mut)
+                    if self._is_pointer_type(ptype_expr) or mode in ('out', 'mut'):
+                        self.pointer_vars.add(raw_pname)
 
         self.emit(f"{return_type} {name}({', '.join(param_strs) or 'void'}) {{")
         self.indent += 1
@@ -1836,6 +2010,24 @@ class Transpiler:
                     # Fallback: use compound literal without type (requires assignment context)
                     return f"{{{', '.join(fields)}}}"
 
+                # Map literal: (map (k1 v1) (k2 v2) ...)
+                if op == 'map':
+                    pairs = []
+                    for item in expr.items[1:]:
+                        if isinstance(item, SList) and len(item) >= 2:
+                            key_expr = self.transpile_expr(item[0])
+                            value_expr = self.transpile_expr(item[1])
+                            pairs.append((key_expr, value_expr))
+
+                    n = len(pairs)
+                    if n == 0:
+                        # Empty map
+                        return "(slop_map){ .entries = NULL, .len = 0, .cap = 0 }"
+
+                    # Generate compound literal with entries
+                    entries = ", ".join([f"{{ .key = {k}, .value = {v}, .occupied = true }}" for k, v in pairs])
+                    return f"(slop_map){{ .entries = (slop_map_entry[]){{{entries}}}, .len = {n}, .cap = {n} }}"
+
                 # Union construction: (union-new Type Tag value?)
                 if op == 'union-new':
                     type_name = expr[1].name
@@ -1916,8 +2108,8 @@ class Transpiler:
                     # Just return the enum value, ignore any "arguments"
                     return self.enums[op]
 
-                # Function call
-                fn_name = self.to_c_name(op)
+                # Function call (user-defined or imported)
+                fn_name = self.to_qualified_c_name(op)
                 args = [self.transpile_expr(a) for a in expr.items[1:]]
                 return f"{fn_name}({', '.join(args)})"
 
@@ -2032,6 +2224,13 @@ class Transpiler:
                 self.generated_list_types.add((type_name, inner))
                 return type_name
 
+            if head == 'Map':
+                key_type = self.to_c_type(type_expr[1])
+                value_type = self.to_c_type(type_expr[2]) if len(type_expr) > 2 else 'void*'
+                type_name = f"slop_map_{key_type}_{value_type}"
+                self.generated_map_types.add((type_name, key_type, value_type))
+                return type_name
+
             if head == 'Array':
                 # (Array T size) -> T* (pointer to first element)
                 inner = self.to_c_type(type_expr[1])
@@ -2066,8 +2265,8 @@ class Transpiler:
                     self.to_c_type(spec[-1])  # Return type
 
     def _emit_generated_types(self):
-        """Emit type definitions for generated Option/List/Result types."""
-        if not (self.generated_option_types or self.generated_list_types or self.generated_result_types):
+        """Emit type definitions for generated Option/List/Result/Map types."""
+        if not (self.generated_option_types or self.generated_list_types or self.generated_result_types or self.generated_map_types):
             return
 
         self.emit("/* Generated generic type definitions */")
@@ -2079,6 +2278,11 @@ class Transpiler:
         # Emit List types
         for type_name, inner in sorted(self.generated_list_types):
             self.emit(f"typedef struct {{ {inner}* data; size_t len; size_t cap; }} {type_name};")
+
+        # Emit Map types
+        for type_name, key_type, value_type in sorted(self.generated_map_types):
+            self.emit(f"typedef struct {{ {key_type} key; {value_type} value; bool occupied; }} {type_name}_entry;")
+            self.emit(f"typedef struct {{ {type_name}_entry* entries; size_t len; size_t cap; }} {type_name};")
 
         # Emit Result types
         for type_name, ok_type, err_type in sorted(self.generated_result_types):
@@ -2105,6 +2309,68 @@ class Transpiler:
             return f"slop_{result}"
         return result
 
+    def to_qualified_c_name(self, name: str) -> str:
+        """Convert SLOP function name to qualified C name with module prefix.
+
+        Used for multi-module builds to avoid name collisions.
+        """
+        if not self.enable_prefixing:
+            return self.to_c_name(name)
+
+        # 'main' is special - C requires this exact name for entry point
+        if name == 'main':
+            return 'main'
+
+        # Check if it's an imported function
+        if name in self.import_map:
+            return self.import_map[name]
+
+        # Prefix with current module name
+        c_name = self.to_c_name(name)
+        if self.current_module:
+            module_prefix = self.to_c_name(self.current_module)
+            return f"{module_prefix}_{c_name}"
+        return c_name
+
+    def to_qualified_type_name(self, name: str) -> str:
+        """Convert SLOP type name to qualified C name with module prefix.
+
+        Used for multi-module builds to avoid type name collisions.
+        Builtins are not prefixed.
+        """
+        if not self.enable_prefixing:
+            return self.to_c_name(name)
+
+        # Don't prefix builtin types
+        if name in self.builtin_types:
+            return name
+
+        # Prefix with current module name
+        c_name = self.to_c_name(name)
+        if self.current_module:
+            module_prefix = self.to_c_name(self.current_module)
+            return f"{module_prefix}_{c_name}"
+        return c_name
+
+    def setup_module_context(self, module_name: str, imports: List = None):
+        """Set up module context for transpilation.
+
+        Args:
+            module_name: Name of the current module
+            imports: List of (module_name, [(symbol, arity), ...]) tuples
+        """
+        self.current_module = module_name
+        self.import_map = {}
+        self.local_functions = set()
+        self.enable_prefixing = True
+
+        if imports:
+            for imp_module, symbols in imports:
+                module_prefix = self.to_c_name(imp_module)
+                for sym_name, _ in symbols:
+                    c_name = self.to_c_name(sym_name)
+                    self.import_map[sym_name] = f"{module_prefix}_{c_name}"
+
     def expr_to_str(self, expr: SExpr) -> str:
         """Convert expression to string for error messages"""
         return str(expr).replace('"', '\\"')
@@ -2128,6 +2394,119 @@ def transpile_file(input_path: str, output_path: str = None):
             f.write(c_code)
     else:
         print(c_code)
+
+
+def transpile_multi(modules: dict, order: list) -> str:
+    """Transpile multiple modules into a single C file.
+
+    Args:
+        modules: Dict mapping module name to ModuleInfo
+        order: List of module names in topological order (dependencies first)
+
+    Returns:
+        Combined C source code
+    """
+    from slop.parser import is_form, get_imports, parse_import
+
+    transpiler = Transpiler()
+    transpiler.enable_prefixing = True
+
+    # Header
+    transpiler.emit("/* Generated by SLOP transpiler - Multi-module build */")
+    transpiler.emit("")
+    transpiler.emit('#include "slop_runtime.h"')
+    transpiler.emit('#include <stdint.h>')
+    transpiler.emit('#include <stdbool.h>')
+    transpiler.emit("")
+
+    # Collect all FFI includes from all modules
+    ffi_includes = set()
+    for name in order:
+        info = modules[name]
+        for form in info.ast:
+            if is_form(form, 'module'):
+                for item in form.items[2:]:
+                    if is_form(item, 'ffi') and len(item) > 1:
+                        from slop.parser import String
+                        if isinstance(item[1], String):
+                            ffi_includes.add(item[1].value)
+            elif is_form(form, 'ffi') and len(form) > 1:
+                from slop.parser import String
+                if isinstance(form[1], String):
+                    ffi_includes.add(form[1].value)
+
+    for header in sorted(ffi_includes):
+        transpiler.emit(f'#include <{header}>')
+    if ffi_includes:
+        transpiler.emit("")
+
+    # Process each module in order
+    for mod_name in order:
+        info = modules[mod_name]
+
+        # Set up module context with imports
+        imports = []
+        for imp in info.imports:
+            imports.append((imp.module_name, imp.symbols))
+        transpiler.setup_module_context(mod_name, imports)
+
+        transpiler.emit(f"/* ========== Module: {mod_name} ========== */")
+        transpiler.emit("")
+
+        # Get module forms (handle both wrapped and unwrapped)
+        module_forms = info.ast
+        for form in info.ast:
+            if is_form(form, 'module'):
+                module_forms = list(form.items[2:])
+                break
+
+        # First collect FFI to register functions
+        for form in module_forms:
+            if is_form(form, 'ffi'):
+                transpiler._process_ffi(form)
+            elif is_form(form, 'ffi-struct'):
+                transpiler._process_ffi_struct(form)
+
+        # Collect types and functions
+        types = []
+        functions = []
+        for form in module_forms:
+            if is_form(form, 'type'):
+                types.append(form)
+            elif is_form(form, 'fn'):
+                functions.append(form)
+
+        # Emit forward declarations for record types
+        record_types = []
+        for t in types:
+            if len(t) > 2 and is_form(t[2], 'record'):
+                type_name = t[1].name
+                # Prefix type names too for multi-module builds
+                c_type_name = f"{transpiler.to_c_name(mod_name)}_{transpiler.to_c_name(type_name)}"
+                record_types.append(c_type_name)
+                transpiler.emit(f"typedef struct {c_type_name} {c_type_name};")
+        if record_types:
+            transpiler.emit("")
+
+        # Emit types
+        for t in types:
+            transpiler.transpile_type(t)
+
+        # Emit function forward declarations
+        if functions:
+            transpiler.emit("/* Forward declarations */")
+            for fn in functions:
+                transpiler.emit_forward_declaration(fn)
+            transpiler.emit("")
+
+        # Emit generated Option/List/Result types
+        transpiler._emit_generated_types()
+
+        # Emit function bodies
+        for fn in functions:
+            transpiler.transpile_function(fn)
+
+    return '\n'.join(transpiler.output)
 
 
 if __name__ == '__main__':

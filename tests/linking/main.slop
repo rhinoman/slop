@@ -1,0 +1,10 @@
+(module main
+  (import core (arena-new 1))
+  (import strings (concat 2))
+
+  (fn main ()
+    (@intent "Entry point")
+    (@spec (() -> Int))
+    (let ((arena (arena-new 4096)))
+      (println (concat "Hello, " "World!"))
+      0)))
