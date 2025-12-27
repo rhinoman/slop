@@ -175,3 +175,80 @@ class TestExamples:
         c_code = transpile(hello_source)
         assert "main" in c_code
         assert "Hello" in c_code or "printf" in c_code
+
+
+class TestComprehensiveTranspilation:
+    """Integration test exercising all transpiler features"""
+
+    def test_comprehensive_transpilation(self, comprehensive_source):
+        """Verify all major features transpile correctly"""
+        c_code = transpile(comprehensive_source)
+
+        # Union type generates tagged union
+        assert "uint8_t tag;" in c_code
+        assert "union {" in c_code
+        assert "Value_number_TAG" in c_code
+
+        # For loop
+        assert "for (int64_t i = 0; i < 10; i++)" in c_code
+
+        # While loop
+        assert "while ((n > 0))" in c_code
+
+        # Enum comparison (cond with equality checks)
+        assert "(s == GameState_waiting)" in c_code
+        assert "(s == GameState_playing)" in c_code
+
+        # Match on union generates switch
+        assert "switch (" in c_code
+
+        # Match on union with binding
+        assert "__auto_type n = " in c_code  # binding from (number n)
+
+        # Result constructors
+        assert ".tag = 0, .data.ok =" in c_code  # ok
+        assert ".tag = 1, .data.err =" in c_code  # error
+
+        # Early return with ?
+        assert "if (_tmp.tag != 0) return _tmp" in c_code
+
+        # Array indexing
+        assert "scores[i]" in c_code
+
+        # Bitwise operators
+        assert "(a & b)" in c_code
+        assert " | " in c_code  # or operator
+        assert "(b << 2)" in c_code
+        assert " ^ " in c_code  # xor operator
+
+        # cond generates if/else if chain
+        assert "} else if (" in c_code
+
+        # with-arena
+        assert "slop_arena_new(1024)" in c_code
+        assert "slop_arena_free" in c_code
+
+        # addr operator
+        assert "(&x)" in c_code
+
+        # cast operator
+        assert "((uint8_t)(n))" in c_code
+
+        # c-inline escape
+        assert "return 42;" in c_code
+
+        # Postcondition with $result
+        assert "SLOP_POST(" in c_code
+        assert "_retval" in c_code
+
+        # Generated Option type
+        assert "slop_option_" in c_code
+
+        # Generated Result type
+        assert "slop_result_" in c_code
+
+        # Nested function call
+        assert "classify(bitwise_ops(a, b))" in c_code
+
+        # do sequence (println followed by expression)
+        assert 'printf("%s\\n"' in c_code

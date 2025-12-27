@@ -28,3 +28,9 @@ def rate_limiter_source(examples_dir):
 def hello_source(examples_dir):
     """Hello world example source"""
     return (examples_dir / "hello.slop").read_text()
+
+
+@pytest.fixture
+def comprehensive_source():
+    """Comprehensive transpiler test source"""
+    return (Path(__file__).parent / "comprehensive.slop").read_text()
