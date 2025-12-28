@@ -6,9 +6,11 @@ with automatic escalation on verification failure.
 """
 
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from threading import Semaphore
+from typing import Optional, List, Dict, Any, Callable
 from slop.parser import SExpr, SList, Symbol, String, Number, parse, find_holes, is_form, pretty_print
 from slop.providers import Tier, ModelConfig, Provider, MockProvider, create_default_configs
 
@@ -41,10 +43,19 @@ VALID_EXPRESSION_FORMS = {
     'arena-new', 'arena-alloc', 'arena-free', 'with-arena',
     # Error handling
     'try', '?',
+    # Result operations
+    'is-ok', 'unwrap',
     # I/O
-    'print', 'println',
+    'print', 'println', 'file-read', 'file-write',
     # String operations
-    'int-to-string', 'string-len', 'string-concat', 'string-eq',
+    'string-new', 'string-len', 'string-concat', 'string-eq', 'string-slice',
+    'int-to-string',
+    # List operations
+    'list-new', 'list-push', 'list-get', 'list-len',
+    # Map operations
+    'map-new', 'map-put', 'map-get', 'map-has',
+    # Time
+    'now-ms', 'sleep-ms',
     # Sequencing
     'do',
     # FFI
@@ -652,13 +663,41 @@ def build_prompt(hole: Hole, context: Dict[str, Any], failed_attempts: List[tupl
 class HoleFiller:
     """Fill holes with tiered model routing"""
 
-    def __init__(self, configs: Dict[Tier, ModelConfig], provider):
+    # Default concurrency limits per tier
+    DEFAULT_TIER_LIMITS = {
+        Tier.TIER_1: 8,   # Local models - can handle more
+        Tier.TIER_2: 4,   # Haiku - moderate
+        Tier.TIER_3: 3,   # Sonnet - careful
+        Tier.TIER_4: 2,   # Opus - very careful
+    }
+
+    def __init__(self, configs: Dict[Tier, ModelConfig], provider,
+                 tier_limits: Optional[Dict[Tier, int]] = None):
         self.configs = configs
         self.provider = provider
         self.max_retries = 2
 
-    def fill(self, hole: Hole, context: Dict[str, Any]) -> FillResult:
-        """Fill a single hole"""
+        # Create per-tier semaphores for rate limiting
+        limits = tier_limits or self.DEFAULT_TIER_LIMITS
+        self._tier_semaphores: Dict[Tier, Semaphore] = {
+            tier: Semaphore(limits.get(tier, 2))
+            for tier in Tier
+        }
+
+    def fill(self, hole: Hole, context: Dict[str, Any],
+             use_semaphores: bool = False) -> FillResult:
+        """Fill a single hole.
+
+        Args:
+            hole: The hole to fill
+            context: Context dict with type_defs, fn_specs, ffi_specs, etc.
+            use_semaphores: If True, use per-tier semaphores for rate limiting
+        """
+        return self._fill_internal(hole, context, use_semaphores)
+
+    def _fill_internal(self, hole: Hole, context: Dict[str, Any],
+                       use_semaphores: bool) -> FillResult:
+        """Internal fill implementation with optional semaphore support."""
         tier = classify_tier(hole)
         failed_attempts = []  # List of (response_snippet, error) tuples
 
@@ -667,68 +706,129 @@ class HoleFiller:
 
         attempts = 0
         current_tier = tier
+        held_semaphore: Optional[Tier] = None
 
-        while current_tier.value <= Tier.TIER_4.value:
-            config = self.configs.get(current_tier)
-            if not config:
-                logger.debug(f"No config for {current_tier.name}, skipping")
+        try:
+            while current_tier.value <= Tier.TIER_4.value:
+                config = self.configs.get(current_tier)
+                if not config:
+                    logger.debug(f"No config for {current_tier.name}, skipping")
+                    next_val = current_tier.value + 1
+                    if next_val > Tier.TIER_4.value:
+                        break
+                    current_tier = Tier(next_val)
+                    continue
+
+                # Acquire semaphore for current tier (release old one if escalating)
+                if use_semaphores:
+                    if held_semaphore and held_semaphore != current_tier:
+                        self._tier_semaphores[held_semaphore].release()
+                        held_semaphore = None
+                    if held_semaphore is None:
+                        self._tier_semaphores[current_tier].acquire()
+                        held_semaphore = current_tier
+
+                for retry in range(self.max_retries):
+                    attempts += 1
+                    # Rebuild prompt with feedback from failed attempts
+                    prompt = build_prompt(hole, context, failed_attempts)
+                    logger.info(f"Attempt {attempts}: {current_tier.name} using {config.model}")
+                    logger.debug(f"Prompt:\n{prompt}")
+
+                    try:
+                        response = self.provider.complete(prompt, config)
+                        logger.debug(f"Response:\n{response}")
+
+                        expr = self._parse_response(response)
+                        if not expr:
+                            error = "Failed to parse as valid S-expression"
+                            logger.warning(error)
+                            failed_attempts.append((response[:100], error))
+                            continue
+
+                        success, error = self._validate(expr, hole, context)
+                        if success:
+                            logger.info(f"Success after {attempts} attempt(s)")
+                            quality_metrics = self._calculate_quality(expr, hole, context, attempts)
+                            return FillResult(
+                                success=True,
+                                expression=expr,
+                                model_used=config.model,
+                                attempts=attempts,
+                                quality_score=quality_metrics['overall'],
+                                quality_metrics=quality_metrics
+                            )
+                        else:
+                            logger.warning(f"Validation failed: {error}")
+                            failed_attempts.append((str(expr)[:100], error))
+                    except Exception as e:
+                        logger.warning(f"Exception during attempt {attempts}: {e}")
+                        failed_attempts.append(("(exception)", str(e)))
+                        continue
+
+                # Escalate to next tier
                 next_val = current_tier.value + 1
                 if next_val > Tier.TIER_4.value:
                     break
+                logger.info(f"Escalating from {current_tier.name} to {Tier(next_val).name}")
                 current_tier = Tier(next_val)
-                continue
 
-            for retry in range(self.max_retries):
-                attempts += 1
-                # Rebuild prompt with feedback from failed attempts
-                prompt = build_prompt(hole, context, failed_attempts)
-                logger.info(f"Attempt {attempts}: {current_tier.name} using {config.model}")
-                logger.debug(f"Prompt:\n{prompt}")
+            logger.error(f"Failed after {attempts} attempt(s)")
+            return FillResult(
+                success=False,
+                error=f"Failed after {attempts} attempts",
+                attempts=attempts
+            )
+        finally:
+            # Always release semaphore on exit
+            if use_semaphores and held_semaphore:
+                self._tier_semaphores[held_semaphore].release()
 
-                try:
-                    response = self.provider.complete(prompt, config)
-                    logger.debug(f"Response:\n{response}")
+    def fill_parallel(
+        self,
+        holes: List[tuple],  # List of (Hole, context) tuples
+        max_workers: Optional[int] = None,
+        progress_callback: Optional[Callable[[int, int, FillResult], None]] = None
+    ) -> List[FillResult]:
+        """Fill multiple holes in parallel with per-tier rate limiting.
 
-                    expr = self._parse_response(response)
-                    if not expr:
-                        error = "Failed to parse as valid S-expression"
-                        logger.warning(error)
-                        failed_attempts.append((response[:100], error))
-                        continue
+        Args:
+            holes: List of (Hole, context) tuples to fill
+            max_workers: Max concurrent threads (default: sum of tier limits)
+            progress_callback: Optional callback(completed, total, result) for progress updates
 
-                    success, error = self._validate(expr, hole, context)
-                    if success:
-                        logger.info(f"Success after {attempts} attempt(s)")
-                        quality_metrics = self._calculate_quality(expr, hole, context, attempts)
-                        return FillResult(
-                            success=True,
-                            expression=expr,
-                            model_used=config.model,
-                            attempts=attempts,
-                            quality_score=quality_metrics['overall'],
-                            quality_metrics=quality_metrics
-                        )
-                    else:
-                        logger.warning(f"Validation failed: {error}")
-                        failed_attempts.append((str(expr)[:100], error))
-                except Exception as e:
-                    logger.warning(f"Exception during attempt {attempts}: {e}")
-                    failed_attempts.append(("(exception)", str(e)))
-                    continue
+        Returns:
+            List of FillResults in same order as input holes
+        """
+        if not holes:
+            return []
 
-            # Escalate to next tier
-            next_val = current_tier.value + 1
-            if next_val > Tier.TIER_4.value:
-                break
-            logger.info(f"Escalating from {current_tier.name} to {Tier(next_val).name}")
-            current_tier = Tier(next_val)
+        # Default max_workers to total tier capacity
+        if max_workers is None:
+            max_workers = sum(self.DEFAULT_TIER_LIMITS.values())
 
-        logger.error(f"Failed after {attempts} attempt(s)")
-        return FillResult(
-            success=False,
-            error=f"Failed after {attempts} attempts",
-            attempts=attempts
-        )
+        results: List[Optional[FillResult]] = [None] * len(holes)
+        completed = 0
+
+        def fill_one(idx: int, hole: Hole, context: Dict[str, Any]) -> tuple:
+            result = self._fill_internal(hole, context, use_semaphores=True)
+            return idx, result
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(fill_one, i, hole, ctx): i
+                for i, (hole, ctx) in enumerate(holes)
+            }
+
+            for future in as_completed(futures):
+                idx, result = future.result()
+                results[idx] = result
+                completed += 1
+
+                if progress_callback:
+                    progress_callback(completed, len(holes), result)
+
+        return results
 
     def _parse_response(self, response: str) -> Optional[SExpr]:
         """Parse LLM response and transform Lisp forms to SLOP equivalents"""

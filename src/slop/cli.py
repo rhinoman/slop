@@ -515,6 +515,56 @@ def cmd_fill(args):
                             if not quiet:
                                 error_info = f": {result.error}" if result.error else ""
                                 print(f"  x {info.prompt[:50]}...{error_info}")
+        elif getattr(args, 'parallel', False):
+            # Parallel mode with per-tier rate limiting
+            if not quiet:
+                print("Filling holes in parallel...")
+
+            # Build all contexts upfront
+            hole_data = []  # List of (form, hole, info, context) tuples
+            for form, hole in all_holes:
+                info = extract_hole(hole)
+                context = _extract_context(form)
+                context['type_defs'] = type_defs
+                context['fn_specs'] = fn_specs
+                context['ffi_specs'] = ffi_specs
+                context['requires_fns'] = requires_fns
+                context['defined_functions'] = [s['name'] for s in fn_specs] + type_names + ffi_functions + imported_names
+                context['error_variants'] = error_variants
+                hole_data.append((form, hole, info, context))
+
+            # Prepare for parallel fill
+            fill_inputs = [(info, context) for (form, hole, info, context) in hole_data]
+
+            # Progress callback for real-time output
+            import threading
+            print_lock = threading.Lock()
+
+            def progress_callback(completed: int, total: int, result):
+                nonlocal success_count, fail_count
+                with print_lock:
+                    if result.success:
+                        success_count += 1
+                        if not quiet:
+                            model_info = f" [{result.model_used}]" if result.model_used else ""
+                            print(f"  [{completed}/{total}] + ...{model_info}")
+                    else:
+                        fail_count += 1
+                        if not quiet:
+                            error_info = f": {result.error}" if result.error else ""
+                            print(f"  [{completed}/{total}] x ...{error_info}")
+
+            # Run parallel fill
+            max_workers = getattr(args, 'max_workers', None)
+            results = filler.fill_parallel(fill_inputs, max_workers=max_workers, progress_callback=progress_callback)
+
+            # Process results
+            for i, (form, hole, info, context) in enumerate(hole_data):
+                result = results[i]
+                if result and result.success and result.expression:
+                    replacements[id(hole)] = result.expression
+                    logger.debug(f"Replacement added: id={id(hole)}")
+
         else:
             # Original sequential mode
             for form, hole in all_holes:
@@ -1016,6 +1066,10 @@ def main():
         help='Output only the filled source, no status messages')
     p.add_argument('--batch-interactive', action='store_true',
         help='Batch interactive provider holes into single sessions')
+    p.add_argument('-p', '--parallel', action='store_true',
+        help='Fill holes in parallel (respects per-tier rate limits)')
+    p.add_argument('--max-workers', type=int, default=None,
+        help='Max parallel workers (default: auto based on tier limits)')
 
     # check
     p = subparsers.add_parser('check', help='Validate')
