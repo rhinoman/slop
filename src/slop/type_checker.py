@@ -1045,6 +1045,14 @@ class TypeChecker:
         if isinstance(pattern, Symbol):
             name = pattern.name
             if name != '_' and not name.startswith("'"):
+                # Check if bare symbol matches a known enum variant
+                enum_type = self.env.lookup_enum_variant(name)
+                if enum_type:
+                    self.warning(
+                        f"Bare '{name}' in pattern matches enum {enum_type.name} - use '{name} for value match",
+                        pattern,
+                        hint=f"Change to '{name} to match the enum value, or use a different variable name"
+                    )
                 self.env.bind_var(name, scrutinee_type)
         elif isinstance(pattern, SList) and len(pattern) >= 1:
             # (tag var) pattern for union types

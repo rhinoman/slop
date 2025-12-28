@@ -166,7 +166,7 @@
     (@spec (((Option Int)) -> Int))
     (match opt
       ((some v) v)
-      (none 0)))
+      ('none 0)))
 
   ;; Main entry point
   (fn main ()

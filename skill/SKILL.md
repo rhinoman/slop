@@ -104,21 +104,26 @@ Simple enums are just symbolic values - NO data attached:
 
 #### Matching Simple Enums
 
-Simple enums have NO data, so you CANNOT bind variables in match patterns:
+Simple enums have NO data, so you CANNOT bind variables in match patterns.
+Use **quoted symbols** (`'Fizz`) to match enum values:
 
 ```
 (type FizzBuzzResult (enum Fizz Buzz FizzBuzz Number))
 
-;; CORRECT - bare symbols, no bindings
+;; CORRECT - quoted symbols for enum values
 (match result
-  (Fizz (println "Fizz"))
-  (Buzz (println "Buzz"))
-  (FizzBuzz (println "FizzBuzz"))
-  (Number (println (int-to-string arena i))))  ; use outer variable 'i', NOT a binding
+  ('Fizz (println "Fizz"))
+  ('Buzz (println "Buzz"))
+  ('FizzBuzz (println "FizzBuzz"))
+  ('Number (println (int-to-string arena i))))  ; use outer variable 'i', NOT a binding
+
+;; WRONG - bare symbol would be a binding, not a value match
+(match result
+  (Fizz (println "Fizz")))   ; ERROR: Fizz is a binding, not enum match
 
 ;; WRONG - trying to bind 'n' from Number (simple enums have no data!)
 (match result
-  ((Number n) (println n)))   ; ERROR: Number has no data to bind
+  (('Number n) (println n)))   ; ERROR: Number has no data to bind
 ```
 
 ### Tagged Unions (With Data)

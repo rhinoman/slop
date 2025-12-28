@@ -322,14 +322,17 @@ class Transpiler:
                 if tag in ('some', 'none', 'ok', 'error'):
                     return self._transpile_option_result_match_expr(scrutinee, clauses, tag)
 
-        # Check if it's a simple enum match
+        # Check if it's a simple enum match (only quoted symbols like 'Fizz)
         is_simple_enum = False
         for clause in clauses:
             if isinstance(clause, SList) and len(clause) >= 2:
                 pattern = clause[0]
-                if isinstance(pattern, Symbol) and self._unquote_symbol(pattern.name) in self.enums:
-                    is_simple_enum = True
-                    break
+                # Only quoted symbols count as enum values; bare identifiers are bindings
+                if isinstance(pattern, Symbol) and pattern.name.startswith("'"):
+                    unquoted = self._unquote_symbol(pattern.name)
+                    if unquoted in self.enums:
+                        is_simple_enum = True
+                        break
 
         # Build switch as statement expression
         # Use concrete type from context since __auto_type requires initializer
@@ -347,11 +350,13 @@ class Transpiler:
                 body = clause.items[1:]
 
                 if isinstance(pattern, Symbol):
-                    unquoted = self._unquote_symbol(pattern.name)
                     if pattern.name == '_' or pattern.name == 'else':
                         parts.append("default: { ")
-                    elif unquoted in self.enums:
-                        parts.append(f"case {self.enums[unquoted]}: {{ ")
+                    elif pattern.name.startswith("'"):
+                        # Quoted symbol = enum value
+                        unquoted = self._unquote_symbol(pattern.name)
+                        if unquoted in self.enums:
+                            parts.append(f"case {self.enums[unquoted]}: {{ ")
                     else:
                         parts.append(f"case {i}: {{ ")
 
@@ -365,10 +370,12 @@ class Transpiler:
 
                 elif isinstance(pattern, SList) and len(pattern) >= 1:
                     raw_tag = pattern[0].name if isinstance(pattern[0], Symbol) else None
+                    # Only quoted tags match enum values
+                    is_quoted_tag = raw_tag and raw_tag.startswith("'")
                     tag = self._unquote_symbol(raw_tag) if raw_tag else None
                     var_name = self.to_c_name(pattern[1].name) if len(pattern) > 1 else None
 
-                    if is_simple_enum and tag in self.enums:
+                    if is_simple_enum and is_quoted_tag and tag in self.enums:
                         parts.append(f"case {self.enums[tag]}: {{ ")
                     else:
                         parts.append(f"case {i}: {{ ")
@@ -1525,21 +1532,24 @@ class Transpiler:
         """Transpile match expression"""
         scrutinee = self.transpile_expr(expr[1])
 
-        # Determine if this is a simple enum match
-        # Check if any pattern is a bare symbol or SList head that's in self.enums
+        # Determine if this is a simple enum match (only quoted symbols like 'Fizz)
         is_simple_enum = False
         for clause in expr.items[2:]:
             if isinstance(clause, SList) and len(clause) >= 2:
                 pattern = clause[0]
-                if isinstance(pattern, Symbol) and self._unquote_symbol(pattern.name) in self.enums:
-                    is_simple_enum = True
-                    break
-                if isinstance(pattern, SList) and len(pattern) >= 1:
-                    raw_tag = pattern[0].name if isinstance(pattern[0], Symbol) else None
-                    tag = self._unquote_symbol(raw_tag) if raw_tag else None
-                    if tag and tag in self.enums:
+                # Only quoted symbols count as enum values; bare identifiers are bindings
+                if isinstance(pattern, Symbol) and pattern.name.startswith("'"):
+                    unquoted = self._unquote_symbol(pattern.name)
+                    if unquoted in self.enums:
                         is_simple_enum = True
                         break
+                if isinstance(pattern, SList) and len(pattern) >= 1:
+                    raw_tag = pattern[0].name if isinstance(pattern[0], Symbol) else None
+                    if raw_tag and raw_tag.startswith("'"):
+                        tag = self._unquote_symbol(raw_tag)
+                        if tag in self.enums:
+                            is_simple_enum = True
+                            break
 
         if is_simple_enum:
             self.emit(f"switch ({scrutinee}) {{")
@@ -1553,15 +1563,15 @@ class Transpiler:
                 body = clause.items[1:]
 
                 if isinstance(pattern, Symbol):
-                    # Bare symbol pattern (simple enum or wildcard)
-                    unquoted = self._unquote_symbol(pattern.name)
                     if pattern.name == '_' or pattern.name == 'else':
                         # Wildcard/default case
                         self.emit("default: {")
-                    elif unquoted in self.enums:
-                        # Simple enum variant
-                        enum_const = self.enums[unquoted]
-                        self.emit(f"case {enum_const}: {{")
+                    elif pattern.name.startswith("'"):
+                        # Quoted symbol = enum value
+                        unquoted = self._unquote_symbol(pattern.name)
+                        if unquoted in self.enums:
+                            enum_const = self.enums[unquoted]
+                            self.emit(f"case {enum_const}: {{")
                     else:
                         # Unknown pattern, use index as fallback
                         self.emit(f"case {i}: {{")
@@ -1574,12 +1584,13 @@ class Transpiler:
                     self.indent -= 1
                     self.emit("}")
                 elif isinstance(pattern, SList) and len(pattern) >= 1:
-                    # Pattern with binding like (Number n)
+                    # Pattern with binding like ('Number n) or (some x)
                     raw_tag = pattern[0].name if isinstance(pattern[0], Symbol) else None
+                    is_quoted_tag = raw_tag and raw_tag.startswith("'")
                     tag = self._unquote_symbol(raw_tag) if raw_tag else None
                     var_name = self.to_c_name(pattern[1].name) if len(pattern) > 1 else None
 
-                    if is_simple_enum and tag in self.enums:
+                    if is_simple_enum and is_quoted_tag and tag in self.enums:
                         enum_const = self.enums[tag]
                         self.emit(f"case {enum_const}: {{")
                     else:

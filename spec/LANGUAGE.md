@@ -330,13 +330,24 @@ before code can be filled or compiled. This is used by code generators (like
 
 ```
 _                            ; Wildcard
-identifier                   ; Binding
-literal                      ; Literal match
+identifier                   ; Binding (captures matched value)
+'identifier                  ; Quoted value (enum variant match)
+literal                      ; Literal match (number, string)
 (array p1 p2...)             ; Array pattern
 (list p1 p2... | rest)       ; List with rest
 (record Type (f1 p1)...)     ; Struct pattern
 (union Tag pattern)          ; Tagged union variant
 (guard pattern when expr)    ; Guarded pattern
+```
+
+**Enum matching**: Use quoted symbols `'Fizz` for enum value matches. Bare identifiers
+are bindings (capture the value), not value matches.
+
+```lisp
+(match result
+  ('Fizz (println "Fizz"))     ; Match enum value Fizz
+  ('Buzz (println "Buzz"))     ; Match enum value Buzz
+  (_ (println "other")))       ; Wildcard
 ```
 
 ## 4. Module System
