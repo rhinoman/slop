@@ -1,5 +1,5 @@
 (module math
-  (export add double Point make-point point-sum Direction direction-value safe-div list-size sum-first-n first-or-zero Score find-first-above count-map-entries Container make-container container-first Item make-item-list item-list-first test-map-ptr safe-sqrt)
+  (export add double Point make-point point-sum Direction direction-value safe-div list-size sum-first-n first-or-zero Score find-first-above count-map-entries Container make-container container-first Item make-item-list item-list-first test-map-ptr safe-sqrt make-pair)
 
   ;; Level 9: Type alias for cross-module use
   (type Score (Int 0 .. 100))
@@ -165,4 +165,12 @@
     (@spec ((Int) -> (Result Int String)))
     (if (>= x 0)
       (ok x)
-      (error "negative"))))
+      (error "negative")))
+
+  ;; Level 16: Inline record type in Result
+  (fn make-pair ((a Int) (b Int))
+    (@intent "Create a pair as inline record in Result")
+    (@spec ((Int Int) -> (Result (record (first Int) (second Int)) String)))
+    (if (> a 0)
+      (ok (record-new (record (first Int) (second Int)) (first a) (second b)))
+      (error "a must be positive"))))

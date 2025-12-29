@@ -1,5 +1,5 @@
 (module main
-  (import math (add double Point make-point point-sum Direction direction-value safe-div list-size sum-first-n first-or-zero Score find-first-above count-map-entries make-container container-first make-item-list item-list-first test-map-ptr safe-sqrt))
+  (import math (add double Point make-point point-sum Direction direction-value safe-div list-size sum-first-n first-or-zero Score find-first-above count-map-entries make-container container-first make-item-list item-list-first test-map-ptr safe-sqrt make-pair))
   (import native (get-time))
 
   ;; Level 9: Function using cross-module type alias
@@ -43,19 +43,24 @@
                 (cfirst (container-first container))
                 (ifirst (item-list-first item-list)))
             ;; Level 15: Result match with bindings - safe-sqrt 4 returns (ok 4)
-            (let ((sqrt-res (safe-sqrt 4)))
+            ;; Level 16: Inline record in Result - make-pair 2 3 returns (ok {first: 2, second: 3})
+            (let ((sqrt-res (safe-sqrt 4))
+                  (pair-res (make-pair 2 3)))
               (match result
-                ((some val) (+ (match sqrt-res
-                                 ((ok sqval) sqval)
+                ((some val) (+ (match pair-res
+                                 ((ok pair) (+ (. pair first) (. pair second)))
                                  ((error e) 0))
-                               (+ (+ (+ (+ (+ (+ (+ (+ (+ (+ (+ (+ (point-sum p) (direction-value d)) val) (list-size nums))
-                                                    (if (> timestamp 0) 1 0))
-                                                 sum2)
-                                              first)
-                                           score)
-                                        (match above ((some v) v) (none 0)))
-                                     count)
-                                  cfirst)
-                               ifirst)
-                            mapptr)))
+                               (+ (match sqrt-res
+                                    ((ok sqval) sqval)
+                                    ((error e) 0))
+                                  (+ (+ (+ (+ (+ (+ (+ (+ (+ (+ (+ (+ (point-sum p) (direction-value d)) val) (list-size nums))
+                                                       (if (> timestamp 0) 1 0))
+                                                    sum2)
+                                                 first)
+                                              score)
+                                           (match above ((some v) v) (none 0)))
+                                        count)
+                                     cfirst)
+                                  ifirst)
+                               mapptr))))
                 (none 0)))))))))

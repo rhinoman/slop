@@ -78,6 +78,7 @@ class Transpiler:
         self.generated_result_types: Set[str] = set()  # Track generated Result<T, E> types
         self.generated_list_types: Set[str] = set()  # Track generated List<T> types
         self.generated_map_types: Set[tuple] = set()  # Track generated Map<K, V> types: (type_name, key_c_type, value_c_type)
+        self.generated_inline_records: Dict[str, str] = {}  # Track inline record types: type_name -> struct_body
         self.emitted_generated_types: Set[str] = set()  # Track which generated types have been emitted (to avoid duplicates)
 
         # Module system support
@@ -377,7 +378,14 @@ class Transpiler:
             "int64_t" -> "int"  (normalized for runtime compatibility)
             "void*" -> "void_ptr"
             "slop_string" -> "string"
+            "struct { int64_t x; int64_t y; }" -> "anon_<hash>"
         """
+        # Handle inline struct types - generate a hash-based identifier
+        if c_type.startswith('struct {'):
+            import hashlib
+            hash_val = hashlib.md5(c_type.encode()).hexdigest()[:8]
+            return f"anon_{hash_val}"
+
         result = c_type.replace('*', '_ptr').replace(' ', '_')
         # Strip slop_ prefix from builtin types for cleaner container names
         # e.g., slop_option_string instead of slop_option_slop_string
@@ -553,15 +561,10 @@ class Transpiler:
         """Generate C struct type for inline record definition.
 
         Handles: (record (field1 Type1) (field2 Type2) ...)
-        Returns: struct { Type1 field1; Type2 field2; }
+        Returns: Named typedef (e.g., _anon_record_<hash>)
         """
-        fields = []
-        for field in record_expr.items[1:]:
-            if isinstance(field, SList) and len(field) >= 2:
-                fname = self.to_c_name(field[0].name)
-                ftype = self.to_c_type(field[1])
-                fields.append(f"{ftype} {fname}")
-        return f"struct {{ {'; '.join(fields)}; }}"
+        # Use to_c_type which now generates named typedefs for inline records
+        return self.to_c_type(record_expr)
 
     def _transpile_match_expr(self, expr: SList) -> str:
         """Transpile match as an expression using GCC statement expression.
@@ -3265,6 +3268,25 @@ class Transpiler:
                 inner = self.to_c_type(type_expr[1])
                 return f"{inner}*"
 
+            if head == 'record':
+                # Inline record: (record (field1 Type1) (field2 Type2) ...)
+                # Generate a named typedef to ensure type compatibility
+                fields = []
+                for field in type_expr.items[1:]:
+                    if isinstance(field, SList) and len(field) >= 2:
+                        field_name = field[0].name if isinstance(field[0], Symbol) else str(field[0])
+                        field_c_name = self.to_c_name(field_name)
+                        field_type = self.to_c_type(field[1])
+                        fields.append(f"{field_type} {field_c_name}")
+                struct_body = "{ " + "; ".join(fields) + "; }"
+                # Generate unique name based on hash of fields
+                import hashlib
+                hash_val = hashlib.md5(struct_body.encode()).hexdigest()[:8]
+                type_name = f"_anon_record_{hash_val}"
+                # Track for later emission
+                self.generated_inline_records[type_name] = struct_body
+                return type_name
+
             if head in self.builtin_types:
                 return self.builtin_types[head]
 
@@ -3371,10 +3393,27 @@ class Transpiler:
                    'value' = emit Option/Result that use record values
                    'all' = emit everything (default, for backward compat)
         """
-        if not (self.generated_option_types or self.generated_list_types or self.generated_result_types or self.generated_map_types):
+        has_types = (self.generated_option_types or self.generated_list_types or
+                     self.generated_result_types or self.generated_map_types or
+                     self.generated_inline_records)
+        if not has_types:
             return
 
         emitted_any = False
+
+        # Emit inline record typedefs FIRST (other types may depend on them)
+        if phase in ('pointer', 'all'):
+            for type_name, struct_body in sorted(self.generated_inline_records.items()):
+                if type_name not in self.emitted_generated_types:
+                    if not emitted_any:
+                        self.emit("/* Generated generic type definitions */")
+                        emitted_any = True
+                    guard = self._type_guard_name(type_name)
+                    self.emit(f"#ifndef {guard}")
+                    self.emit(f"#define {guard}")
+                    self.emit(f"typedef struct {struct_body} {type_name};")
+                    self.emit("#endif")
+                    self.emitted_generated_types.add(type_name)
 
         # Emit Option types (skip pre-defined and already emitted ones)
         # Uses same layout as SLOP_OPTION_DEFINE: { bool has_value; T value; }

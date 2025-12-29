@@ -183,6 +183,8 @@ class TypeChecker:
         self._param_modes: Dict[str, str] = {}
         # Track which 'out' parameters have been initialized (written to)
         self._out_initialized: Set[str] = set()
+        # Track current function's return type (for ? operator validation)
+        self._current_fn_return_type: Optional[Type] = None
         # Register built-in functions
         self._register_builtins()
 
@@ -723,6 +725,27 @@ class TypeChecker:
             return OptionType(inner)
         if op == 'none':
             return OptionType(self.fresh_type_var('T'))
+
+        # Try operator: (? expr) - early return on error
+        if op == '?':
+            if len(expr) < 2:
+                self.error("? operator requires an expression", expr)
+                return UNKNOWN
+            inner_type = self.infer_expr(expr[1])
+            # Check if we're in a void-returning function
+            if self._current_fn_return_type is not None:
+                if (isinstance(self._current_fn_return_type, PrimitiveType) and
+                    self._current_fn_return_type.name in ('Unit', 'Void')):
+                    self.error(
+                        "Cannot use ? operator in function returning Unit",
+                        expr,
+                        hint="The ? operator performs early return on error, which requires the function to return a Result type. "
+                             "Change the function's return type to (Result T E) or handle errors explicitly with match."
+                    )
+            # Return the ok type from the Result
+            if isinstance(inner_type, ResultType):
+                return inner_type.ok_type
+            return UNKNOWN
 
         # List and Map constructors with type parameters
         if op == 'list-new':
@@ -1694,6 +1717,8 @@ class TypeChecker:
         # Clear parameter mode tracking for this function
         self._param_modes = {}
         self._out_initialized = set()
+        # Track current function's return type for ? operator validation
+        self._current_fn_return_type = fn_type.return_type
 
         # Bind parameters with mode tracking
         param_types_iter = iter(fn_type.param_types)
