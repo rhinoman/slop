@@ -145,6 +145,69 @@ slop check examples/rate-limiter.slop
 slop build examples/rate-limiter.slop -o rate_limiter
 ```
 
+## Project Configuration
+
+Create a `slop.toml` file to configure your project:
+
+```toml
+[project]
+name = "my-project"
+version = "0.1.0"
+entry = "src/main.slop"        # Main module
+
+[build]
+output = "build/myapp"         # Output path (directory created if needed)
+include = ["src", "lib"]       # Module search paths
+type = "executable"            # "executable", "static", or "shared"
+debug = false
+
+[build.link]
+libraries = ["pthread"]        # -l flags
+library_paths = []             # -L flags
+```
+
+With a `slop.toml`, commands use project settings automatically:
+
+```bash
+slop build                     # Uses [project].entry, outputs to [build].output
+slop build --debug             # CLI flags override config
+slop fill                      # Uses entry from config
+slop fill -c slop.toml         # Explicit config path
+```
+
+### Hole Filler Configuration
+
+Configure LLM providers and tier routing for `slop fill`:
+
+```toml
+[providers.ollama]
+type = "ollama"
+base_url = "http://localhost:11434"
+
+[providers.openai]
+type = "openai-compatible"
+base_url = "https://api.openai.com/v1"
+api_key = "${OPENAI_API_KEY}"
+
+[tiers.tier-1]
+provider = "ollama"
+model = "phi3:mini"
+
+[tiers.tier-2]
+provider = "ollama"
+model = "llama3:8b"
+
+[tiers.tier-3]
+provider = "ollama"
+model = "llama3:70b-q4"
+
+[tiers.tier-4]
+provider = "openai"
+model = "gpt-4o"
+```
+
+See `slop.toml.example` for complete configuration options.
+
 ## Hybrid Generation Pipeline
 
 ```
@@ -273,7 +336,7 @@ Arena allocation handles 90% of cases:
 - ✓ Hole filler with quality scoring and pattern library
 - ✓ CLI tooling (`slop` command)
 - ✓ Runtime header with arena allocation
-- ✓ Test suite (74 tests)
+- ✓ Test suite
 
 **Not Yet Implemented:**
 - Contract verification (SMT solver integration)

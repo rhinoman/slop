@@ -21,7 +21,8 @@ from slop.transpiler import Transpiler, transpile, transpile_multi
 from slop.hole_filler import HoleFiller, extract_hole, classify_tier, replace_holes_in_ast
 from slop.formatter import format_source
 from slop.providers import (
-    MockProvider, create_default_configs, load_config, create_from_config, Tier
+    MockProvider, create_default_configs, load_config, create_from_config, Tier,
+    load_project_config, ProjectConfig, BuildConfig
 )
 from slop.type_checker import TypeChecker, check_file, check_modules
 from slop.resolver import ModuleResolver, ResolverError
@@ -494,13 +495,28 @@ def cmd_fill(args):
     quiet = args.quiet
 
     try:
-        ast = parse_file(args.input)
+        # Load project config for entry point
+        config_path = getattr(args, 'config', None)
+        project_cfg, _ = load_project_config(config_path)
+
+        # Determine input file
+        if hasattr(args, 'input') and args.input:
+            input_file = args.input
+        elif project_cfg and project_cfg.entry:
+            input_file = project_cfg.entry
+            if not quiet:
+                print(f"Using entry from slop.toml: {input_file}")
+        else:
+            print("Error: No input file specified and no [project].entry in slop.toml", file=sys.stderr)
+            return 1
+
+        ast = parse_file(input_file)
 
         # Pre-check scaffold for type errors before filling
         if not quiet:
             print("  Pre-checking scaffold...")
 
-        diagnostics = check_file(args.input)
+        diagnostics = check_file(input_file)
         type_errors = [d for d in diagnostics if d.severity == 'error']
         type_warnings = [d for d in diagnostics if d.severity == 'warning']
 
@@ -645,8 +661,8 @@ def cmd_fill(args):
         const_names = _extract_const_names(ast)
         const_specs = _extract_const_specs(ast)
         # Extract full signatures from imported modules
-        imported_specs = _extract_imported_specs(ast, from_path=Path(args.input))
-        imported_types = _extract_imported_types(ast, from_path=Path(args.input))
+        imported_specs = _extract_imported_specs(ast, from_path=Path(input_file))
+        imported_types = _extract_imported_types(ast, from_path=Path(input_file))
         if not quiet:
             if imported_specs:
                 print(f"  Extracted {len(imported_specs)} imported function specs")
@@ -680,7 +696,7 @@ def cmd_fill(args):
             if not quiet:
                 print("No holes to fill")
             if args.output:
-                with open(args.input) as f:
+                with open(input_file) as f:
                     Path(args.output).write_text(f.read())
             return 0
 
@@ -888,9 +904,9 @@ def cmd_fill(args):
         output_text = format_source(output_text)
 
         if args.inplace:
-            Path(args.input).write_text(output_text)
+            Path(input_file).write_text(output_text)
             if not quiet:
-                print(f"\nWrote {args.input}")
+                print(f"\nWrote {input_file}")
         elif args.output:
             Path(args.output).write_text(output_text)
             if not quiet:
@@ -1019,17 +1035,55 @@ def _has_imports(ast) -> bool:
 def cmd_build(args):
     """Full build pipeline"""
     try:
-        input_path = Path(args.input)
-        output = args.output or input_path.stem
+        # Load project config (auto-detect slop.toml or use explicit -c)
+        config_path = getattr(args, 'config', None)
+        project_cfg, build_cfg = load_project_config(config_path)
+
+        # Determine input file
+        if hasattr(args, 'input') and args.input:
+            input_path = Path(args.input)
+        elif project_cfg and project_cfg.entry:
+            input_path = Path(project_cfg.entry)
+            print(f"Using entry from slop.toml: {input_path}")
+        else:
+            print("Error: No input file specified and no [project].entry in slop.toml", file=sys.stderr)
+            return 1
+
+        # Merge config with CLI args (CLI wins)
+        if build_cfg:
+            output = args.output or build_cfg.output or input_path.stem
+            include_paths = (args.include or []) + build_cfg.include
+            debug = args.debug or build_cfg.debug
+            # Map build_type to library flag format
+            if build_cfg.build_type == "static":
+                library_mode = getattr(args, 'library', None) or "static"
+            elif build_cfg.build_type == "shared":
+                library_mode = getattr(args, 'library', None) or "shared"
+            else:
+                library_mode = getattr(args, 'library', None)
+            link_libraries = build_cfg.libraries
+            link_paths = build_cfg.library_paths
+        else:
+            output = args.output or input_path.stem
+            include_paths = args.include or []
+            debug = args.debug
+            library_mode = getattr(args, 'library', None)
+            link_libraries = []
+            link_paths = []
 
         print(f"Building {input_path} -> {output}")
 
+        # Create output directory if needed
+        output_dir = Path(output).parent
+        if output_dir and str(output_dir) != '.':
+            output_dir.mkdir(parents=True, exist_ok=True)
+
         # Parse
         print("  Parsing...")
-        ast = parse_file(args.input)
+        ast = parse_file(str(input_path))
 
         # Check if this is a multi-module build
-        search_paths = [Path(p) for p in (args.include or [])]
+        search_paths = [Path(p) for p in include_paths]
         is_multi_module = _has_imports(ast)
 
         if is_multi_module:
@@ -1095,7 +1149,6 @@ def cmd_build(args):
 
             # Write to temp directory and compile
             runtime_path = _get_runtime_path()
-            library_mode = getattr(args, 'library', None)
 
             with tempfile.TemporaryDirectory() as tmpdir:
                 c_files = []
@@ -1110,13 +1163,20 @@ def cmd_build(args):
 
                 print("  Compiling...")
 
+                # Build link flags from config
+                link_flags = []
+                for lpath in link_paths:
+                    link_flags.extend(["-L", lpath])
+                for lib in link_libraries:
+                    link_flags.extend(["-l", lib])
+
                 if library_mode == 'static':
                     # Compile to object files, then create static library
                     obj_files = []
                     for c_file in c_files:
                         obj_file = c_file.replace('.c', '.o')
                         compile_cmd = ["cc", "-c", "-O2", "-I", str(runtime_path), "-I", tmpdir, "-o", obj_file, c_file]
-                        if args.debug:
+                        if debug:
                             compile_cmd.insert(1, "-g")
                             compile_cmd.insert(2, "-DSLOP_DEBUG")
                         result = subprocess.run(compile_cmd, capture_output=True, text=True)
@@ -1137,8 +1197,8 @@ def cmd_build(args):
                     ext = ".dylib" if sys.platform == "darwin" else ".so"
                     lib_file = f"{output}{ext}"
                     compile_cmd = ["cc", "-shared", "-fPIC", "-O2", "-I", str(runtime_path), "-I", tmpdir,
-                                  "-o", lib_file] + c_files
-                    if args.debug:
+                                  "-o", lib_file] + c_files + link_flags
+                    if debug:
                         compile_cmd.insert(1, "-g")
                         compile_cmd.insert(2, "-DSLOP_DEBUG")
                     result = subprocess.run(compile_cmd, capture_output=True, text=True)
@@ -1149,8 +1209,8 @@ def cmd_build(args):
 
                 else:
                     # Default: build executable
-                    compile_cmd = ["cc", "-O2", "-I", str(runtime_path), "-I", tmpdir, "-o", output] + c_files
-                    if args.debug:
+                    compile_cmd = ["cc", "-O2", "-I", str(runtime_path), "-I", tmpdir, "-o", output] + c_files + link_flags
+                    if debug:
                         compile_cmd.insert(1, "-g")
                         compile_cmd.insert(2, "-DSLOP_DEBUG")
                     result = subprocess.run(compile_cmd, capture_output=True, text=True)
@@ -1170,7 +1230,7 @@ def cmd_build(args):
 
             # Type check
             print("  Type checking...")
-            diagnostics = check_file(args.input)
+            diagnostics = check_file(str(input_path))
             type_errors = [d for d in diagnostics if d.severity == 'error']
             type_warnings = [d for d in diagnostics if d.severity == 'warning']
 
@@ -1190,7 +1250,7 @@ def cmd_build(args):
 
             # Transpile
             print("  Transpiling to C...")
-            with open(args.input) as f:
+            with open(input_path) as f:
                 source = f.read()
             c_code = transpile(source)
 
@@ -1204,7 +1264,12 @@ def cmd_build(args):
 
         runtime_path = _get_runtime_path()
 
-        library_mode = getattr(args, 'library', None)
+        # Build link flags from config
+        link_flags = []
+        for lpath in link_paths:
+            link_flags.extend(["-L", lpath])
+        for lib in link_libraries:
+            link_flags.extend(["-l", lib])
 
         if library_mode == 'static':
             # Compile to object file, then create static library
@@ -1212,7 +1277,7 @@ def cmd_build(args):
             lib_file = f"{output}.a"
 
             compile_cmd = ["cc", "-c", "-O2", "-I", str(runtime_path), "-o", obj_file, c_file]
-            if args.debug:
+            if debug:
                 compile_cmd.insert(1, "-g")
                 compile_cmd.insert(2, "-DSLOP_DEBUG")
 
@@ -1237,8 +1302,8 @@ def cmd_build(args):
             lib_file = f"{output}{ext}"
 
             compile_cmd = ["cc", "-shared", "-fPIC", "-O2", "-I", str(runtime_path),
-                          "-o", lib_file, c_file]
-            if args.debug:
+                          "-o", lib_file, c_file] + link_flags
+            if debug:
                 compile_cmd.insert(1, "-g")
                 compile_cmd.insert(2, "-DSLOP_DEBUG")
 
@@ -1257,9 +1322,9 @@ def cmd_build(args):
                 "-I", str(runtime_path),
                 "-o", output,
                 c_file,
-            ]
+            ] + link_flags
 
-            if args.debug:
+            if debug:
                 compile_cmd.insert(1, "-g")
                 compile_cmd.insert(2, "-DSLOP_DEBUG")
 
@@ -1409,7 +1474,8 @@ def main():
 
     # fill
     p = subparsers.add_parser('fill', help='Fill holes with LLM')
-    p.add_argument('input')
+    p.add_argument('input', nargs='?', default=None,
+                   help='Input file (optional if slop.toml has [project].entry)')
     p.add_argument('-o', '--output')
     p.add_argument('-i', '--inplace', action='store_true',
         help='Modify input file in place')
@@ -1431,7 +1497,8 @@ def main():
 
     # build
     p = subparsers.add_parser('build', help='Full pipeline')
-    p.add_argument('input')
+    p.add_argument('input', nargs='?', default=None,
+                   help='Input file (optional if slop.toml has [project].entry)')
     p.add_argument('-o', '--output')
     p.add_argument('-c', '--config', help='Path to TOML config file')
     p.add_argument('-I', '--include', action='append',

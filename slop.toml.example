@@ -2,6 +2,31 @@
 # Copy to slop.toml and customize for your setup
 
 # ============================================================================
+# PROJECT
+# Basic project metadata and entry point
+# ============================================================================
+
+[project]
+name = "my-slop-project"
+version = "0.1.0"
+entry = "src/main.slop"        # Main module (used by `slop build` with no args)
+
+# ============================================================================
+# BUILD
+# Build settings for `slop build` command
+# ============================================================================
+
+[build]
+output = "build/myapp"         # Output path (binary, .a, or .so/.dylib)
+include = ["src", "lib"]       # Search paths for module imports (-I)
+type = "executable"            # "executable" (default), "static", or "shared"
+debug = false                  # Include debug symbols and SLOP_DEBUG
+
+[build.link]
+libraries = []                 # Libraries to link (-l flags)
+library_paths = []             # Library search paths (-L flags)
+
+# ============================================================================
 # PROVIDERS
 # Define LLM providers. Each provider can be referenced by tiers below.
 # ============================================================================
