@@ -252,6 +252,78 @@ def load_config(path: str) -> dict:
     return expand_env_vars_recursive(config)
 
 
+@dataclass
+class ProjectConfig:
+    """Project configuration from slop.toml"""
+    name: str = ""
+    version: str = "0.1.0"
+    entry: str = ""
+
+
+@dataclass
+class BuildConfig:
+    """Build configuration from slop.toml"""
+    output: str = ""
+    include: list = None
+    build_type: str = "executable"  # "executable", "static", "shared"
+    debug: bool = False
+    libraries: list = None
+    library_paths: list = None
+
+    def __post_init__(self):
+        if self.include is None:
+            self.include = []
+        if self.libraries is None:
+            self.libraries = []
+        if self.library_paths is None:
+            self.library_paths = []
+
+
+def load_project_config(path: str = None) -> tuple[Optional[ProjectConfig], Optional[BuildConfig]]:
+    """Load project and build configuration from slop.toml.
+
+    Args:
+        path: Path to config file. If None, looks for slop.toml in current dir.
+
+    Returns:
+        (ProjectConfig, BuildConfig) tuple. Either may be None if not present.
+    """
+    from pathlib import Path
+
+    if path is None:
+        config_path = Path("slop.toml")
+        if not config_path.exists():
+            return None, None
+    else:
+        config_path = Path(path)
+        if not config_path.exists():
+            raise FileNotFoundError(f"Config file not found: {path}")
+
+    config = load_config(str(config_path))
+
+    # Extract project config
+    project_data = config.get('project', {})
+    project = ProjectConfig(
+        name=project_data.get('name', ''),
+        version=project_data.get('version', '0.1.0'),
+        entry=project_data.get('entry', ''),
+    ) if project_data else None
+
+    # Extract build config
+    build_data = config.get('build', {})
+    link_data = build_data.get('link', {})
+    build = BuildConfig(
+        output=build_data.get('output', ''),
+        include=build_data.get('include', []),
+        build_type=build_data.get('type', 'executable'),
+        debug=build_data.get('debug', False),
+        libraries=link_data.get('libraries', []),
+        library_paths=link_data.get('library_paths', []),
+    ) if build_data else None
+
+    return project, build
+
+
 def create_provider(provider_config: dict) -> Provider:
     """Create a provider instance from config"""
     provider_type = provider_config.get('type', '')

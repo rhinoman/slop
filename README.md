@@ -273,7 +273,7 @@ Arena allocation handles 90% of cases:
 - ✓ Hole filler with quality scoring and pattern library
 - ✓ CLI tooling (`slop` command)
 - ✓ Runtime header with arena allocation
-- ✓ Test suite (74 tests)
+- ✓ Test suite
 
 **Not Yet Implemented:**
 - Contract verification (SMT solver integration)
