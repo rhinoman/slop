@@ -56,8 +56,6 @@ literal     = number | string | 'true | 'false | 'nil
 (type name type-expr)
 (const name Type const-expr)
 (fn name params body)
-(structure form*)
-(logic form*)
 ```
 
 ### 3.2 Constants
