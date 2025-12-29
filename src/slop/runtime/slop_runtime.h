@@ -411,8 +411,8 @@ static inline bool slop_map_has(slop_map* map, slop_string key) {
 /* ============================================================
  * Generic Map Operations (for transpiled SLOP code)
  *
- * These are stub implementations that allow generated code to compile.
- * For production use, you should provide proper typed implementations.
+ * Integer-keyed map with fixed-size value storage (up to 256 bytes).
+ * Used for SLOP Map types with integer keys (e.g., Map PetId Pet).
  * ============================================================ */
 
 /* Generic map entry with fixed-size value storage */
@@ -523,13 +523,25 @@ static inline slop_gmap_option_raw _slop_map_get_raw(void* gmap_ptr, int64_t gma
  */
 typedef struct { uint8_t* data; size_t len; size_t cap; } slop_gmap_list;
 
-static inline slop_gmap_list _slop_map_values_raw(void* gmap_ptr) {
+static inline slop_gmap_list _slop_map_values_raw(void* gmap_ptr, size_t value_size) {
     slop_gmap_t* m = (slop_gmap_t*)gmap_ptr;
     size_t count = 0;
     for (size_t idx = 0; idx < m->gmap_len; idx++) {
         if (m->gmap_entries[idx].gmap_occupied) count++;
     }
-    return (slop_gmap_list){NULL, count, count};
+    if (count == 0) {
+        return (slop_gmap_list){NULL, 0, 0};
+    }
+    uint8_t* data = (uint8_t*)malloc(count * value_size);
+    size_t write_idx = 0;
+    for (size_t idx = 0; idx < m->gmap_len; idx++) {
+        if (m->gmap_entries[idx].gmap_occupied) {
+            memcpy(data + (write_idx * value_size),
+                   m->gmap_entries[idx].gmap_value, value_size);
+            write_idx++;
+        }
+    }
+    return (slop_gmap_list){data, count, count};
 }
 
 /* Take first n elements from list - modifies in place and returns */
@@ -551,7 +563,7 @@ static inline slop_gmap_list _slop_take_raw(slop_gmap_list lst, int64_t n) {
         return result; \
     } \
     static inline ListName map_values_##V(void* m) { \
-        slop_gmap_list raw = _slop_map_values_raw(m); \
+        slop_gmap_list raw = _slop_map_values_raw(m, sizeof(V)); \
         return (ListName){(V*)raw.data, raw.len, raw.cap}; \
     } \
     static inline ListName take_##V(int64_t n, ListName lst) { \
@@ -576,7 +588,7 @@ static inline slop_gmap_list _slop_take_raw(slop_gmap_list lst, int64_t n) {
 
 #define SLOP_MAP_VALUES_DEFINE(V, ListType) \
     static inline ListType map_values_##V(void* m) { \
-        slop_gmap_list raw = _slop_map_values_raw(m); \
+        slop_gmap_list raw = _slop_map_values_raw(m, sizeof(V)); \
         return (ListType){(V*)raw.data, raw.len, raw.cap}; \
     }
 
