@@ -18,7 +18,7 @@ from slop.types import BUILTIN_FUNCTIONS
 logger = logging.getLogger(__name__)
 
 
-# Cache for SKILL.md + builtins.md content
+# Cache for spec/LANGUAGE.md + spec/REFERENCE.md content
 _SKILL_SPEC: Optional[str] = None
 
 # Valid built-in expression forms from SLOP spec
@@ -259,32 +259,27 @@ def _extract_function_calls(expr: SExpr) -> set:
 
 
 def load_skill_spec() -> str:
-    """Load and cache the SLOP language spec from LANGUAGE.md, builtins.md, and patterns.md"""
+    """Load and cache the SLOP language spec from spec/LANGUAGE.md and spec/REFERENCE.md"""
     global _SKILL_SPEC
     if _SKILL_SPEC is not None:
         return _SKILL_SPEC
 
     # Find spec files relative to this file's location
-    # hole_filler.py is in src/slop/, spec/ and skill/ are at project root
+    # hole_filler.py is in src/slop/, spec/ is at project root
     pkg_root = Path(__file__).parent.parent.parent
 
     content = ""
 
-    # Load spec/LANGUAGE.md - complete language specification with grammar
-    # This includes the crucial 'symbol syntax showing quoted enum variants
+    # Load spec/LANGUAGE.md - complete language specification
     lang_path = pkg_root / "spec" / "LANGUAGE.md"
     if lang_path.exists():
         content = lang_path.read_text()
 
-    # Load builtins.md - concise function reference with common mistakes
-    builtins_path = pkg_root / "skill" / "references" / "builtins.md"
-    if builtins_path.exists():
-        content += "\n\n" + builtins_path.read_text()
-
-    # Load full patterns.md - includes Error Handling section with (error 'variant) syntax
-    patterns_path = pkg_root / "skill" / "references" / "patterns.md"
-    if patterns_path.exists():
-        content += "\n\n" + patterns_path.read_text()
+    # Load spec/REFERENCE.md - quick reference for LLM code generation
+    # Contains common mistakes, loop patterns, and idioms
+    ref_path = pkg_root / "spec" / "REFERENCE.md"
+    if ref_path.exists():
+        content += "\n\n" + ref_path.read_text()
 
     _SKILL_SPEC = content.strip()
     return _SKILL_SPEC
