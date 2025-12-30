@@ -104,7 +104,8 @@ AcquireResult acquire(Limiter* limiter) {
 slop/
 ├── spec/                    Language specifications
 │   ├── LANGUAGE.md          Grammar, types, semantics
-│   └── HYBRID_PIPELINE.md   Generation architecture
+│   ├── HYBRID_PIPELINE.md   Generation architecture
+│   └── REFERENCE.md         Quick reference
 ├── src/slop/
 │   ├── runtime/
 │   │   └── slop_runtime.h   Minimal C runtime (~400 lines)
@@ -118,8 +119,6 @@ slop/
 ├── examples/
 │   ├── rate-limiter.slop    Complete example
 │   └── hello.slop           Minimal example
-├── skill/                   Claude skill for SLOP generation
-│   └── references/          Built-ins, patterns, types docs
 └── tests/                   Test suite
 ```
 
