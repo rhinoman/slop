@@ -1,0 +1,121 @@
+;; ============================================================
+;; Environment Variables Test Module
+;;
+;; Tests for the env.slop standard library functions.
+;;
+;; Run via: pytest lib/std/os/tests/test_env.py
+;; Returns 0 on success, non-zero = number of failed tests.
+;; ============================================================
+
+(module env-test
+  (export main)
+
+  (import env (EnvError get-env set-env unset-env))
+
+  ;; ============================================================
+  ;; Test Constants
+  ;; ============================================================
+
+  (const TEST_VAR String "SLOP_TEST_VAR_12345")
+  (const TEST_VALUE String "test_value")
+
+  ;; ============================================================
+  ;; Test: get-env
+  ;; ============================================================
+
+  (fn test-get-env-existing ()
+    (@intent "Test that get-env returns value for existing variable")
+    (@spec (() -> Bool))
+
+    ;; PATH should always exist on Unix systems
+    (match (get-env "PATH")
+      ((some _) true)
+      (none false)))
+
+  (fn test-get-env-nonexistent ()
+    (@intent "Test that get-env returns none for nonexistent variable")
+    (@spec (() -> Bool))
+
+    (match (get-env "SLOP_DEFINITELY_NOT_SET_XYZ123")
+      ((some _) false)
+      (none true)))
+
+  ;; ============================================================
+  ;; Test: set-env
+  ;; ============================================================
+
+  (fn test-set-env ()
+    (@intent "Test setting an environment variable")
+    (@spec (() -> Bool))
+
+    (match (set-env TEST_VAR TEST_VALUE)
+      ((ok _)
+        ;; Verify it was set
+        (match (get-env TEST_VAR)
+          ((some val) (string-eq val TEST_VALUE))
+          (none false)))
+      ((error _) false)))
+
+  (fn test-set-env-overwrite ()
+    (@intent "Test that set-env overwrites existing value")
+    (@spec (() -> Bool))
+
+    (let ((new-value "new_value"))
+      (match (set-env TEST_VAR "initial")
+        ((ok _)
+          (match (set-env TEST_VAR new-value)
+            ((ok _)
+              (match (get-env TEST_VAR)
+                ((some val) (string-eq val new-value))
+                (none false)))
+            ((error _) false)))
+        ((error _) false))))
+
+  ;; ============================================================
+  ;; Test: unset-env
+  ;; ============================================================
+
+  (fn test-unset-env ()
+    (@intent "Test removing an environment variable")
+    (@spec (() -> Bool))
+
+    ;; First set it
+    (match (set-env TEST_VAR TEST_VALUE)
+      ((ok _)
+        ;; Then unset it
+        (match (unset-env TEST_VAR)
+          ((ok _)
+            ;; Verify it's gone
+            (match (get-env TEST_VAR)
+              ((some _) false)
+              (none true)))
+          ((error _) false)))
+      ((error _) false)))
+
+  (fn test-unset-nonexistent ()
+    (@intent "Test that unset-env succeeds for nonexistent variable")
+    (@spec (() -> Bool))
+
+    ;; unsetenv succeeds even if var doesn't exist
+    (match (unset-env "SLOP_DEFINITELY_NOT_SET_ABC789")
+      ((ok _) true)
+      ((error _) false)))
+
+  ;; ============================================================
+  ;; Main Entry Point
+  ;; ============================================================
+
+  (fn main ()
+    (@intent "Run all environment variable tests and return failure count")
+    (@spec (() -> Int))
+
+    (let ((failures (cast Int 0)))
+      (do
+        (if (not (test-get-env-existing)) (set! failures (+ failures 1)) ())
+        (if (not (test-get-env-nonexistent)) (set! failures (+ failures 1)) ())
+        (if (not (test-set-env)) (set! failures (+ failures 1)) ())
+        (if (not (test-set-env-overwrite)) (set! failures (+ failures 1)) ())
+        (if (not (test-unset-env)) (set! failures (+ failures 1)) ())
+        (if (not (test-unset-nonexistent)) (set! failures (+ failures 1)) ())
+        failures)))
+)

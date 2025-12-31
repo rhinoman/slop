@@ -639,6 +639,9 @@ class TypeChecker:
             return PtrType(self.fresh_type_var(), nullable=True)
         if name in ('true', 'false'):
             return PrimitiveType('Bool')
+        if name == 'none':
+            # Bare 'none' is Option type with unknown inner type
+            return OptionType(self.fresh_type_var('T'))
         if name.startswith("'"):
             # Quoted symbol - enum variant, look up which enum it belongs to
             variant_name = name[1:]  # Strip the quote
