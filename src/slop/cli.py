@@ -1585,6 +1585,86 @@ def cmd_format(args):
     return exit_code
 
 
+def cmd_verify(args):
+    """Verify contracts and range safety with Z3"""
+    try:
+        from slop.verifier import verify_file, Z3_AVAILABLE
+    except ImportError:
+        print("Error: verifier module not found", file=sys.stderr)
+        return 1
+
+    if not Z3_AVAILABLE:
+        print("Error: Z3 solver not available. Install with: pip install z3-solver",
+              file=sys.stderr)
+        return 1
+
+    # Determine failure mode
+    mode = args.mode if args.mode else "error"
+
+    # Run verification
+    results = verify_file(args.input, mode=mode, timeout_ms=args.timeout)
+
+    # Categorize results
+    verified = [r for r in results if r.status == 'verified']
+    failed = [r for r in results if r.status == 'failed']
+    unknown = [r for r in results if r.status == 'unknown']
+    warnings = [r for r in results if r.status == 'warning']
+    errors = [r for r in results if r.status == 'error']
+    skipped = [r for r in results if r.status == 'skipped']
+
+    # Print results
+    for r in verified:
+        print(f"  verified: {r.name}")
+
+    for r in skipped:
+        if args.verbose:
+            print(f"  skipped: {r.name} - {r.message}")
+
+    for r in warnings:
+        print(f"  warning: {r.name} - {r.message}")
+
+    for r in unknown:
+        print(f"  unknown: {r.name} - {r.message}")
+
+    for r in failed:
+        print(f"  failed: {r.name} - {r.message}")
+        if args.verbose and r.counterexample:
+            ce_str = ", ".join(f"{k}={v}" for k, v in r.counterexample.items())
+            print(f"    counterexample: {ce_str}")
+
+    for r in errors:
+        print(f"  error: {r.name} - {r.message}")
+
+    # Summary
+    total = len(verified) + len(failed) + len(unknown) + len(warnings)
+    if total == 0:
+        print("No contracts to verify")
+        return 0
+
+    if failed or errors:
+        summary = f"\n{len(verified)} verified, {len(failed)} failed"
+        if warnings:
+            summary += f", {len(warnings)} warning(s)"
+        if unknown:
+            summary += f", {len(unknown)} unknown"
+        print(summary)
+        if mode == "error":
+            return 1
+        return 0
+
+    if unknown or warnings:
+        summary = f"\n{len(verified)} verified"
+        if warnings:
+            summary += f", {len(warnings)} warning(s)"
+        if unknown:
+            summary += f", {len(unknown)} unknown (timeout)"
+        print(summary)
+        return 0
+
+    print(f"\nAll {len(verified)} contract(s) verified")
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='SLOP - Symbolic LLM-Optimized Programming',
@@ -1676,6 +1756,16 @@ def main():
     p.add_argument('--check', action='store_true',
         help='Check if files are formatted (exit 1 if not)')
 
+    # verify
+    p = subparsers.add_parser('verify', help='Verify contracts with Z3')
+    p.add_argument('input', help='Input SLOP file')
+    p.add_argument('--mode', choices=['error', 'warn'],
+        help='Failure mode: error (block, default) or warn')
+    p.add_argument('--timeout', type=int, default=5000,
+        help='Z3 solver timeout in milliseconds (default: 5000)')
+    p.add_argument('-v', '--verbose', action='store_true',
+        help='Show counterexamples and skipped contracts')
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1691,6 +1781,7 @@ def main():
         'build': cmd_build,
         'derive': cmd_derive,
         'format': cmd_format,
+        'verify': cmd_verify,
     }
 
     return commands[args.command](args)

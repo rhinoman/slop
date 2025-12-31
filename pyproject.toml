@@ -32,7 +32,8 @@ slop = "slop.cli:main"
 dev = ["pytest", "black", "mypy"]
 yaml = ["pyyaml>=6.0"]
 openapi = ["pyyaml>=6.0"]
-all = ["pyyaml>=6.0"]
+verify = ["z3-solver>=4.12.0"]
+all = ["pyyaml>=6.0", "z3-solver>=4.12.0"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/slop"]
