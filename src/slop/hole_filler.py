@@ -307,6 +307,15 @@ class FillResult:
     quality_metrics: Optional[Dict[str, float]] = None
 
 
+@dataclass
+class CheckResult:
+    """Result of hole implementation type check."""
+    valid: bool
+    errors: List[str]
+    inferred_type: Optional[str] = None
+    expected_type: Optional[str] = None
+
+
 def extract_hole(hole_expr: SList) -> Hole:
     """Extract hole information from AST"""
     items = hole_expr.items[1:]
@@ -884,6 +893,284 @@ def build_prompt(hole: Hole, context: Dict[str, Any], failed_attempts: List[tupl
     return '\n'.join(sections)
 
 
+def _validate_expr_type(
+    expr: SExpr,
+    expected_type_expr: SExpr,
+    context: dict,
+) -> tuple:
+    """Core type validation logic.
+
+    Args:
+        expr: Parsed expression to validate
+        expected_type_expr: Parsed expected type expression
+        context: Context dictionary with type_defs, fn_specs, params, etc.
+
+    Returns:
+        Tuple of (error_messages: List[str], inferred_type_str: Optional[str], expected_type_str: Optional[str])
+    """
+    import re
+    from slop.type_checker import TypeChecker
+    from slop.types import (
+        Type, PrimitiveType, PtrType, OptionType, ResultType,
+        TypeVar, UNKNOWN, FnType, RecordType, EnumType, UnionType
+    )
+
+    def types_compatible(inferred: Type, expected: Type) -> bool:
+        """Check if inferred type is compatible with expected type."""
+        if inferred == UNKNOWN or expected == UNKNOWN:
+            return True
+        if isinstance(inferred, TypeVar) or isinstance(expected, TypeVar):
+            return True
+        if isinstance(inferred, ResultType) and isinstance(expected, ResultType):
+            if isinstance(inferred.ok_type, TypeVar) or isinstance(inferred.err_type, TypeVar):
+                return True
+            if isinstance(expected.ok_type, RecordType) and expected.ok_type.name == '<anonymous>':
+                return types_compatible(inferred.err_type, expected.err_type)
+        if hasattr(inferred, 'is_subtype_of'):
+            return inferred.is_subtype_of(expected)
+        if hasattr(inferred, 'equals'):
+            return inferred.equals(expected)
+        return str(inferred) == str(expected)
+
+    def is_allowable_unknown(typ: Type) -> bool:
+        """Check if type is an allowable unknown (c-inline, type var)."""
+        if typ == UNKNOWN:
+            return True
+        if isinstance(typ, TypeVar):
+            return True
+        return False
+
+    try:
+        # Create type checker (built-ins registered automatically)
+        checker = TypeChecker()
+
+        # Register imported types FIRST
+        imported_types = context.get('imported_types', [])
+        for type_info in imported_types:
+            try:
+                type_ast = parse(type_info['type_def'])
+                if type_ast and is_form(type_ast[0], 'type') and len(type_ast[0]) > 2:
+                    name = type_info['name']
+                    typ = checker.parse_type_expr(type_ast[0][2])
+                    if isinstance(typ, RecordType) and typ.name == '<anonymous>':
+                        typ = RecordType(name, typ.fields)
+                    elif isinstance(typ, EnumType) and typ.name == '<anonymous>':
+                        typ = EnumType(name, typ.variants)
+                    elif isinstance(typ, UnionType) and typ.name == '<anonymous>':
+                        typ = UnionType(name, typ.variants)
+                    checker.env.register_type(name, typ)
+            except Exception:
+                pass
+
+        # Register local type definitions
+        type_defs = context.get('type_defs', [])
+        for type_def_str in type_defs:
+            try:
+                type_ast = parse(type_def_str)
+                if type_ast and is_form(type_ast[0], 'type') and len(type_ast[0]) > 2:
+                    name = type_ast[0][1].name if isinstance(type_ast[0][1], Symbol) else str(type_ast[0][1])
+                    typ = checker.parse_type_expr(type_ast[0][2])
+                    if isinstance(typ, RecordType) and typ.name == '<anonymous>':
+                        typ = RecordType(name, typ.fields)
+                    elif isinstance(typ, EnumType) and typ.name == '<anonymous>':
+                        typ = EnumType(name, typ.variants)
+                    elif isinstance(typ, UnionType) and typ.name == '<anonymous>':
+                        typ = UnionType(name, typ.variants)
+                    checker.env.register_type(name, typ)
+            except Exception:
+                pass
+
+        # Parse and bind parameters
+        params_str = context.get('params', '')
+        if params_str:
+            try:
+                params_ast = parse(params_str)
+                if params_ast and isinstance(params_ast[0], SList):
+                    for param in params_ast[0].items:
+                        if isinstance(param, SList) and len(param) >= 2:
+                            param_name = param[0].name if isinstance(param[0], Symbol) else str(param[0])
+                            param_type = checker.parse_type_expr(param[1])
+                            checker.env.bind_var(param_name, param_type)
+            except Exception:
+                pass
+
+        # Register functions from fn_specs
+        for spec in context.get('fn_specs', []):
+            try:
+                fn_name = spec.get('name', '')
+                if fn_name and spec.get('return_type'):
+                    ret_ast = parse(spec['return_type'])
+                    if ret_ast:
+                        ret_type = checker.parse_type_expr(ret_ast[0])
+                        param_types = []
+                        params_str = spec.get('params', '')
+                        if params_str:
+                            params_ast = parse(params_str)
+                            if params_ast and isinstance(params_ast[0], SList):
+                                for param in params_ast[0].items:
+                                    if isinstance(param, SList) and len(param) >= 2:
+                                        param_type = checker.parse_type_expr(param[1])
+                                        param_types.append(param_type)
+                        checker.env.register_function(fn_name, FnType(tuple(param_types), ret_type))
+            except Exception:
+                pass
+
+        # Register FFI functions
+        for spec in context.get('ffi_specs', []):
+            try:
+                fn_name = spec.get('name', '')
+                if fn_name and spec.get('return_type'):
+                    ret_ast = parse(spec['return_type'])
+                    if ret_ast:
+                        ret_type = checker.parse_type_expr(ret_ast[0])
+                        param_types = []
+                        params_str = spec.get('params', '')
+                        if params_str:
+                            params_ast = parse(params_str)
+                            if params_ast and isinstance(params_ast[0], SList):
+                                for param in params_ast[0].items:
+                                    if isinstance(param, SList) and len(param) >= 2:
+                                        param_type = checker.parse_type_expr(param[1])
+                                        param_types.append(param_type)
+                        checker.env.register_function(fn_name, FnType(tuple(param_types), ret_type))
+            except Exception:
+                pass
+
+        # Register imported functions
+        for spec in context.get('imported_specs', []):
+            try:
+                fn_name = spec.get('name', '')
+                if fn_name and spec.get('return_type'):
+                    ret_ast = parse(spec['return_type'])
+                    if ret_ast:
+                        ret_type = checker.parse_type_expr(ret_ast[0])
+                        param_types = []
+                        params_str = spec.get('params', '')
+                        if params_str:
+                            params_ast = parse(params_str)
+                            if params_ast and isinstance(params_ast[0], SList):
+                                for param in params_ast[0].items:
+                                    if isinstance(param, SList) and len(param) >= 2:
+                                        param_type = checker.parse_type_expr(param[1])
+                                        param_types.append(param_type)
+                        checker.env.register_function(fn_name, FnType(tuple(param_types), ret_type))
+            except Exception:
+                pass
+
+        # Register constants
+        for spec in context.get('const_specs', []):
+            try:
+                const_name = spec.get('name', '')
+                type_expr_str = spec.get('type_expr', '')
+                if const_name and type_expr_str:
+                    type_ast = parse(type_expr_str)
+                    if type_ast:
+                        const_type = checker.parse_type_expr(type_ast[0])
+                        checker.env.bind_var(const_name, const_type)
+            except Exception:
+                pass
+
+        # Parse expected type and infer expression type
+        expected = checker.parse_type_expr(expected_type_expr)
+        inferred = checker.infer_expr(expr)
+
+        # Collect type errors with enhancements
+        error_msgs = []
+        errors = [d for d in checker.diagnostics if d.severity == 'error']
+        param_names = _extract_param_names(context.get('params', ''))
+
+        for err in errors:
+            msg = err.message
+            if "Undefined variable:" in msg and param_names:
+                msg += f" -- Available: {', '.join(param_names)}"
+            if re.search(r"expected \(Int \d+ \.\..*\), got Int", msg):
+                msg += " -- Use (cast <range-type> value)"
+            error_msgs.append(msg)
+
+        # Check type compatibility
+        if not error_msgs and not types_compatible(inferred, expected):
+            if not is_allowable_unknown(inferred):
+                error_msgs.append(f"Type mismatch: expected {expected}, got {inferred}")
+
+        return (error_msgs, str(inferred), str(expected))
+
+    except Exception as e:
+        logger.warning(f"Type check exception (allowing): {e}")
+        return ([], None, None)
+
+
+def check_hole_impl(
+    expr_str: str,
+    expected_type: str,
+    context_file: Optional[str] = None,
+    fn_name: Optional[str] = None,
+    params: Optional[str] = None,
+) -> CheckResult:
+    """Type check an expression against an expected type with context.
+
+    Args:
+        expr_str: SLOP expression string to validate
+        expected_type: Expected type as SLOP type expression string
+        context_file: Path to .slop file for context (types, functions, etc.)
+        fn_name: If provided, extract params from this function in context_file
+        params: Parameter string like "((x Int) (y String))" - overrides fn_name extraction
+
+    Returns:
+        CheckResult with valid flag, errors list, and type information
+    """
+    from pathlib import Path
+
+    # Parse the expression
+    try:
+        expr_ast = parse(expr_str)
+        if not expr_ast:
+            return CheckResult(valid=False, errors=["Empty expression"])
+        expr = expr_ast[0]
+    except ParseError as e:
+        return CheckResult(valid=False, errors=[f"Parse error in expression: {e}"])
+
+    # Parse the expected type
+    try:
+        type_ast = parse(expected_type)
+        if not type_ast:
+            return CheckResult(valid=False, errors=["Empty type expression"])
+        expected_type_expr = type_ast[0]
+    except ParseError as e:
+        return CheckResult(valid=False, errors=[f"Parse error in type: {e}"])
+
+    # Build context from file if provided
+    context: Dict[str, Any] = {
+        'type_defs': [],
+        'fn_specs': [],
+        'ffi_specs': [],
+        'const_specs': [],
+        'imported_specs': [],
+        'imported_types': [],
+        'params': params or '',
+    }
+
+    if context_file:
+        try:
+            from slop.cli import extract_file_context
+            file_context = extract_file_context(context_file, fn_name if not params else None)
+            context.update(file_context)
+            # If params provided explicitly, use those instead
+            if params:
+                context['params'] = params
+        except Exception as e:
+            return CheckResult(valid=False, errors=[f"Error reading context file: {e}"])
+
+    # Validate expression type
+    errors, inferred_str, expected_str = _validate_expr_type(expr, expected_type_expr, context)
+
+    return CheckResult(
+        valid=len(errors) == 0,
+        errors=errors,
+        inferred_type=inferred_str,
+        expected_type=expected_str,
+    )
+
+
 class HoleFiller:
     """Fill holes with tiered model routing"""
 
@@ -1215,185 +1502,11 @@ class HoleFiller:
         - ALLOW unknown types (?) from c-inline expressions
         - ALLOW unresolved type variables
         """
-        import re
-        from slop.type_checker import TypeChecker, TypeEnv
-        from slop.types import (
-            Type, PrimitiveType, PtrType, OptionType, ResultType,
-            TypeVar, UNKNOWN, FnType, RecordType, EnumType, UnionType
-        )
-
         if not hole.type_expr:
             return []  # No type constraint to check
 
-        try:
-            # Create type checker (built-ins registered automatically via _register_builtins)
-            checker = TypeChecker()
-
-            # Register imported types FIRST (so local types can reference them)
-            imported_types = context.get('imported_types', [])
-            for type_info in imported_types:
-                try:
-                    type_ast = parse(type_info['type_def'])
-                    if type_ast and is_form(type_ast[0], 'type') and len(type_ast[0]) > 2:
-                        name = type_info['name']
-                        typ = checker.parse_type_expr(type_ast[0][2])
-                        # Fix anonymous names
-                        if isinstance(typ, RecordType) and typ.name == '<anonymous>':
-                            typ = RecordType(name, typ.fields)
-                        elif isinstance(typ, EnumType) and typ.name == '<anonymous>':
-                            typ = EnumType(name, typ.variants)
-                        elif isinstance(typ, UnionType) and typ.name == '<anonymous>':
-                            typ = UnionType(name, typ.variants)
-                        checker.env.register_type(name, typ)
-                except Exception:
-                    pass
-
-            # Parse and register types from type_defs (pretty-printed strings)
-            # These come after imported_types so they can reference imported types
-            type_defs = context.get('type_defs', [])
-            for type_def_str in type_defs:
-                try:
-                    type_ast = parse(type_def_str)
-                    if type_ast and is_form(type_ast[0], 'type') and len(type_ast[0]) > 2:
-                        name = type_ast[0][1].name if isinstance(type_ast[0][1], Symbol) else str(type_ast[0][1])
-                        typ = checker.parse_type_expr(type_ast[0][2])
-                        # Fix anonymous names for record/enum/union types
-                        if isinstance(typ, RecordType) and typ.name == '<anonymous>':
-                            typ = RecordType(name, typ.fields)
-                        elif isinstance(typ, EnumType) and typ.name == '<anonymous>':
-                            typ = EnumType(name, typ.variants)
-                        elif isinstance(typ, UnionType) and typ.name == '<anonymous>':
-                            typ = UnionType(name, typ.variants)
-                        checker.env.register_type(name, typ)
-                except Exception:
-                    pass  # Skip malformed type defs
-
-            # Parse parameters from context['params'] string like "((arena Arena) (buf (Ptr U8)))"
-            params_str = context.get('params', '')
-            if params_str:
-                try:
-                    params_ast = parse(params_str)
-                    if params_ast and isinstance(params_ast[0], SList):
-                        for param in params_ast[0].items:
-                            if isinstance(param, SList) and len(param) >= 2:
-                                param_name = param[0].name if isinstance(param[0], Symbol) else str(param[0])
-                                param_type = checker.parse_type_expr(param[1])
-                                checker.env.bind_var(param_name, param_type)
-                except Exception:
-                    pass  # Skip if params can't be parsed
-
-            # Register functions from fn_specs
-            fn_specs = context.get('fn_specs', [])
-            for spec in fn_specs:
-                try:
-                    fn_name = spec.get('name', '')
-                    if fn_name and spec.get('return_type'):
-                        ret_ast = parse(spec['return_type'])
-                        if ret_ast:
-                            ret_type = checker.parse_type_expr(ret_ast[0])
-                            param_types = []
-                            params_str = spec.get('params', '')
-                            if params_str:
-                                params_ast = parse(params_str)
-                                if params_ast and isinstance(params_ast[0], SList):
-                                    for param in params_ast[0].items:
-                                        if isinstance(param, SList) and len(param) >= 2:
-                                            param_type = checker.parse_type_expr(param[1])
-                                            param_types.append(param_type)
-                            checker.env.register_function(fn_name, FnType(tuple(param_types), ret_type))
-                except Exception:
-                    pass
-
-            # Register FFI functions from ffi_specs
-            ffi_specs = context.get('ffi_specs', [])
-            for spec in ffi_specs:
-                try:
-                    fn_name = spec.get('name', '')
-                    if fn_name and spec.get('return_type'):
-                        ret_ast = parse(spec['return_type'])
-                        if ret_ast:
-                            ret_type = checker.parse_type_expr(ret_ast[0])
-                            param_types = []
-                            params_str = spec.get('params', '')
-                            if params_str:
-                                params_ast = parse(params_str)
-                                if params_ast and isinstance(params_ast[0], SList):
-                                    for param in params_ast[0].items:
-                                        if isinstance(param, SList) and len(param) >= 2:
-                                            param_type = checker.parse_type_expr(param[1])
-                                            param_types.append(param_type)
-                            checker.env.register_function(fn_name, FnType(tuple(param_types), ret_type))
-                except Exception:
-                    pass
-
-            # Register imported functions from imported_specs
-            imported_specs = context.get('imported_specs', [])
-            for spec in imported_specs:
-                try:
-                    fn_name = spec.get('name', '')
-                    if fn_name and spec.get('return_type'):
-                        ret_ast = parse(spec['return_type'])
-                        if ret_ast:
-                            ret_type = checker.parse_type_expr(ret_ast[0])
-                            param_types = []
-                            params_str = spec.get('params', '')
-                            if params_str:
-                                params_ast = parse(params_str)
-                                if params_ast and isinstance(params_ast[0], SList):
-                                    for param in params_ast[0].items:
-                                        if isinstance(param, SList) and len(param) >= 2:
-                                            param_type = checker.parse_type_expr(param[1])
-                                            param_types.append(param_type)
-                            checker.env.register_function(fn_name, FnType(tuple(param_types), ret_type))
-                except Exception:
-                    pass
-
-            # Register constants from const_specs as variables
-            const_specs = context.get('const_specs', [])
-            for spec in const_specs:
-                try:
-                    const_name = spec.get('name', '')
-                    type_expr_str = spec.get('type_expr', '')
-                    if const_name and type_expr_str:
-                        type_ast = parse(type_expr_str)
-                        if type_ast:
-                            const_type = checker.parse_type_expr(type_ast[0])
-                            checker.env.bind_var(const_name, const_type)
-                except Exception:
-                    pass
-
-            # Parse expected type
-            expected = checker.parse_type_expr(hole.type_expr)
-
-            # Infer actual type of expression
-            inferred = checker.infer_expr(expr)
-
-            # Collect ALL type errors with enhancements
-            error_msgs = []
-            errors = [d for d in checker.diagnostics if d.severity == 'error']
-            param_names = _extract_param_names(context.get('params', ''))
-
-            for err in errors:
-                msg = err.message
-                # Enhance undefined variable errors with available variables
-                if "Undefined variable:" in msg and param_names:
-                    msg += f" -- Available: {', '.join(param_names)}"
-                # Enhance range type errors with cast hint
-                if re.search(r"expected \(Int \d+ \.\..*\), got Int", msg):
-                    msg += " -- Use (cast <range-type> value)"
-                error_msgs.append(msg)
-
-            # Check type compatibility (only if no other errors)
-            if not error_msgs and not self._types_compatible(inferred, expected):
-                if not self._is_allowable_unknown(inferred):
-                    error_msgs.append(f"Type mismatch: expected {expected}, got {inferred}")
-
-            return error_msgs
-
-        except Exception as e:
-            # Type checking failed - log but don't fail validation
-            logger.warning(f"Type check exception (allowing): {e}")
-            return []
+        errors, _, _ = _validate_expr_type(expr, hole.type_expr, context)
+        return errors
 
     def _types_compatible(self, inferred: 'Type', expected: 'Type') -> bool:
         """Check if inferred type is compatible with expected type.

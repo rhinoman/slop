@@ -1,0 +1,253 @@
+;; ============================================================
+;; File I/O Test Module
+;;
+;; Tests for the file.slop standard library functions.
+;; Uses a temporary test file for read/write operations.
+;;
+;; Run via: pytest lib/std/io/tests/test_file_io.py
+;; Returns 0 on success, non-zero = number of failed tests.
+;; ============================================================
+
+(module file-test
+  (export main)
+
+  (import file (FileMode FileError File
+                file-open file-close
+                file-read file-read-line file-read-all
+                file-write file-write-line
+                file-flush file-seek file-tell
+                file-exists file-size))
+
+  ;; ============================================================
+  ;; Test Constants
+  ;; ============================================================
+
+  (const TEST_FILE String "/tmp/slop_file_test.txt")
+  (const NONEXISTENT_FILE String "/tmp/slop_nonexistent_12345.txt")
+
+  ;; ============================================================
+  ;; Test: file-exists
+  ;; ============================================================
+
+  (fn test-file-exists ()
+    (@intent "Test that file-exists correctly detects file presence")
+    (@spec (() -> Bool))
+
+    ;; Check nonexistent returns false, then create file and check it exists
+    (if (file-exists NONEXISTENT_FILE)
+      false
+      (match (file-open TEST_FILE 'write)
+        ((ok f)
+          (let ((_ (file-close (addr f))))
+            (file-exists TEST_FILE)))
+        ((error _) false))))
+
+  ;; ============================================================
+  ;; Test: file-open and file-close
+  ;; ============================================================
+
+  (fn test-open-close ()
+    (@intent "Test opening and closing files with different modes")
+    (@spec (() -> Bool))
+
+    (match (file-open TEST_FILE 'write)
+      ((ok f)
+        (match (file-close (addr f))
+          ((ok _) true)
+          ((error _) false)))
+      ((error _) false)))
+
+  (fn test-open-nonexistent ()
+    (@intent "Test that opening non-existent file for read returns error")
+    (@spec (() -> Bool))
+
+    (match (file-open NONEXISTENT_FILE 'read)
+      ((ok _) false)
+      ((error _) true)))
+
+  ;; ============================================================
+  ;; Test: file-write and file-read
+  ;; ============================================================
+
+  (fn test-write-read-roundtrip ()
+    (@intent "Test writing and reading data back")
+    (@spec (() -> Bool))
+
+    (with-arena 1024
+      (let ((test-data (Bytes (cast (Ptr U8) "hello") 5 5)))
+        (match (file-open TEST_FILE 'write)
+          ((ok wf)
+            (match (file-write (addr wf) test-data)
+              ((ok _)
+                (let ((_ (file-close (addr wf))))
+                  (match (file-open TEST_FILE 'read)
+                    ((ok rf)
+                      (match (file-read arena (addr rf) 5)
+                        ((ok read-bytes)
+                          (let ((_ (file-close (addr rf))))
+                            (== (. read-bytes len) 5)))
+                        ((error _)
+                          (let ((_ (file-close (addr rf)))) false))))
+                    ((error _) false))))
+              ((error _)
+                (let ((_ (file-close (addr wf)))) false))))
+          ((error _) false)))))
+
+  (fn test-write-line ()
+    (@intent "Test writing lines with automatic newline")
+    (@spec (() -> Bool))
+
+    (with-arena 1024
+      (match (file-open TEST_FILE 'write)
+        ((ok wf)
+          (match (file-write-line (addr wf) "test")
+            ((ok bytes-written)
+              (let ((_ (file-close (addr wf))))
+                ;; "test" + newline = 5 bytes
+                (== bytes-written 5)))
+            ((error _)
+              (let ((_ (file-close (addr wf)))) false))))
+        ((error _) false))))
+
+  ;; ============================================================
+  ;; Test: file-read operations
+  ;; ============================================================
+
+  (fn test-read-line ()
+    (@intent "Test reading single line from file")
+    (@spec (() -> Bool))
+
+    (with-arena 1024
+      ;; First write multi-line content
+      (match (file-open TEST_FILE 'write)
+        ((ok wf)
+          (let ((content (Bytes (cast (Ptr U8) "line1\nline2\n") 12 12)))
+            (let ((_ (file-write (addr wf) content)))
+              (let ((_ (file-close (addr wf))))
+                ;; Now read first line
+                (match (file-open TEST_FILE 'read)
+                  ((ok rf)
+                    (match (file-read-line arena (addr rf) 256)
+                      ((ok read-line)
+                        (let ((_ (file-close (addr rf))))
+                          ;; line should be "line1\n" (6 chars)
+                          (== (. read-line len) 6)))
+                      ((error _)
+                        (let ((_ (file-close (addr rf)))) false))))
+                  ((error _) false))))))
+        ((error _) false))))
+
+  (fn test-read-all ()
+    (@intent "Test reading entire file contents")
+    (@spec (() -> Bool))
+
+    (with-arena 1024
+      ;; First write known content
+      (match (file-open TEST_FILE 'write)
+        ((ok wf)
+          (let ((content (Bytes (cast (Ptr U8) "hello world") 11 11)))
+            (let ((_ (file-write (addr wf) content)))
+              (let ((_ (file-close (addr wf))))
+                ;; Now read all
+                (match (file-open TEST_FILE 'read)
+                  ((ok rf)
+                    (match (file-read-all arena (addr rf))
+                      ((ok read-str)
+                        (let ((_ (file-close (addr rf))))
+                          (== (. read-str len) 11)))
+                      ((error _)
+                        (let ((_ (file-close (addr rf)))) false))))
+                  ((error _) false))))))
+        ((error _) false))))
+
+  ;; ============================================================
+  ;; Test: file-seek and file-tell
+  ;; ============================================================
+
+  (fn test-seek-tell ()
+    (@intent "Test seeking to positions and reporting current position")
+    (@spec (() -> Bool))
+
+    (with-arena 256
+      ;; Create file with some content first
+      (match (file-open TEST_FILE 'write)
+        ((ok wf)
+          (let ((content (Bytes (cast (Ptr U8) "0123456789") 10 10)))
+            (let ((_ (file-write (addr wf) content)))
+              (let ((_ (file-close (addr wf))))
+                ;; Now open for read and test seek/tell
+                (match (file-open TEST_FILE 'read)
+                  ((ok rf)
+                    (match (file-seek (addr rf) 5 0)
+                      ((ok _)
+                        (match (file-tell (addr rf))
+                          ((ok tell-pos)
+                            (let ((_ (file-close (addr rf))))
+                              (== tell-pos 5)))
+                          ((error _)
+                            (let ((_ (file-close (addr rf)))) false))))
+                      ((error _)
+                        (let ((_ (file-close (addr rf)))) false))))
+                  ((error _) false))))))
+        ((error _) false))))
+
+  ;; ============================================================
+  ;; Test: file-flush
+  ;; ============================================================
+
+  (fn test-flush ()
+    (@intent "Test flushing buffered writes")
+    (@spec (() -> Bool))
+
+    (let ((content (Bytes (cast (Ptr U8) "data") 4 4)))
+      (match (file-open TEST_FILE 'write)
+        ((ok f)
+          (let ((_ (file-write (addr f) content)))
+            (match (file-flush (addr f))
+              ((ok _)
+                (let ((_ (file-close (addr f)))) true))
+              ((error _)
+                (let ((_ (file-close (addr f)))) false)))))
+        ((error _) false))))
+
+  ;; ============================================================
+  ;; Test: file-size
+  ;; ============================================================
+
+  (fn test-file-size ()
+    (@intent "Test getting file size")
+    (@spec (() -> Bool))
+
+    ;; Write 10 bytes, then check size
+    (let ((content (Bytes (cast (Ptr U8) "0123456789") 10 10)))
+      (match (file-open TEST_FILE 'write)
+        ((ok f)
+          (let ((_ (file-write (addr f) content)))
+            (let ((_ (file-close (addr f))))
+              (match (file-size TEST_FILE)
+                ((ok file-sz) (== file-sz 10))
+                ((error _) false)))))
+        ((error _) false))))
+
+  ;; ============================================================
+  ;; Main Entry Point
+  ;; ============================================================
+
+  (fn main ()
+    (@intent "Run all file I/O tests and return failure count (0 = all passed)")
+    (@spec (() -> Int))
+
+    (let ((failures (cast Int 0)))
+      (do
+        (if (not (test-file-exists)) (set! failures (+ failures 1)) ())
+        (if (not (test-open-close)) (set! failures (+ failures 1)) ())
+        (if (not (test-open-nonexistent)) (set! failures (+ failures 1)) ())
+        (if (not (test-write-read-roundtrip)) (set! failures (+ failures 1)) ())
+        (if (not (test-write-line)) (set! failures (+ failures 1)) ())
+        (if (not (test-read-line)) (set! failures (+ failures 1)) ())
+        (if (not (test-read-all)) (set! failures (+ failures 1)) ())
+        (if (not (test-seek-tell)) (set! failures (+ failures 1)) ())
+        (if (not (test-flush)) (set! failures (+ failures 1)) ())
+        (if (not (test-file-size)) (set! failures (+ failures 1)) ())
+        failures)))
+)

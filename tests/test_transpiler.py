@@ -819,7 +819,7 @@ class TestMultiModuleTypes:
         math_info = ModuleInfo(name='math', path=Path('math.slop'), ast=math_ast)
         math_info.exports = {'Score'}
         main_info = ModuleInfo(name='main', path=Path('main.slop'), ast=main_ast)
-        main_info.imports = [ImportSpec(module_name='math', symbols=[('Score', 0)])]
+        main_info.imports = [ImportSpec(module_name='math', symbols=['Score'])]
 
         # Transpile multi-module
         modules = {'math': math_info, 'main': main_info}
@@ -863,3 +863,104 @@ class TestTranspilerValidation:
             transpile(source)
         assert "Field name must be a symbol" in str(exc.value)
         assert "line" in str(exc.value)
+
+
+class TestDerefPointerTracking:
+    """Test that deref and addr operators are correctly tracked for field access."""
+
+    def test_deref_uses_dot_not_arrow(self):
+        """(. (deref ptr) field) should use . not -> since deref yields value"""
+        source = """
+        (type Point (record (x Int) (y Int)))
+        (fn get-x ((p (Ptr Point)))
+          (@spec (((Ptr Point)) -> Int))
+          (. (deref p) x))
+        """
+        c_code = transpile(source)
+        # deref yields value, so should use . not ->
+        # May have extra parens: ((*p)).x or (*p).x
+        assert ".x" in c_code and "*p" in c_code
+        assert "->x" not in c_code
+
+    def test_addr_uses_arrow(self):
+        """Field access on (addr val) should use -> since addr yields pointer"""
+        source = """
+        (type Point (record (x Int) (y Int)))
+        (fn set-x ((p Point))
+          (@spec ((Point) -> Int))
+          (. (addr p) x))
+        """
+        c_code = transpile(source)
+        # addr yields pointer, so should use -> not .
+        # May have extra parens: ((&p))->x or (&p)->x
+        assert "->x" in c_code and "&p" in c_code
+
+
+class TestStringPointerCast:
+    """Test that string literals cast to pointers emit raw C strings."""
+
+    def test_string_literal_cast_to_ptr_void(self):
+        """String literal cast to (Ptr Void) should emit raw C string"""
+        source = """
+        (ffi "stdio.h" (fwrite ((buf (Ptr Void)) (size U64) (count U64) (file (Ptr Void))) U64))
+        (fn write-newline ((f (Ptr Void)))
+          (@spec (((Ptr Void)) -> U64))
+          (fwrite (cast (Ptr Void) "\\n") 1 1 f))
+        """
+        c_code = transpile(source)
+        # Should NOT wrap in SLOP_STR when casting to pointer
+        # Check that raw C string with void* cast is used
+        assert '(void*)"\\n"' in c_code
+        assert 'SLOP_STR' not in c_code
+
+
+class TestFfiStructCName:
+    """Test ffi-struct with :c-name parameter."""
+
+    def test_ffi_struct_c_name_override(self):
+        """ffi-struct with :c-name should use the specified C type name"""
+        source = """
+        (ffi-struct "sys/stat.h" stat_buf :c-name "stat"
+          (st_size I64))
+        (fn get-size ((s (Ptr stat_buf)))
+          (@spec (((Ptr stat_buf)) -> I64))
+          (. s st_size))
+        """
+        c_code = transpile(source)
+        # struct prefix is added automatically for non-_t types
+        assert "struct stat" in c_code
+        assert "struct stat_buf" not in c_code
+
+
+class TestFfiConstants:
+    """Test FFI constant declarations."""
+
+    def test_ffi_const_no_code_emitted(self):
+        """ffi constants should not emit #define or static const"""
+        source = """
+        (ffi "limits.h"
+          (INT_MAX Int))
+        (fn get-max ()
+          (@spec (() -> Int))
+          INT_MAX)
+        """
+        c_code = transpile(source)
+        assert '#include <limits.h>' in c_code
+        assert '#define INT_MAX' not in c_code
+        assert 'static const' not in c_code
+        assert 'INT_MAX' in c_code  # Used in function body
+
+    def test_ffi_mixed_funcs_and_consts(self):
+        """ffi can declare both functions and constants"""
+        source = """
+        (ffi "stdio.h"
+          (EOF Int)
+          (fclose ((file (Ptr Void))) Int))
+        (fn check-eof ((result Int))
+          (@spec ((Int) -> Bool))
+          (== result EOF))
+        """
+        c_code = transpile(source)
+        assert '#include <stdio.h>' in c_code
+        assert '#define EOF' not in c_code
+        assert 'EOF' in c_code  # Used in comparison

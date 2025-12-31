@@ -56,9 +56,22 @@ class TypeEnv:
 
     def _init_builtins(self):
         """Initialize built-in types"""
-        # Primitives
-        for name in ['Int', 'Float', 'Bool', 'String', 'Bytes', 'Unit', 'Void']:
+        # Scalar primitives
+        for name in ['Int', 'Float', 'Bool', 'Unit', 'Void']:
             self.type_registry[name] = PrimitiveType(name)
+
+        # String and Bytes are C structs with fields - register as RecordType
+        # This enables constructor syntax (String data len) and proper field access
+        # Use U64 for len/cap to match C's size_t
+        self.type_registry['String'] = RecordType('String', {
+            'data': PtrType(PrimitiveType('U8')),
+            'len': PrimitiveType('U64'),
+        })
+        self.type_registry['Bytes'] = RecordType('Bytes', {
+            'data': PtrType(PrimitiveType('U8')),
+            'len': PrimitiveType('U64'),
+            'cap': PrimitiveType('U64'),
+        })
 
         # Width-specific integers
         for name in ['I8', 'I16', 'I32', 'I64', 'U8', 'U16', 'U32', 'U64']:
@@ -194,8 +207,8 @@ class TypeChecker:
 
     def _register_builtins(self):
         """Register built-in function signatures."""
-        # Common types
-        STRING = PrimitiveType('String')
+        # Common types - use registered String type for consistency
+        STRING = self.env.lookup_type('String') or PrimitiveType('String')
         INT = PrimitiveType('Int')
         BOOL = PrimitiveType('Bool')
         UNIT = PrimitiveType('Unit')
@@ -574,7 +587,8 @@ class TypeChecker:
             return RangeType('Int', RangeBounds(val, val))
 
         if isinstance(expr, String):
-            return PrimitiveType('String')
+            # Return registered String type (RecordType) for proper field access
+            return self.env.lookup_type('String') or PrimitiveType('String')
 
         if isinstance(expr, Symbol):
             return self._infer_symbol(expr)
@@ -1362,7 +1376,7 @@ class TypeChecker:
 
     def _infer_field_access(self, expr: SList) -> Type:
         """Infer type of field access: (. obj field)"""
-        if len(expr) < 3:
+        if len(expr) != 3:
             self.error(f"Field access requires 2 arguments (obj field), got {len(expr) - 1}", expr)
             return UNKNOWN
 
@@ -1566,6 +1580,22 @@ class TypeChecker:
 
         fn_type = self.env.lookup_function(fn_name)
         if fn_type is None:
+            # Check if this is a type constructor (TypeName arg1 arg2 ...)
+            type_obj = self.env.lookup_type(fn_name)
+            if type_obj is not None:
+                if isinstance(type_obj, RecordType):
+                    # Record constructor - validate arguments match fields
+                    fields = list(type_obj.fields.items())
+                    if len(args) != len(fields):
+                        self.error(f"Record '{fn_name}' has {len(fields)} fields, got {len(args)} arguments", expr)
+                    else:
+                        for i, (arg, (field_name, field_type)) in enumerate(zip(args, fields)):
+                            arg_type = self.infer_expr(arg)
+                            self._check_assignable(arg_type, field_type, f"field '{field_name}' of '{fn_name}'", arg)
+                    return type_obj
+                elif isinstance(type_obj, EnumType):
+                    # Enum used as type - just return the type
+                    return type_obj
             # Unknown function - might be FFI or runtime
             return UNKNOWN
 
@@ -1680,8 +1710,8 @@ class TypeChecker:
 
         # Pointer compatibility
         if isinstance(source, PtrType) and isinstance(target, PtrType):
-            # UNKNOWN pointee matches any type (polymorphic pointers like arena-alloc)
-            if isinstance(source.pointee, UnknownType) or isinstance(target.pointee, UnknownType):
+            # UNKNOWN or TypeVar pointee matches any type (polymorphic pointers like arena-alloc, nil)
+            if isinstance(source.pointee, (UnknownType, TypeVar)) or isinstance(target.pointee, (UnknownType, TypeVar)):
                 return
             pointees_match = source.pointee.equals(target.pointee)
             # Forward reference fallback: compare by name
@@ -1895,33 +1925,44 @@ class TypeChecker:
         self.env.register_function(name, fn_type)
 
     def _register_ffi_funcs(self, form: SList):
-        """Register FFI function signatures.
+        """Register FFI function signatures and constants.
 
-        FFI form: (ffi "header.h" (func-name ((param Type)...) ReturnType) ...)
+        FFI form: (ffi "header.h" (decl...) ...)
+
+        Functions: (func-name ((param Type)...) ReturnType) - item[1] is SList
+        Constants: (const-name Type) - item[1] is Symbol
         """
         if len(form) < 2:
             return
 
-        # Skip header string, process function declarations
+        # Skip header string, process declarations
         for item in form.items[2:]:
-            if isinstance(item, SList) and len(item) >= 3:
-                # (func-name ((param Type)...) ReturnType)
-                fn_name = item[0].name if isinstance(item[0], Symbol) else str(item[0])
-                params_list = item[1] if isinstance(item[1], SList) else SList([])
-                return_type_expr = item[2]
+            if isinstance(item, SList) and len(item) >= 2:
+                name = item[0].name if isinstance(item[0], Symbol) else str(item[0])
+                second = item[1]
 
-                # Parse parameter types
-                param_types: List[Type] = []
-                for param in params_list:
-                    if isinstance(param, SList) and len(param) >= 2:
-                        param_type = self.parse_type_expr(param[1])
-                        param_types.append(param_type)
+                if isinstance(second, SList):
+                    # Function: (func-name ((param Type)...) ReturnType)
+                    if len(item) >= 3:
+                        params_list = second
+                        return_type_expr = item[2]
 
-                # Parse return type
-                return_type = self.parse_type_expr(return_type_expr)
+                        # Parse parameter types
+                        param_types: List[Type] = []
+                        for param in params_list:
+                            if isinstance(param, SList) and len(param) >= 2:
+                                param_type = self.parse_type_expr(param[1])
+                                param_types.append(param_type)
 
-                fn_type = FnType(tuple(param_types), return_type)
-                self.env.register_function(fn_name, fn_type)
+                        # Parse return type
+                        return_type = self.parse_type_expr(return_type_expr)
+
+                        fn_type = FnType(tuple(param_types), return_type)
+                        self.env.register_function(name, fn_type)
+                else:
+                    # Constant: (const-name Type)
+                    const_type = self.parse_type_expr(second)
+                    self.env.bind_var(name, const_type)
 
     def _register_const(self, form: SList):
         """Register a constant as a bound variable.
@@ -1967,6 +2008,20 @@ class TypeChecker:
                     self.env.bind_var(param_name, param_type)
                     # Track parameter mode
                     self._param_modes[param_name] = mode
+
+        # Type check @pre conditions (params are in scope)
+        for item in form.items[3:]:
+            if is_form(item, '@pre') and len(item) > 1:
+                pre_type = self.infer_expr(item[1])
+                self._expect_type(pre_type, PrimitiveType('Bool'), "@pre condition", item[1])
+
+        # Type check @post conditions ($result is in scope)
+        # Bind $result to the function's return type for postcondition checking
+        self.env.bind_var('$result', fn_type.return_type)
+        for item in form.items[3:]:
+            if is_form(item, '@post') and len(item) > 1:
+                post_type = self.infer_expr(item[1])
+                self._expect_type(post_type, PrimitiveType('Bool'), "@post condition", item[1])
 
         # Check body expressions
         body_exprs = [item for item in form.items[3:]
@@ -2037,7 +2092,10 @@ def check_file(path: str) -> List[TypeDiagnostic]:
     if has_imports:
         # Use full module resolution to get imported signatures
         from slop.resolver import ModuleResolver
-        resolver = ModuleResolver()
+        # Add parent directory to search paths to find sibling/parent modules
+        file_path = Path(path).resolve()
+        search_paths = [file_path.parent, file_path.parent.parent]
+        resolver = ModuleResolver(search_paths)
         try:
             graph = resolver.build_dependency_graph(Path(path))
             order = resolver.topological_sort(graph)
@@ -2092,7 +2150,7 @@ def check_modules(modules: dict, order: list) -> Dict[str, List[TypeDiagnostic]]
         for imp in info.imports:
             source_mod = imp.module_name
             if source_mod in exported_sigs:
-                for fn_name, _ in imp.symbols:
+                for fn_name in imp.symbols:
                     if fn_name in exported_sigs[source_mod]:
                         checker.env.register_import(fn_name, exported_sigs[source_mod][fn_name])
 
@@ -2109,7 +2167,7 @@ def check_modules(modules: dict, order: list) -> Dict[str, List[TypeDiagnostic]]
         exported_sigs[mod_name] = {}
         exported_types[mod_name] = {}
 
-        for fn_name, arity in info.exports.items():
+        for fn_name in info.exports:
             if fn_name in checker.env.function_sigs:
                 exported_sigs[mod_name][fn_name] = checker.env.function_sigs[fn_name]
 

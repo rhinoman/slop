@@ -81,7 +81,7 @@
    '((list
       :anchor
       (identifier) @font-lock-operator-face
-      (:match "^\\(\\+\\|-\\|\\*\\|/\\|%\\|&\\||\\|\\^\\|<<\\|>>\\|==\\|!=\\|<\\|<=\\|>\\|>=\\|and\\|or\\|not\\|\\.\\|@\\|put\\|set!\\|deref\\|ok\\|error\\|try\\|\\?\\|is-ok\\|unwrap\\|some\\|none\\|break\\|continue\\|return\\|cast\\|sizeof\\|addr\\|array\\|list\\|map\\|record-new\\|union-new\\|arena-new\\|arena-alloc\\|arena-free\\|with-arena\\|string-new\\|string-len\\|string-concat\\|string-eq\\|string-slice\\|int-to-string\\|list-new\\|list-push\\|list-get\\|list-len\\|map-new\\|map-put\\|map-get\\|map-has\\|now-ms\\|sleep-ms\\|file-read\\|file-write\\|print\\|println\\)$"
+      (:match "^\\(\\+\\|-\\|\\*\\|/\\|%\\|&\\||\\|\\^\\|<<\\|>>\\|==\\|!=\\|<\\|<=\\|>\\|>=\\|and\\|or\\|not\\|\\.\\|@\\|put\\|set!\\|deref\\|ok\\|error\\|try\\|\\?\\|is-ok\\|unwrap\\|some\\|none\\|break\\|continue\\|return\\|cast\\|sizeof\\|addr\\|array\\|list\\|map\\|record-new\\|union-new\\|arena-new\\|arena-alloc\\|arena-free\\|with-arena\\|string-new\\|string-len\\|string-concat\\|string-eq\\|string-slice\\|int-to-string\\|list-new\\|list-push\\|list-get\\|list-len\\|map-new\\|map-put\\|map-get\\|map-has\\|now-ms\\|sleep-ms\\|print\\|println\\)$"
               @font-lock-operator-face))
      (range_dots) @font-lock-operator-face)
 

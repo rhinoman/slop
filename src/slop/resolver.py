@@ -19,7 +19,7 @@ class ModuleInfo:
     name: str
     path: Path
     ast: List[SExpr]
-    exports: Dict[str, int] = field(default_factory=dict)  # name -> arity
+    exports: Set[str] = field(default_factory=set)
     imports: List[ImportSpec] = field(default_factory=list)
     export_types: List[str] = field(default_factory=list)
 
@@ -119,11 +119,10 @@ class ModuleResolver:
                 break
 
         # Extract exports
-        exports = {}
+        exports = set()
         for exp_form in get_exports(module_forms):
             spec = parse_export(exp_form)
-            for name, arity in spec.symbols:
-                exports[name] = arity
+            exports.update(spec.symbols)
 
         # Extract imports
         imports = []
@@ -291,18 +290,11 @@ class ModuleResolver:
                 source = graph.modules[imp.module_name]
 
                 # Check each imported symbol
-                for name, arity in imp.symbols:
+                for name in imp.symbols:
                     if name not in source.exports:
                         errors.append(
                             f"{info.path}:{imp.line}: '{name}' not exported from '{imp.module_name}'"
                         )
-                    else:
-                        export_arity = source.exports[name]
-                        # -1 means "any arity" (bare symbol export/import)
-                        if export_arity != -1 and arity != -1 and export_arity != arity:
-                            errors.append(
-                                f"{info.path}:{imp.line}: '{name}' has arity {export_arity}, not {arity}"
-                            )
 
         return errors
 
