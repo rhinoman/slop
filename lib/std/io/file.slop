@@ -1,0 +1,272 @@
+;; ============================================================
+;; File I/O Standard Library
+;;
+;; Type-safe SLOP wrapper around C stdio file operations.
+;;
+;; Provides:
+;; - File handle type with open modes
+;; - Read/write operations with Result types
+;; - Line-by-line reading
+;; - Arena-based string allocation for reads
+;; ============================================================
+
+(module file
+  (export
+    FileMode FileError File
+    file-open file-close
+    file-read file-read-line file-read-all
+    file-write file-write-line
+    file-flush file-seek file-tell
+    file-exists file-size)
+
+  ;; ============================================================
+  ;; FFI Declarations
+  ;; ============================================================
+
+  (ffi "stdio.h"
+    ;; Constants (no code emitted - defined in header)
+    (SEEK_SET Int)
+    (SEEK_CUR Int)
+    (SEEK_END Int)
+    ;; Functions
+    (fopen ((path (Ptr U8)) (mode (Ptr U8))) (Ptr Void))
+    (fclose ((file (Ptr Void))) Int)
+    (fread ((buf (Ptr Void)) (size U64) (count U64) (file (Ptr Void))) U64)
+    (fwrite ((buf (Ptr Void)) (size U64) (count U64) (file (Ptr Void))) U64)
+    (fgets ((buf (Ptr U8)) (size Int) (file (Ptr Void))) (Ptr U8))
+    (fflush ((file (Ptr Void))) Int)
+    (fseek ((file (Ptr Void)) (offset I64) (whence Int)) Int)
+    (ftell ((file (Ptr Void))) I64)
+    (feof ((file (Ptr Void))) Int)
+    (ferror ((file (Ptr Void))) Int))
+
+  (ffi "sys/stat.h"
+    (stat ((path (Ptr U8)) (buf (Ptr Void))) Int))
+
+  (ffi-struct "sys/stat.h" stat_buf :c-name "stat"
+    (st_dev U64)
+    (st_ino U64)
+    (st_nlink U64)
+    (st_mode U32)
+    (st_uid U32)
+    (st_gid U32)
+    (st_pad0 U32)
+    (st_rdev U64)
+    (st_size I64)
+    (st_blksize I64)
+    (st_blocks I64))
+
+  (ffi "unistd.h"
+    (F_OK Int)  ;; Constant for file existence check
+    (access ((path (Ptr U8)) (mode Int)) Int))
+
+  ;; ============================================================
+  ;; Types
+  ;; ============================================================
+
+  ;; File open modes
+  (type FileMode (enum
+    read           ;; "r"  - read only, file must exist
+    write          ;; "w"  - write only, truncates or creates
+    append         ;; "a"  - append only, creates if missing
+    read-write     ;; "r+" - read/write, file must exist
+    write-read     ;; "w+" - read/write, truncates or creates
+    append-read))  ;; "a+" - read/append, creates if missing
+
+  ;; File operation errors
+  (type FileError (enum
+    not-found      ;; File does not exist
+    permission     ;; Permission denied
+    io-error       ;; General I/O error
+    eof            ;; End of file reached
+    invalid-mode   ;; Invalid file mode
+    closed))       ;; Operation on closed file
+
+  ;; File handle (opaque wrapper around FILE*)
+  (type File (record
+    (handle (Ptr Void))
+    (mode FileMode)
+    (is-open Bool)))
+
+
+  ;; ============================================================
+  ;; Core Operations
+  ;; ============================================================
+
+  (fn file-open ((path String) (mode FileMode))
+    (@intent "Open a file with the specified mode, returning a File handle or error")
+    (@spec ((String FileMode) -> (Result File FileError)))
+    (@pre (> (. path len) 0))
+    (@example ("test.txt" 'read) -> (ok (File _ 'read true)))
+    (@example ("missing.txt" 'read) -> (error 'not-found))
+    (@example ("output.txt" 'write) -> (ok (File _ 'write true)))
+
+    (let ((mode-str (match mode
+      ('read "r")
+      ('write "w")
+      ('append "a")
+      ('read-write "r+")
+      ('write-read "w+")
+      ('append-read "a+"))))
+      (let ((handle (fopen (cast (Ptr U8) (. path data)) (cast (Ptr U8) (. mode-str data)))))
+        (if (== handle nil)
+          (error 'not-found)
+          (ok (File handle mode true))))))
+
+  (fn file-close ((f (Ptr File)))
+    (@intent "Close an open file handle")
+    (@spec (((Ptr File)) -> (Result Bool FileError)))
+    (@pre (. (deref f) is-open))
+    (@post (not (. (deref f) is-open)))
+    (@example ((File handle 'read true)) -> (ok true))
+
+    (do
+      (set! (deref f) is-open false)
+      (let ((result (fclose (. (deref f) handle))))
+        (if (== result 0)
+          (ok true)
+          (error 'io-error)))))
+
+  ;; ============================================================
+  ;; Read Operations
+  ;; ============================================================
+
+  (fn file-read ((arena Arena) (f (Ptr File)) (max-bytes (Int 1 ..)))
+    (@intent "Read up to max-bytes from file into arena-allocated buffer")
+    (@spec ((Arena (Ptr File) (Int 1 ..)) -> (Result Bytes FileError)))
+    (@pre (. (deref f) is-open))
+    (@example (arena file 1024) -> (ok (Bytes data 512)))
+    (@example (arena closed-file 1024) -> (error 'closed))
+
+    (let ((buf (arena-alloc arena max-bytes)))
+      (let ((bytes-read (fread buf 1 (cast U64 max-bytes) (. (deref f) handle))))
+        (if (and (== bytes-read 0) (!= (ferror (. (deref f) handle)) 0))
+          (error 'io-error)
+          (ok (Bytes buf bytes-read bytes-read))))))
+
+  (fn file-read-line ((arena Arena) (f (Ptr File)) (max-len (Int 1 ..)))
+    (@intent "Read a single line from file, up to max-len characters")
+    (@spec ((Arena (Ptr File) (Int 1 ..)) -> (Result String FileError)))
+    (@pre (. (deref f) is-open))
+    (@example (arena file 256) -> (ok "line content"))
+    (@example (arena file-at-eof 256) -> (error 'eof))
+
+    (let ((buf (arena-alloc arena (+ max-len 1))))
+      (let ((result (fgets (cast (Ptr U8) buf) (cast Int max-len) (. (deref f) handle))))
+        (if (== result nil)
+          (if (!= (feof (. (deref f) handle)) 0)
+            (error 'eof)
+            (error 'io-error))
+          (ok (string-new arena (cast (Ptr U8) buf)))))))
+
+  (fn file-read-all ((arena Arena) (f (Ptr File)))
+    (@intent "Read entire file contents into arena-allocated string")
+    (@spec ((Arena (Ptr File)) -> (Result String FileError)))
+    (@pre (. (deref f) is-open))
+    (@example (arena file) -> (ok "file contents..."))
+
+    (do
+      (let ((start-pos (ftell (. (deref f) handle))))
+        (fseek (. (deref f) handle) 0 SEEK_END)
+        (let ((size (ftell (. (deref f) handle))))
+          (fseek (. (deref f) handle) start-pos SEEK_SET)
+          (let ((buf (arena-alloc arena (+ size 1))))
+            (let ((bytes-read (fread buf 1 (cast U64 size) (. (deref f) handle))))
+              ;; Use String constructor with explicit length since fread doesn't null-terminate
+              (ok (String (cast (Ptr U8) buf) bytes-read))))))))
+
+  ;; ============================================================
+  ;; Write Operations
+  ;; ============================================================
+
+  (fn file-write ((f (Ptr File)) (data Bytes))
+    (@intent "Write bytes to file, returning number of bytes written")
+    (@spec (((Ptr File) Bytes) -> (Result (Int 0 ..) FileError)))
+    (@pre (. (deref f) is-open))
+    (@example (file (Bytes "hello" 5)) -> (ok 5))
+
+    (let ((written (fwrite (cast (Ptr Void) (. data data)) 1 (. data len) (. (deref f) handle))))
+      (if (!= (ferror (. (deref f) handle)) 0)
+        (error 'io-error)
+        (ok (cast (Int 0 ..) written)))))
+
+  (fn file-write-line ((f (Ptr File)) (line String))
+    (@intent "Write string followed by newline to file")
+    (@spec (((Ptr File) String) -> (Result (Int 0 ..) FileError)))
+    (@pre (. (deref f) is-open))
+    (@example (file "hello") -> (ok 6))
+
+    (let ((written1 (fwrite (cast (Ptr Void) (. line data)) 1 (. line len) (. (deref f) handle))))
+      (let ((written2 (fwrite (cast (Ptr Void) "\n") 1 1 (. (deref f) handle))))
+        (if (!= (ferror (. (deref f) handle)) 0)
+          (error 'io-error)
+          (ok (cast (Int 0 ..) (+ written1 written2)))))))
+
+  ;; ============================================================
+  ;; Positioning and Control
+  ;; ============================================================
+
+  (fn file-flush ((f (Ptr File)))
+    (@intent "Flush buffered writes to disk")
+    (@spec (((Ptr File)) -> (Result Bool FileError)))
+    (@pre (. (deref f) is-open))
+    (@example (file) -> (ok true))
+
+    (let ((result (fflush (. (deref f) handle))))
+      (if (== result 0)
+        (ok true)
+        (error 'io-error))))
+
+  (fn file-seek ((f (Ptr File)) (offset I64) (whence Int))
+    (@intent "Seek to position in file (whence: 0=start, 1=current, 2=end)")
+    (@spec (((Ptr File) I64 Int) -> (Result Bool FileError)))
+    (@pre (. (deref f) is-open))
+    (@pre (and (>= whence 0) (<= whence 2)))
+    (@example (file 0 0) -> (ok true))
+    (@example (file -10 2) -> (ok true))
+
+    (let ((result (fseek (. (deref f) handle) offset whence)))
+      (if (== result 0)
+        (ok true)
+        (error 'io-error))))
+
+  (fn file-tell ((f (Ptr File)))
+    (@intent "Get current position in file")
+    (@spec (((Ptr File)) -> (Result I64 FileError)))
+    (@pre (. (deref f) is-open))
+    (@example (file) -> (ok 42))
+
+    (let ((pos (ftell (. (deref f) handle))))
+      (if (< pos 0)
+        (error 'io-error)
+        (ok pos))))
+
+  ;; ============================================================
+  ;; File System Queries
+  ;; ============================================================
+
+  (fn file-exists ((path String))
+    (@intent "Check if file exists at path")
+    (@spec ((String) -> Bool))
+    (@pure)
+    (@example ("existing.txt") -> true)
+    (@example ("missing.txt") -> false)
+
+    (== (access (cast (Ptr U8) (. path data)) F_OK) 0))
+
+  (fn file-size ((path String))
+    (@intent "Get size of file in bytes, or error if not accessible")
+    (@spec ((String) -> (Result I64 FileError)))
+    (@pure)
+    (@example ("test.txt") -> (ok 1024))
+    (@example ("missing.txt") -> (error 'not-found))
+
+    ;; Note: This function requires stack allocation which SLOP doesn't directly support.
+    ;; Using with-arena as a workaround for temporary allocation.
+    (with-arena 256
+      (let ((buf (arena-alloc arena (sizeof stat_buf))))
+        (let ((result (stat (cast (Ptr U8) (. path data)) buf)))
+          (if (!= result 0)
+            (error 'not-found)
+            (ok (cast I64 (. (cast (Ptr stat_buf) buf) st_size))))))))
+)

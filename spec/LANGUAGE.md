@@ -51,8 +51,8 @@ literal     = number | string | 'true | 'false | 'nil
 
 ```
 (module name exports? form*)
-(export (name arity)*)
-(import module-name (name arity)*)
+(export name*)
+(import module-name name*)
 (type name type-expr)
 (const name Type const-expr)
 (fn name params body)
@@ -90,11 +90,11 @@ literal     = number | string | 'true | 'false | 'nil
 
 (Bool)                   ; true or false (uint8_t)
 
-(String)                 ; Immutable, length-prefixed
+(String)                 ; Record: { data: (Ptr U8), len: U64 }
 (String .. max-len)      ; String with max length
 (String min .. max)      ; String with length in range
 
-(Bytes)                  ; Raw byte buffer
+(Bytes)                  ; Record: { data: (Ptr U8), len: U64, cap: U64 }
 (Bytes .. max-len)       ; Bounded byte buffer
 
 ; Collections
@@ -217,7 +217,8 @@ identifier               ; Variable reference
 (array e1 e2...)                         ; Fixed array literal
 (list [Type] e1 e2...)                   ; Dynamic list (Type optional)
 (map [KeyType ValueType] (k1 v1)...)     ; Map literal (types optional)
-(record-new Type (f1 v1) (f2 v2)...)     ; Struct construction
+(record-new Type (f1 v1) (f2 v2)...)     ; Struct construction (named fields)
+(TypeName v1 v2 ...)                     ; Struct construction (positional)
 (union-new Type Tag value)               ; Tagged union construction
 
 ; Collection Literal Type Inference:
@@ -369,9 +370,9 @@ matched type must be covered, or a wildcard (`_` or `else`) must be present.
 
 ```
 (module user-service
-  (export (create 1) (find 1) (update 2) (delete 1))
-  (import core (arena-new 1) (arena-free 1))
-  (import strings (concat 2) (len 1))
+  (export create find update delete)
+  (import core arena-new arena-free)
+  (import strings concat len)
   
   (type UserId (Int 1 ..))
   (type User (record
@@ -548,10 +549,6 @@ Minimal runtime (~500 lines of C):
 (is-ok result) -> Bool
 (unwrap result) -> T
 
-; I/O (via FFI)
-(file-read path) -> (Result Bytes IoError)
-(file-write path data) -> (Result Unit IoError)
-
 ; Time
 (now-ms) -> (Int 0 ..)
 (sleep-ms ms) -> Unit
@@ -586,6 +583,18 @@ Example:
     (bytes-from-ptr out 32)))
 ```
 
+**Constants**: The `ffi` form can also declare constants from C headers:
+
+```
+(ffi "stdio.h"
+  (SEEK_SET Int)    ;; constant - (name Type)
+  (SEEK_CUR Int)
+  (EOF Int)
+  (fclose ((file (Ptr Void))) Int))  ;; function - (name ((params)) ReturnType)
+```
+
+Constants are distinguished from functions by having a type symbol as the second element instead of a parameter list. No C code is emitted - the symbol passes through directly to C.
+
 ### 9.2 Struct Declarations
 
 Map C structs for field access:
@@ -605,6 +614,16 @@ Map C structs for field access:
     (set! addr.sin_addr 0)         ; INADDR_ANY
     addr))
 ```
+
+**C name override**: When the SLOP name differs from the C struct name, use `:c-name`:
+
+```
+(ffi-struct "sys/stat.h" stat_buf :c-name "stat"
+  (st_size I64)
+  (st_mode U32))
+```
+
+This maps `stat_buf` in SLOP to `struct stat` in C (the `struct` prefix is added automatically for non-`_t` types).
 
 ### 9.3 C Inline Escape Hatch
 

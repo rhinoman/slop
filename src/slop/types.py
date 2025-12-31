@@ -279,7 +279,13 @@ class RecordType(Type):
         return self.name
 
     def equals(self, other: Type) -> bool:
-        return isinstance(other, RecordType) and self.name == other.name
+        # Match RecordType by name
+        if isinstance(other, RecordType):
+            return self.name == other.name
+        # Also match PrimitiveType by name (for String/Bytes backwards compat)
+        if isinstance(other, PrimitiveType):
+            return self.name == other.name
+        return False
 
     def get_field(self, name: str) -> Optional[Type]:
         return self.fields.get(name)

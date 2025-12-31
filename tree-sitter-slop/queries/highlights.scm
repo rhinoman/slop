@@ -75,8 +75,6 @@
     "map-new" "map-put" "map-get" "map-has"
     ; Time
     "now-ms" "sleep-ms"
-    ; File I/O
-    "file-read" "file-write"
     ; Console I/O
     "print" "println"))
 

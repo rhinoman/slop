@@ -152,6 +152,12 @@ class Transpiler:
                 # arena-alloc always returns a pointer
                 if op == 'arena-alloc':
                     return True
+                # deref yields a value, not a pointer
+                if op == 'deref':
+                    return False
+                # addr yields a pointer
+                if op == 'addr':
+                    return True
                 # cast to pointer type: (cast (Ptr T) ...)
                 if op == 'cast' and len(expr) >= 2:
                     target_type = expr[1]
@@ -807,7 +813,7 @@ class Transpiler:
         if some_ok_clause:
             var_name, body, tag = some_ok_clause
             parts.append(f"if ({check_field}) {{ ")
-            if var_name:
+            if var_name and var_name != '_':
                 if is_option:
                     parts.append(f"__auto_type {var_name} = {value_field}; ")
                 else:
@@ -827,7 +833,7 @@ class Transpiler:
                 parts.append("else { ")
             else:
                 parts.append(f"if (!{check_field}) {{ ")
-            if var_name and is_result:
+            if var_name and var_name != '_' and is_result:
                 parts.append(f"__auto_type {var_name} = _match_val.data.err; ")
             for j, item in enumerate(body):
                 if j == len(body) - 1:
@@ -1079,7 +1085,11 @@ class Transpiler:
                 self._register_ffi_struct(item)
 
     def _register_ffi(self, form: SList):
-        """Register FFI function declarations: (ffi "header.h" (func ...) ...)"""
+        """Register FFI declarations: (ffi "header.h" (decl...) ...)
+
+        Functions: (func-name ((param Type)...) ReturnType) - decl[1] is SList
+        Constants: (const-name Type) - decl[1] is Symbol (no code emitted)
+        """
         if len(form) < 2:
             return
 
@@ -1087,17 +1097,22 @@ class Transpiler:
         if header and header not in self.ffi_includes:
             self.ffi_includes.append(header)
 
-        # Register each declared function
+        # Register each declaration
         for decl in form.items[2:]:
             if isinstance(decl, SList) and len(decl) >= 2:
-                func_name = decl[0].name
-                params = decl[1] if len(decl) > 1 else SList([])
-                return_type = decl[2] if len(decl) > 2 else Symbol('Void')
-                self.ffi_funcs[func_name] = {
-                    'c_name': func_name.replace('-', '_'),
-                    'params': params,
-                    'return_type': return_type
-                }
+                name = decl[0].name
+                second = decl[1]
+
+                if isinstance(second, SList):
+                    # Function: (func-name ((param Type)...) ReturnType)
+                    params = second
+                    return_type = decl[2] if len(decl) > 2 else Symbol('Void')
+                    self.ffi_funcs[name] = {
+                        'c_name': name.replace('-', '_'),
+                        'params': params,
+                        'return_type': return_type
+                    }
+                # else: Constant - no code emitted, symbol passes through to C
 
     def _register_ffi_struct(self, form: SList, inline: bool = False):
         """Register FFI struct: (ffi-struct "header.h" name (field type) ...)"""
@@ -1113,6 +1128,21 @@ class Transpiler:
             header = None
             name = form[1].name
             fields_start = 2
+
+        # Check for :c-name keyword argument
+        c_name_override = None
+        if fields_start < len(form):
+            for i in range(fields_start, len(form)):
+                item = form[i]
+                if isinstance(item, Symbol) and item.name == ':c-name':
+                    if i + 1 < len(form) and isinstance(form[i + 1], String):
+                        c_name_override = form[i + 1].value
+                        # Skip :c-name and its value when processing fields
+                        fields_start = i + 2
+                    break
+                # Stop if we hit a field (SList)
+                if isinstance(item, SList):
+                    break
 
         if header and header not in self.ffi_includes:
             self.ffi_includes.append(header)
@@ -1162,9 +1192,16 @@ class Transpiler:
                             'is_struct': field_type.name in self.ffi_structs
                         }
 
+            # Use :c-name override if provided, otherwise use heuristic
             # Heuristic: types ending in _t are usually typedefs (no struct prefix)
             # Other types are usually C structs (need struct prefix)
-            if name.endswith('_t'):
+            if c_name_override:
+                # Apply same heuristic to the override
+                if c_name_override.endswith('_t'):
+                    c_name = c_name_override
+                else:
+                    c_name = f"struct {c_name_override}"
+            elif name.endswith('_t'):
                 c_name = name
             else:
                 c_name = f"struct {name}"
@@ -1362,6 +1399,9 @@ class Transpiler:
 
         if is_int_type:
             self.emit(f"#define {c_name} ({c_value})")
+        elif type_name == 'String' and isinstance(value_expr, String):
+            # String constants need SLOP_STR() wrapper to initialize slop_string struct
+            self.emit(f"static const {c_type} {c_name} = SLOP_STR({c_value});")
         else:
             self.emit(f"static const {c_type} {c_name} = {c_value};")
 
@@ -1866,8 +1906,12 @@ class Transpiler:
                     continue
 
             var_expr = self.transpile_expr(init_expr)
-            # Type inference would go here; for now use auto
-            self.emit(f"__auto_type {var_name} = {var_expr};")
+            # Skip binding for _ wildcards - just evaluate for side effects
+            if raw_name == "_":
+                self.emit(f"(void){var_expr};")
+            else:
+                # Type inference would go here; for now use auto
+                self.emit(f"__auto_type {var_name} = {var_expr};")
 
         # Emit body
         for i, item in enumerate(body):
@@ -1890,7 +1934,11 @@ class Transpiler:
                 self.pointer_vars.add(raw_name)
 
             var_expr = self.transpile_expr(init_expr)
-            self.emit(f"__auto_type {var_name} = {var_expr};")
+            # Skip binding for _ wildcards - just evaluate for side effects
+            if raw_name == "_":
+                self.emit(f"(void){var_expr};")
+            else:
+                self.emit(f"__auto_type {var_name} = {var_expr};")
 
         # Emit body, capturing the last expression
         for i, item in enumerate(body):
@@ -2006,7 +2054,11 @@ class Transpiler:
 
             value = self.transpile_expr(expr[3], expected_type)
             target_code = self.transpile_expr(target)
-            self.emit(f"{target_code}->{self.to_c_name(field)} = {value};")
+            # Use -> for pointers, . for values
+            if self._is_pointer_expr(target):
+                self.emit(f"{target_code}->{self.to_c_name(field)} = {value};")
+            else:
+                self.emit(f"({target_code}).{self.to_c_name(field)} = {value};")
         elif len(expr) == 3:
             # (set! var value) - simple assignment
             target = expr[1]
@@ -2230,6 +2282,11 @@ class Transpiler:
         # Infer type of scrutinee for tracking bound variables
         scrutinee_type = self._infer_type(scrutinee_expr)
 
+        # Store scrutinee in temp variable to avoid evaluating side effects twice
+        # (e.g., file reads should only happen once)
+        self.emit(f"__auto_type _match_scrutinee = {scrutinee};")
+        scrutinee = "_match_scrutinee"
+
         # Collect clauses
         some_ok_clause = None
         none_err_clause = None
@@ -2261,7 +2318,7 @@ class Transpiler:
             var_name, body, tag = some_ok_clause
             self.emit(f"if ({check_field}) {{")
             self.indent += 1
-            if var_name:
+            if var_name and var_name != '_':
                 if is_option:
                     self.emit(f"__auto_type {var_name} = {scrutinee}.value;")
                     # Track the type of the bound variable for type flow analysis
@@ -2283,7 +2340,7 @@ class Transpiler:
             else:
                 self.emit(f"if (!{check_field}) {{")
             self.indent += 1
-            if var_name and not is_option:
+            if var_name and var_name != '_' and not is_option:
                 self.emit(f"__auto_type {var_name} = {scrutinee}.data.err;")
             for j, item in enumerate(body):
                 is_last = (j == len(body) - 1)
@@ -3076,7 +3133,15 @@ class Transpiler:
                 # Type cast
                 if op == 'cast':
                     target_type = self.to_c_type(expr[1])
-                    value = self.transpile_expr(expr[2])
+                    inner_expr = expr[2]
+
+                    # Special case: string literal cast to pointer type
+                    # Emit raw C string instead of SLOP_STR() which returns a struct
+                    if isinstance(inner_expr, String) and is_form(expr[1], 'Ptr'):
+                        escaped = inner_expr.value.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+                        return f'(({target_type})"{escaped}")'
+
+                    value = self.transpile_expr(inner_expr)
                     # Check if target is a named range type with a _new constructor
                     if isinstance(expr[1], Symbol) and expr[1].name in self.types:
                         # Named type - use constructor for range checking
@@ -3140,6 +3205,18 @@ class Transpiler:
                 if op in self.enums:
                     # Just return the enum value, ignore any "arguments"
                     return self.enums[op]
+
+                # Check if it's a builtin struct constructor: (String data len) or (Bytes data len cap)
+                if op == 'String' and len(expr.items) == 3:
+                    data = self.transpile_expr(expr[1])
+                    length = self.transpile_expr(expr[2])
+                    return f"((slop_string){{.len = {length}, .data = {data}}})"
+
+                if op == 'Bytes' and len(expr.items) == 4:
+                    data = self.transpile_expr(expr[1])
+                    length = self.transpile_expr(expr[2])
+                    cap = self.transpile_expr(expr[3])
+                    return f"((slop_bytes){{.len = {length}, .cap = {cap}, .data = {data}}})"
 
                 # Check if it's a record type constructor: (TypeName val1 val2 ...)
                 # Record types are in self.types and have fields in record_fields
@@ -3671,7 +3748,7 @@ class Transpiler:
         if imports:
             for imp_module, symbols in imports:
                 module_prefix = self.to_c_name(imp_module)
-                for sym_name, _ in symbols:
+                for sym_name in symbols:
                     c_name = self.to_c_name(sym_name)
                     self.import_map[sym_name] = f"{module_prefix}_{c_name}"
 
@@ -3981,7 +4058,9 @@ def transpile_multi_split(modules: dict, order: list) -> dict:
 
         # ===== BUILD HEADER FILE =====
         header_lines = []
-        guard_name = f"{mod_name.upper()}_H"
+        # Convert module name to valid C identifier for header guard
+        c_mod_name = transpiler.to_c_name(mod_name)
+        guard_name = f"{c_mod_name.upper()}_H"
 
         header_lines.append(f"#ifndef {guard_name}")
         header_lines.append(f"#define {guard_name}")

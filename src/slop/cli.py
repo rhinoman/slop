@@ -477,6 +477,93 @@ def _extract_imported_types(ast, search_paths=None, from_path=None) -> list:
     return imported_types
 
 
+def extract_file_context(filepath: str, fn_name: str = None) -> dict:
+    """Extract type checking context from a .slop file.
+
+    Args:
+        filepath: Path to the .slop file
+        fn_name: If provided, also extract params from this function
+
+    Returns:
+        Context dictionary with type_defs, fn_specs, ffi_specs, const_specs,
+        imported_specs, imported_types, and params (if fn_name provided).
+    """
+    from slop.parser import Symbol
+
+    ast = parse_file(filepath)
+
+    # Extract type definitions
+    type_defs = []
+    for form in ast:
+        if is_form(form, 'type') and len(form) > 1:
+            type_defs.append(pretty_print(form))
+        elif is_form(form, 'record') and len(form) > 1:
+            type_defs.append(pretty_print(form))
+        elif is_form(form, 'enum') and len(form) > 1:
+            type_defs.append(pretty_print(form))
+        elif is_form(form, 'module'):
+            for item in form.items:
+                if is_form(item, 'type') and len(item) > 1:
+                    type_defs.append(pretty_print(item))
+                elif is_form(item, 'record') and len(item) > 1:
+                    type_defs.append(pretty_print(item))
+                elif is_form(item, 'enum') and len(item) > 1:
+                    type_defs.append(pretty_print(item))
+
+    # Extract function specs
+    fn_specs = []
+    for form in ast:
+        if is_form(form, 'fn'):
+            spec = _extract_fn_spec(form)
+            if spec:
+                fn_specs.append(spec)
+        elif is_form(form, 'module'):
+            for item in form.items:
+                if is_form(item, 'fn'):
+                    spec = _extract_fn_spec(item)
+                    if spec:
+                        fn_specs.append(spec)
+
+    # Extract FFI specs
+    ffi_specs = _extract_ffi_specs(ast)
+
+    # Extract const specs
+    const_specs = _extract_const_specs(ast)
+
+    # Extract imported specs and types
+    from_path = Path(filepath)
+    imported_specs = _extract_imported_specs(ast, from_path=from_path)
+    imported_types = _extract_imported_types(ast, from_path=from_path)
+
+    context = {
+        'type_defs': type_defs,
+        'fn_specs': fn_specs,
+        'ffi_specs': ffi_specs,
+        'const_specs': const_specs,
+        'imported_specs': imported_specs,
+        'imported_types': imported_types,
+        'params': '',
+    }
+
+    # If fn_name provided, find that function and extract its params
+    if fn_name:
+        for form in ast:
+            if is_form(form, 'fn') and len(form) > 2:
+                name = form[1].name if isinstance(form[1], Symbol) else str(form[1])
+                if name == fn_name:
+                    context['params'] = str(form[2])
+                    break
+            elif is_form(form, 'module'):
+                for item in form.items:
+                    if is_form(item, 'fn') and len(item) > 2:
+                        name = item[1].name if isinstance(item[1], Symbol) else str(item[1])
+                        if name == fn_name:
+                            context['params'] = str(item[2])
+                            break
+
+    return context
+
+
 def cmd_fill(args):
     """Fill holes with LLM"""
     import logging
@@ -1010,6 +1097,53 @@ def cmd_check(args):
         return 1
 
 
+def cmd_check_hole(args):
+    """Validate expression against expected type."""
+    from slop.hole_filler import check_hole_impl
+
+    # Get expression from arg or stdin
+    if args.expr:
+        expr_str = args.expr
+    else:
+        if sys.stdin.isatty():
+            print("Error: No expression provided. Use positional arg or pipe to stdin.",
+                  file=sys.stderr)
+            return 1
+        expr_str = sys.stdin.read().strip()
+
+    if not expr_str:
+        print("Error: Empty expression", file=sys.stderr)
+        return 1
+
+    # Validate --fn requires --context
+    if args.fn and not args.context:
+        print("Error: --fn requires --context", file=sys.stderr)
+        return 1
+
+    # Call the API
+    result = check_hole_impl(
+        expr_str=expr_str,
+        expected_type=args.expected_type,
+        context_file=args.context,
+        fn_name=args.fn,
+        params=args.params,
+    )
+
+    if result.valid:
+        if args.verbose:
+            print(f"OK: {result.inferred_type} matches {result.expected_type}")
+        else:
+            print("OK")
+        return 0
+    else:
+        for err in result.errors:
+            print(f"Error: {err}", file=sys.stderr)
+        if args.verbose and result.inferred_type:
+            print(f"Inferred: {result.inferred_type}", file=sys.stderr)
+            print(f"Expected: {result.expected_type}", file=sys.stderr)
+        return 1
+
+
 def _get_runtime_path() -> Path:
     """Get path to bundled runtime header"""
     try:
@@ -1495,6 +1629,21 @@ def main():
     p = subparsers.add_parser('check', help='Validate')
     p.add_argument('input')
 
+    # check-hole
+    p = subparsers.add_parser('check-hole', help='Validate expression against expected type')
+    p.add_argument('expr', nargs='?', default=None,
+                   help='Expression to check (reads from stdin if not provided)')
+    p.add_argument('-t', '--type', required=True, dest='expected_type',
+                   help='Expected type (e.g., "Int", "(Ptr User)", "(Result Int Error)")')
+    p.add_argument('-c', '--context',
+                   help='Context .slop file for types and functions')
+    p.add_argument('-f', '--fn',
+                   help='Function name to extract params from (requires --context)')
+    p.add_argument('-p', '--params',
+                   help='Parameter list like "((x Int) (y String))" (overrides --fn)')
+    p.add_argument('-v', '--verbose', action='store_true',
+                   help='Show inferred and expected types')
+
     # build
     p = subparsers.add_parser('build', help='Full pipeline')
     p.add_argument('input', nargs='?', default=None,
@@ -1538,6 +1687,7 @@ def main():
         'transpile': cmd_transpile,
         'fill': cmd_fill,
         'check': cmd_check,
+        'check-hole': cmd_check_hole,
         'build': cmd_build,
         'derive': cmd_derive,
         'format': cmd_format,

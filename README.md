@@ -142,6 +142,15 @@ slop check examples/rate-limiter.slop
 
 # Full build (requires cc)
 slop build examples/rate-limiter.slop -o rate_limiter
+
+# Validate a hole implementation against expected type
+slop check-hole '(+ x 1)' -t Int -p '((x Int))'
+
+# With context from a file
+slop check-hole '(helper 42)' -t Int -c myfile.slop
+
+# From stdin
+echo '(ok value)' | slop check-hole -t '(Result T E)'
 ```
 
 ## Project Configuration
