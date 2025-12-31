@@ -140,6 +140,9 @@ slop transpile examples/rate-limiter.slop -o rate_limiter.c
 # Type check
 slop check examples/rate-limiter.slop
 
+# Verify contracts with Z3 (requires: pip install z3-solver)
+slop verify examples/rate-limiter.slop
+
 # Full build (requires cc)
 slop build examples/rate-limiter.slop -o rate_limiter
 
@@ -344,12 +347,13 @@ Arena allocation handles 90% of cases:
 - ✓ Hole filler with quality scoring and pattern library
 - ✓ CLI tooling (`slop` command)
 - ✓ Runtime header with arena allocation
+- ✓ Contract verification via Z3 (`slop verify`)
 - ✓ Test suite
 
 **Not Yet Implemented:**
 - Concurrency primitives (Channel based)
-- Contract verification (SMT solver integration)
 - Property-based testing generation
+- Contract verification with body analysis (verifies contract consistency, not implementation)
 
 ## License
 

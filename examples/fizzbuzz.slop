@@ -1,26 +1,33 @@
-;; FizzBuzz in SLOP
-
-(module fizzbuzz (export fizzbuzz main)
+(module fizzbuzz
+  (export fizzbuzz main)
 
   (type FizzBuzzResult (enum Fizz Buzz FizzBuzz Number))
 
   (fn fizzbuzz ((n (Int 1 .. 100)))
     (@intent "Return Fizz for multiples of 3, Buzz for multiples of 5, FizzBuzz for both, Number otherwise")
     (@spec (((Int 1 .. 100)) -> FizzBuzzResult))
+    (@pre (>= n 1))
+    (@pre (<= n 100))
+    (@post
+      (or
+        (== $result 'Fizz)
+        (== $result 'Buzz)
+        (== $result 'FizzBuzz)
+        (== $result 'Number)))
     (@example (15) -> FizzBuzz)
     (@example (9) -> Fizz)
     (@example (10) -> Buzz)
     (@example (7) -> Number)
     (@pure)
-    (hole FizzBuzzResult "check divisibility by 3 and 5, return appropriate enum variant"
+    (hole FizzBuzzResult
+      "check divisibility by 3 and 5, return appropriate enum variant"
       :must-use (n)
       :complexity tier-2))
 
   (fn main ()
     (@intent "Print fizzbuzz for numbers 1 to 100")
     (@spec (() -> (Int)))
-    (hole (Int) "loop 1 to 100, call fizzbuzz, print result for each"
+    (hole (Int)
+      "loop 1 to 100, call fizzbuzz, print result for each"
       :complexity tier-3
-      :must-use (fizzbuzz)))
-
-)
+      :must-use (fizzbuzz))))

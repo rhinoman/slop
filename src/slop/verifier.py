@@ -80,6 +80,16 @@ class Z3Translator:
         self.filename = filename
         self.variables: Dict[str, z3.ExprRef] = {}
         self.constraints: List[z3.BoolRef] = []
+        self.enum_values: Dict[str, int] = {}  # 'Fizz' -> 0, etc.
+        self._build_enum_map()
+
+    def _build_enum_map(self):
+        """Build mapping from enum variant names to integer values"""
+        for typ in self.type_env.type_registry.values():
+            if isinstance(typ, EnumType):
+                for i, variant in enumerate(typ.variants):
+                    self.enum_values[variant] = i
+                    self.enum_values[f"'{variant}"] = i
 
     def declare_variable(self, name: str, typ: Type) -> z3.ExprRef:
         """Create Z3 variable with appropriate sort and add range constraints"""
@@ -178,6 +188,15 @@ class Z3Translator:
     def _translate_symbol(self, sym: Symbol) -> Optional[z3.ExprRef]:
         """Translate a symbol reference"""
         name = sym.name
+
+        # Quoted enum variant: 'Fizz -> IntVal(0)
+        if name.startswith("'"):
+            if name in self.enum_values:
+                return z3.IntVal(self.enum_values[name])
+            # Try without quote prefix
+            variant = name[1:]
+            if variant in self.enum_values:
+                return z3.IntVal(self.enum_values[variant])
 
         # Special variable for postconditions
         if name == '$result':
@@ -414,7 +433,15 @@ class ContractVerifier:
         # Declare $result for postconditions
         if postconditions:
             if spec_return_type:
-                translator.declare_variable('$result', spec_return_type)
+                # For enum return types, use Int and constrain to valid range
+                if isinstance(spec_return_type, EnumType):
+                    result_var = translator.declare_variable('$result', PrimitiveType('Int'))
+                    # Add constraint that result is a valid enum value
+                    num_variants = len(spec_return_type.variants)
+                    translator.constraints.append(result_var >= 0)
+                    translator.constraints.append(result_var < num_variants)
+                else:
+                    translator.declare_variable('$result', spec_return_type)
             else:
                 # Default to Int if no spec
                 translator.declare_variable('$result', PrimitiveType('Int'))

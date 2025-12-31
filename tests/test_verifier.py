@@ -285,6 +285,24 @@ class TestContractVerification:
         assert len(warnings) == 1
         assert "mutable state" in warnings[0].message.lower()
 
+    def test_enum_comparison_in_postcondition(self):
+        """Postcondition comparing $result to enum variant should verify"""
+        from slop.verifier import verify_source
+
+        source = """
+        (module test
+          (type Status (enum ok error pending))
+          (fn get-status ((x Int))
+            (@spec ((Int) -> Status))
+            (@post (or (== $result 'ok)
+                       (== $result 'error)
+                       (== $result 'pending)))
+            'ok))
+        """
+        results = verify_source(source)
+        verified = [r for r in results if r.status == 'verified']
+        assert len(verified) == 1
+
 
 class TestRangeVerification:
     """Test range type safety verification"""
@@ -361,6 +379,23 @@ class TestVerifySource:
         verified = [r for r in results if r.status == 'verified']
         assert len(verified) >= 1
 
+    def test_contradictory_postconditions(self):
+        """Z3 catches logically impossible postconditions"""
+        from slop.verifier import verify_source
+
+        source = """
+        (module test
+        (fn impossible ((x Int))
+            (@spec ((Int) -> Int))
+            (@pre (> x 0))
+            (@post (> $result x))
+            (@post (< $result x))
+            x))
+        """
+        results = verify_source(source)
+
+        failed = [r for r in results if r.status == 'failed']
+        assert len(failed) == 1
 
 class TestZ3Available:
     """Test Z3 availability check"""

@@ -1,0 +1,19 @@
+  (module math
+    (export divide abs-positive)
+
+    (type Positive (Int 1 ..))
+
+    ;; Safe division - type system prevents zero denominator
+    (fn divide ((numerator Int) (denominator Positive))
+      (@intent "Safe division - denominator cannot be zero")
+      (@spec ((Int Positive) -> Int))
+      (@pre (>= denominator 1))
+      (/ numerator denominator))
+
+    ;; Absolute value of positive is always positive
+    (fn abs-positive ((x Positive))
+      (@intent "Absolute value of a positive number")
+      (@spec ((Positive) -> Positive))
+      (@pre (> x 0))
+      (@post (> $result 0))
+      x))
