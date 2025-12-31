@@ -249,16 +249,20 @@ class Transpiler:
         """Transform C type based on parameter mode.
 
         - 'in':  Pass by value (default, unchanged)
-        - 'out': Always pointer (uninitialized)
-        - 'mut': Always pointer (initialized/mutable)
+        - 'out': Always pointer (output parameter)
+        - 'mut': Mutable - no type change (value types stay values, pointers stay pointers)
         """
         if mode == 'in':
             # Pass by value - no change
             return c_type
-        elif mode == 'out' or mode == 'mut':
-            # Always pointer for out/mut
+        elif mode == 'out':
+            # 'out' always needs pointer for output
             if not c_type.endswith('*'):
                 return f"{c_type}*"
+            return c_type
+        elif mode == 'mut':
+            # 'mut' on value types = mutable local copy (no pointer added)
+            # 'mut' on pointer types = mutable through pointer (unchanged)
             return c_type
 
         return c_type
@@ -1511,9 +1515,12 @@ class Transpiler:
         param_strs = []
         for p in params:
             if isinstance(p, SList) and len(p) >= 2:
-                pname = self.to_c_name(p[0].name)
-                ptype = self.to_c_type(p[1])
-                param_strs.append(f"{ptype} {pname}")
+                mode, raw_pname, ptype_expr = self._parse_parameter_mode(p)
+                if raw_pname and ptype_expr:
+                    pname = self.to_c_name(raw_pname)
+                    ptype = self.to_c_type(ptype_expr)
+                    ptype = self._apply_parameter_mode(mode, ptype)
+                    param_strs.append(f"{ptype} {pname}")
 
         self.emit(f"{return_type} {name}({', '.join(param_strs) or 'void'});")
 
@@ -2077,22 +2084,27 @@ class Transpiler:
 
         # Emit bindings
         for binding in bindings:
-            raw_name = binding[0].name
+            # Skip 'mut' keyword if present: (mut name init) or (mut name Type init)
+            idx = 0
+            if isinstance(binding[0], Symbol) and binding[0].name == 'mut':
+                idx = 1
+
+            raw_name = binding[idx].name
             var_name = self.to_c_name(raw_name)
 
-            # Handle typed bindings: (name Type init) vs untyped: (name init)
-            if len(binding) >= 3:
-                # Typed binding: (name Type init)
-                type_expr = binding[1]
-                init_expr = binding[2]
+            # Handle typed bindings: (name Type init) or (mut name Type init)
+            if len(binding) >= idx + 3:
+                # Typed binding
+                type_expr = binding[idx + 1]
+                init_expr = binding[idx + 2]
 
                 # Check if this is a ScopedPtr binding
                 if self._is_scoped_ptr_type(type_expr):
                     pointee_c_type = self._get_scoped_pointee_type(type_expr)
                     self._register_scoped(raw_name, pointee_c_type)
             else:
-                # Untyped binding: (name init)
-                init_expr = binding[1]
+                # Untyped binding: (name init) or (mut name init)
+                init_expr = binding[idx + 1]
 
             # Check if init expression is make-scoped (register for auto-cleanup)
             if is_form(init_expr, 'make-scoped') and len(init_expr) >= 2:
@@ -2167,20 +2179,26 @@ class Transpiler:
 
         # Emit bindings
         for binding in bindings:
-            raw_name = binding[0].name
+            # Skip 'mut' keyword if present: (mut name init) or (mut name Type init)
+            idx = 0
+            if isinstance(binding[0], Symbol) and binding[0].name == 'mut':
+                idx = 1
+
+            raw_name = binding[idx].name
             var_name = self.to_c_name(raw_name)
 
-            # Handle typed bindings: (name Type init) vs untyped: (name init)
-            if len(binding) >= 3:
-                type_expr = binding[1]
-                init_expr = binding[2]
+            # Handle typed bindings: (name Type init) or (mut name Type init)
+            if len(binding) >= idx + 3:
+                type_expr = binding[idx + 1]
+                init_expr = binding[idx + 2]
 
                 # Check if this is a ScopedPtr binding
                 if self._is_scoped_ptr_type(type_expr):
                     pointee_c_type = self._get_scoped_pointee_type(type_expr)
                     self._register_scoped(raw_name, pointee_c_type)
             else:
-                init_expr = binding[1]
+                # Untyped binding: (name init) or (mut name init)
+                init_expr = binding[idx + 1]
 
             # Check if init expression is make-scoped (register for auto-cleanup)
             if is_form(init_expr, 'make-scoped') and len(init_expr) >= 2:
@@ -4513,6 +4531,13 @@ def transpile_multi_split(modules: dict, order: list) -> dict:
         transpiler.output = []
         for fn in functions:
             transpiler.transpile_function(fn)
+
+        # Static literals need to be emitted before functions that use them
+        if transpiler.static_literals:
+            impl_lines.append("/* Static backing arrays for immutable list literals */")
+            impl_lines.extend(transpiler.static_literals)
+            impl_lines.append("")
+
         if transpiler.output:
             impl_lines.extend(transpiler.output)
 

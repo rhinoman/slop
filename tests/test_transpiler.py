@@ -348,7 +348,7 @@ class TestComprehensiveTranspilation:
         # For loop
         assert "for (int64_t i = 0; i < 10; i++)" in c_code
 
-        # While loop
+        # While loop (using mutable parameter directly)
         assert "while ((n > 0))" in c_code
 
         # Enum comparison (cond with equality checks)
@@ -557,8 +557,8 @@ class TestParameterModes:
         # Should be pointer type
         assert "int64_t* result" in c_code
 
-    def test_mut_mode_pointer(self):
-        """'mut' mode generates pointer parameter"""
+    def test_mut_mode_value(self):
+        """'mut' mode with value type generates mutable value parameter"""
         source = """
         (fn increment ((mut counter Int))
           (@intent "Mutate counter")
@@ -566,8 +566,9 @@ class TestParameterModes:
           (set! counter (+ counter 1)))
         """
         c_code = transpile(source)
-        # Should be pointer type
-        assert "int64_t* counter" in c_code
+        # mut on value type = mutable local copy, NOT pointer
+        assert "int64_t counter" in c_code
+        assert "int64_t* counter" not in c_code
 
     def test_mixed_modes(self):
         """Function with mixed parameter modes"""
@@ -580,7 +581,8 @@ class TestParameterModes:
         c_code = transpile(source)
         assert "int64_t a" in c_code  # in: pass by value
         assert "int64_t* result" in c_code  # out: pointer
-        assert "int64_t* state" in c_code  # mut: pointer
+        assert "int64_t state" in c_code  # mut on value type: mutable local copy
+        assert "int64_t* state" not in c_code  # NOT a pointer
 
 
 class TestMapLiterals:

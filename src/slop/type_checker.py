@@ -199,6 +199,8 @@ class TypeChecker:
         # Track which variables hold mutable collections (from list-new, map-new)
         # Immutable literals (list, map) are not added here
         self._mutable_collections: Set[str] = set()
+        # Track which variables are declared as mutable (with 'mut' keyword in let)
+        self._mutable_vars: Set[str] = set()
         # Track current function's return type (for ? operator validation)
         self._current_fn_return_type: Optional[Type] = None
         # Register built-in functions
@@ -1360,26 +1362,69 @@ class TypeChecker:
             )
 
     def _infer_let(self, expr: SList) -> Type:
-        """Infer type of let expression"""
+        """Infer type of let expression.
+
+        Syntax:
+          (let ((x init)) body)           - immutable binding
+          (let ((mut x init)) body)       - mutable binding (allows set!)
+          (let ((mut x Type init)) body)  - mutable with explicit type
+        """
         if len(expr) < 2:
             return UNKNOWN
 
         self.env.push_scope()
         # Track which mutable collections are bound in this scope
+        scope_mutable_collections: Set[str] = set()
+        # Track which mutable vars are bound in this scope (for cleanup)
         scope_mutable_vars: Set[str] = set()
 
         bindings = expr[1] if isinstance(expr[1], SList) else SList([])
         for binding in bindings:
             if isinstance(binding, SList) and len(binding) >= 2:
-                var_name = binding[0].name if isinstance(binding[0], Symbol) else str(binding[0])
-                init_expr = binding[1]
-                var_type = self.infer_expr(init_expr)
+                is_mut = False
+                idx = 0
+
+                # Check for mut keyword at start of binding
+                if isinstance(binding[0], Symbol) and binding[0].name == 'mut':
+                    is_mut = True
+                    idx = 1
+
+                if idx >= len(binding):
+                    continue  # Malformed binding
+
+                var_name = binding[idx].name if isinstance(binding[idx], Symbol) else str(binding[idx])
+
+                # Check for explicit type annotation: (mut x Type init) or (x Type init)
+                if len(binding) > idx + 2:
+                    # Has explicit type annotation
+                    type_expr = binding[idx + 1]
+                    init_expr = binding[idx + 2]
+                    var_type = self.parse_type_expr(type_expr)
+                    # Type check the init expr against declared type
+                    init_type = self.infer_expr(init_expr)
+                    self._check_assignable(init_type, var_type, f"binding '{var_name}'", init_expr)
+                else:
+                    # No explicit type - infer from init
+                    init_expr = binding[idx + 1]
+                    var_type = self.infer_expr(init_expr)
+
+                    # Widen singleton range types for mut variables
+                    # This allows (let ((mut total 0)) (set! total (+ total 1)))
+                    if is_mut and isinstance(var_type, RangeType):
+                        # Widen to the base type (Int, I32, etc.)
+                        var_type = PrimitiveType(var_type.base)
+
                 self.env.bind_var(var_name, var_type)
+
+                # Track mutable variables
+                if is_mut:
+                    self._mutable_vars.add(var_name)
+                    scope_mutable_vars.add(var_name)
 
                 # Track if this is a mutable collection (list-new or map-new)
                 if self._is_mutable_collection_constructor(init_expr):
                     self._mutable_collections.add(var_name)
-                    scope_mutable_vars.add(var_name)
+                    scope_mutable_collections.add(var_name)
 
         # Infer body type
         body_type = PrimitiveType('Unit')
@@ -1387,8 +1432,12 @@ class TypeChecker:
             body_type = self.infer_expr(body_expr)
 
         # Clean up mutable collection tracking for this scope
-        for var_name in scope_mutable_vars:
+        for var_name in scope_mutable_collections:
             self._mutable_collections.discard(var_name)
+
+        # Clean up mutable var tracking for this scope
+        for var_name in scope_mutable_vars:
+            self._mutable_vars.discard(var_name)
 
         self.env.pop_scope()
         return body_type
@@ -1624,8 +1673,9 @@ class TypeChecker:
                         self._check_assignable(value_type, target_type, f"assignment to '{name}'", expr[2])
                 else:
                     # Simple variable assignment
-                    # Check parameter mode constraints
+                    # Check mutability: must be either a mut let binding or a mutable parameter
                     if name in self._param_modes:
+                        # Parameter - check mode constraints
                         mode = self._param_modes[name]
                         if mode == 'in':
                             self.error(f"Cannot assign to 'in' parameter '{name}'", target,
@@ -1633,6 +1683,12 @@ class TypeChecker:
                         elif mode == 'out':
                             # Mark out parameter as initialized
                             self._out_initialized.add(name)
+                        # 'mut' and 'out' modes allow assignment
+                    elif name not in self._mutable_vars:
+                        # Not a mutable parameter and not a mut let binding
+                        self.error(f"Cannot assign to immutable variable '{name}'", target,
+                                  hint="Declare with 'mut' to allow mutation: (let ((mut x 0)) ...)")
+
                     expected = self.env.lookup_var(name)
                     if expected:
                         self._check_assignable(value_type, expected, f"assignment to '{name}'", expr[2])

@@ -1,74 +1,37 @@
-;; ============================================================
-;; Comprehensive Transpiler Test
-;; ============================================================
-;;
-;; Exercises all major transpiler features in a single module:
-;; - Range, record, enum, union, array types
-;; - Loops (for, while)
-;; - Match on enum, union, Option, Result
-;; - Bitwise operators
-;; - Arena memory
-;; - cond expressions
-;; - do sequences
-;; - addr, cast, c-inline
-;; - Postconditions with $result
-;; - Nested function calls
-;; - Generic types (Option<T>, Result<T,E>)
-
 (module comprehensive-test
   (export (main 0))
 
-  ;; === TYPE DEFINITIONS ===
-
-  ;; Range type
   (type Score (Int 0 .. 100))
 
-  ;; Record type
-  (type Player (record
-    (name String)
-    (score Score)
-    (active Bool)))
+  (type Player (record (name String) (score Score) (active Bool)))
 
-  ;; Enum type
   (type GameState (enum waiting playing paused finished))
 
-  ;; Union (tagged union)
-  (type Value (union
-    (number Int)
-    (text String)
-    (nothing)))
+  (type Value (union (number Int) (text String) (nothing)))
 
-  ;; Array type alias
   (type Scores (Array Int 10))
 
-  ;; === FUNCTIONS ===
-
-  ;; Bitwise operations
   (fn bitwise-ops ((a Int) (b Int))
     (@intent "Test bitwise operators")
     (@spec ((Int Int) -> Int))
     (| (& a b) (^ a (<< b 2))))
 
-  ;; For loop with array indexing
   (fn sum-array ((scores (Ptr Scores)))
     (@intent "Sum array elements using for loop")
     (@spec (((Ptr Scores)) -> Int))
-    (let ((total 0))
-      (for (i 0 10)
-        (set! total (+ total (@ scores i))))
+    (let ((mut total 0))
+      (for (i 0 10) (set! total (+ total (@ scores i))))
       total))
 
-  ;; While loop
-  (fn count-down ((n Int))
+  (fn count-down ((mut n Int))
     (@intent "Count iterations using while loop")
     (@spec ((Int) -> Int))
-    (let ((count 0))
+    (let ((mut count 0))
       (while (> n 0)
         (set! count (+ count 1))
         (set! n (- n 1)))
       count))
 
-  ;; Enum comparison (using cond - match on simple enums has a known issue)
   (fn state-name ((s GameState))
     (@intent "Map enum to numeric value")
     (@spec ((GameState) -> Int))
@@ -78,7 +41,6 @@
       ((== s 'paused) 2)
       (else 3)))
 
-  ;; Match on union with binding
   (fn extract-value ((v Value))
     (@intent "Extract value from tagged union")
     (@spec ((Value) -> Int))
@@ -87,15 +49,11 @@
       ((text t) 0)
       ((nothing) -1)))
 
-  ;; Result type with ok/error
   (fn divide ((a Int) (b Int))
     (@intent "Safe division returning Result")
     (@spec ((Int Int) -> (Result Int String)))
-    (if (== b 0)
-      (error "division by zero")
-      (ok (/ a b))))
+    (if (== b 0) (error "division by zero") (ok (/ a b))))
 
-  ;; Early return with ?
   (fn safe-divide-twice ((a Int) (b Int) (c Int))
     (@intent "Chain operations with early return")
     (@spec ((Int Int Int) -> (Result Int String)))
@@ -103,7 +61,6 @@
           (second (? (divide first c))))
       (ok second)))
 
-  ;; cond expression
   (fn classify ((n Int))
     (@intent "Multi-way conditional")
     (@spec ((Int) -> Int))
@@ -112,7 +69,6 @@
       ((== n 0) 0)
       (else 1)))
 
-  ;; with-arena scoped memory
   (fn arena-test ()
     (@intent "Test scoped arena allocation")
     (@spec (() -> Int))
@@ -121,46 +77,37 @@
         (set! p score 42)
         (. p score))))
 
-  ;; do expression (sequence)
   (fn sequence-test ((x Int))
     (@intent "Test do sequencing")
     (@spec ((Int) -> Int))
-    (do
-      (println "testing")
-      (+ x 1)))
+    (do (println "testing") (+ x 1)))
 
-  ;; addr operator
   (fn get-address ((x Int))
     (@intent "Get address of variable")
     (@spec ((Int) -> (Ptr Int)))
     (addr x))
 
-  ;; cast operator
   (fn to-byte ((n Int))
     (@intent "Cast int to byte")
     (@spec ((Int) -> U8))
     (cast U8 n))
 
-  ;; c-inline escape
   (fn inline-c ()
     (@intent "Test inline C code")
     (@spec (() -> Int))
     (c-inline "42"))
 
-  ;; Postcondition with $result
   (fn always-positive ((x Int))
     (@intent "Ensure result is positive")
     (@spec ((Int) -> Int))
     (@post (> $result 0))
     (if (< x 1) 1 x))
 
-  ;; Nested function calls
   (fn nested-calls ((a Int) (b Int))
     (@intent "Test nested function calls")
     (@spec ((Int Int) -> Int))
     (classify (bitwise-ops a b)))
 
-  ;; Option type matching
   (fn option-test ((opt (Option Int)))
     (@intent "Match on Option type")
     (@spec (((Option Int)) -> Int))
@@ -168,7 +115,6 @@
       ((some v) v)
       ('none 0)))
 
-  ;; Main entry point
   (fn main ()
     (@intent "Entry point")
     (@spec (() -> Int))

@@ -73,7 +73,7 @@
    '((list
       :anchor
       (identifier) @font-lock-keyword-face
-      (:match "^\\(fn\\|sig\\|impl\\|module\\|export\\|import\\|type\\|const\\|record\\|enum\\|union\\|structure\\|logic\\|let\\|let\\*\\|if\\|cond\\|match\\|when\\|while\\|for\\|for-each\\|do\\|hole\\|ffi\\|ffi-struct\\)$"
+      (:match "^\\(fn\\|sig\\|impl\\|module\\|export\\|import\\|type\\|const\\|record\\|enum\\|union\\|structure\\|logic\\|let\\|let\\*\\|mut\\|if\\|cond\\|match\\|when\\|while\\|for\\|for-each\\|do\\|hole\\|ffi\\|ffi-struct\\)$"
               @font-lock-keyword-face)))
 
    :language 'slop
