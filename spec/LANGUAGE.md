@@ -116,7 +116,7 @@ literal     = number | string | 'true | 'false | 'nil
 
 ; Pointers (explicit when needed)
 (Ptr T)                  ; Pointer to T
-(OwnPtr T)               ; Owning pointer (freed when scope ends)
+(ScopedPtr T)            ; Scoped pointer (freed when scope ends)
 (OptPtr T)               ; Nullable pointer
 
 ; Function types
@@ -410,10 +410,10 @@ For data that outlives a request:
 
 ```
 (type Connection (record
-  (socket OwnPtr Socket)    ; Freed when Connection is freed
-  (buffer OwnPtr Bytes)))
+  (socket (ScopedPtr Socket))    ; Freed when Connection is freed
+  (buffer (ScopedPtr Bytes))))
 
-(fn connection-close ((conn (OwnPtr Connection)))
+(fn connection-close ((conn (ScopedPtr Connection)))
   (@intent "Close connection and free resources")
   ; Compiler generates cleanup code
   ...)
@@ -454,7 +454,7 @@ SLOP                    C
 (record (x T) (y U))    struct { T x; U y; }
 (union (a T) (b U))     struct { uint8_t tag; union { T a; U b; } data; }
 (Ptr T)                 T*
-(OwnPtr T)              T* (with cleanup)
+(ScopedPtr T)           T* (with cleanup)
 (Fn (A B) -> R)         R (*)(A, B)
 ```
 

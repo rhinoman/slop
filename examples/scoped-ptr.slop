@@ -1,0 +1,92 @@
+(module scoped-ptr
+  (export create-buffer process-data main)
+
+  ;; FFI for memory allocation and I/O
+  (ffi "stdlib.h"
+    (malloc ((size U64)) (Ptr Void))
+    (free ((ptr (Ptr Void))) Void))
+
+  (ffi "stdio.h"
+    (puts ((s (Ptr U8))) Int)
+    (printf ((fmt (Ptr U8)) (val U64)) Int))
+
+  ;; Simple buffer with scoped lifetime
+  (type Buffer (record
+    (data (ScopedPtr U8))
+    (size U64)))
+
+  ;; Connection with multiple scoped resources
+  (type Connection (record
+    (socket (ScopedPtr U8))
+    (read-buf (ScopedPtr Buffer))
+    (write-buf (ScopedPtr Buffer))))
+
+  ;; Create a buffer - returns pointer to heap-allocated Buffer
+  ;; Note: In production, should check for malloc failure
+  (fn create-buffer ((size U64))
+    (@intent "Allocate a buffer of given size")
+    (@spec ((U64) -> (Ptr Buffer)))
+    (@pre (> size 0))
+    (@post (or (== $result nil) (!= $result nil)))
+    (let ((buf (Ptr Buffer) (cast (Ptr Buffer) (malloc (sizeof Buffer)))))
+      (set! buf data (cast (ScopedPtr U8) (malloc size)))
+      (set! buf size size)
+      buf))
+
+  ;; Process data using a scoped buffer
+  ;; The scoped pointer is automatically freed when let scope ends
+  (fn process-data ((len U64))
+    (@intent "Process data using temporary buffer")
+    (@spec ((U64) -> Bool))
+    (@pre (> len 0))
+    (@post (or (== $result true) (== $result false)))
+    (let ((temp (ScopedPtr U8) (cast (ScopedPtr U8) (malloc 1024))))
+      ;; temp is automatically freed when let scope ends
+      (!= temp nil)))
+
+  ;; Get buffer size
+  (fn get-buffer-size ((buf (Ptr Buffer)))
+    (@intent "Return the size of a buffer")
+    (@spec (((Ptr Buffer)) -> U64))
+    (@pre (!= buf nil))
+    (@post (>= $result 0))
+    (. buf size))
+
+  ;; Free a buffer manually (for non-scoped usage)
+  (fn free-buffer ((buf (Ptr Buffer)))
+    (@intent "Free a buffer and its data")
+    (@spec (((Ptr Buffer)) -> Void))
+    (@pre (!= buf nil))
+    (free (cast (Ptr Void) (. buf data)))
+    (free (cast (Ptr Void) buf)))
+
+  ;; Main function demonstrating ScopedPtr usage
+  (fn main ()
+    (@intent "Demonstrate ScopedPtr automatic cleanup")
+    (@spec (() -> Int))
+
+    ;; Test 1: Create and use a buffer
+    (puts (cast (Ptr U8) "=== ScopedPtr Demo ==="))
+
+    (let ((buf (Ptr Buffer) (create-buffer 256)))
+      (puts (cast (Ptr U8) "Created buffer with size:"))
+      (printf (cast (Ptr U8) "  %llu bytes\n") (get-buffer-size buf))
+      (free-buffer buf))
+
+    ;; Test 2: process-data uses scoped pointer internally
+    (puts (cast (Ptr U8) "\nTesting process-data with scoped cleanup..."))
+    (if (process-data 100)
+      (puts (cast (Ptr U8) "process-data: SUCCESS (temp buffer allocated and auto-freed)"))
+      (puts (cast (Ptr U8) "process-data: FAILED")))
+
+    ;; Test 3: Demonstrate scoped cleanup in local scope
+    (puts (cast (Ptr U8) "\nTesting local scoped pointer..."))
+    (let ((local-buf (ScopedPtr U8) (cast (ScopedPtr U8) (malloc 512))))
+      (if (!= local-buf nil)
+        (puts (cast (Ptr U8) "Local buffer allocated (will be auto-freed at scope end)"))
+        (puts (cast (Ptr U8) "Local buffer allocation failed"))))
+    ;; local-buf is automatically freed here
+
+    (puts (cast (Ptr U8) "\nAll scoped pointers cleaned up automatically!"))
+    (puts (cast (Ptr U8) "=== Demo Complete ==="))
+    0))

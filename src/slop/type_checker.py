@@ -444,7 +444,7 @@ class TypeChecker:
                     pointee = self.parse_type_expr(expr[1]) if len(expr) > 1 else UNKNOWN
                     return PtrType(pointee)
 
-                if name == 'OwnPtr':
+                if name == 'ScopedPtr':
                     pointee = self.parse_type_expr(expr[1]) if len(expr) > 1 else UNKNOWN
                     return PtrType(pointee, owning=True)
 

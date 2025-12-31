@@ -964,3 +964,69 @@ class TestFfiConstants:
         assert '#include <stdio.h>' in c_code
         assert '#define EOF' not in c_code
         assert 'EOF' in c_code  # Used in comparison
+
+
+class TestScopedPtr:
+    """Test ScopedPtr type and cleanup generation"""
+
+    def test_scoped_ptr_type_generates_pointer(self):
+        """ScopedPtr generates C pointer type"""
+        source = """
+        (type Container (record (data (ScopedPtr U8))))
+        """
+        c_code = transpile(source)
+        assert "uint8_t*" in c_code
+        assert "data" in c_code
+
+    def test_record_with_scoped_ptr_generates_destructor(self):
+        """Records with ScopedPtr fields generate destructor functions"""
+        source = """
+        (type Buffer (record
+          (data (ScopedPtr U8))
+          (size U64)))
+        """
+        c_code = transpile(source)
+        assert "Buffer_free" in c_code
+        assert "if (!ptr) return;" in c_code
+        assert "if (ptr->data) free(ptr->data);" in c_code
+        assert "free(ptr);" in c_code
+
+    def test_let_with_scoped_ptr_generates_cleanup(self):
+        """let bindings with ScopedPtr generate cleanup at scope end"""
+        source = """
+        (fn test ()
+          (@spec (() -> Int))
+          (let ((p (ScopedPtr U8) (malloc 100)))
+            (use p)
+            42))
+        """
+        c_code = transpile(source)
+        # Should have cleanup before the return
+        assert "if (p) free(p);" in c_code
+
+    def test_nested_scoped_ptr_records(self):
+        """Nested records with ScopedPtr get proper destructor chaining"""
+        source = """
+        (type Inner (record (buf (ScopedPtr U8))))
+        (type Outer (record (inner (ScopedPtr Inner))))
+        """
+        c_code = transpile(source)
+        # Both should have destructors
+        assert "Inner_free" in c_code
+        assert "Outer_free" in c_code
+        # Outer's destructor should call Inner_free
+        assert "Inner_free(ptr->inner)" in c_code
+
+    def test_multiple_scoped_ptr_fields(self):
+        """Multiple ScopedPtr fields all generate cleanup"""
+        source = """
+        (type Connection (record
+          (socket (ScopedPtr U8))
+          (read-buf (ScopedPtr U8))
+          (write-buf (ScopedPtr U8))))
+        """
+        c_code = transpile(source)
+        assert "Connection_free" in c_code
+        assert "ptr->socket" in c_code
+        assert "ptr->read_buf" in c_code
+        assert "ptr->write_buf" in c_code

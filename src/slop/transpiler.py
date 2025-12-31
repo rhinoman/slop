@@ -81,6 +81,11 @@ class Transpiler:
         self.generated_inline_records: Dict[str, str] = {}  # Track inline record types: type_name -> struct_body
         self.emitted_generated_types: Set[str] = set()  # Track which generated types have been emitted (to avoid duplicates)
 
+        # ScopedPtr tracking - stack of scopes, each maps var_name -> pointee_c_type
+        self.scoped_vars: List[Dict[str, str]] = [{}]
+        self.records_needing_destructor: Dict[str, List[str]] = {}  # record_name -> [scoped_field_names]
+        self.generated_destructors: Set[str] = set()  # Track which destructors have been generated
+
         # Module system support
         self.current_module: Optional[str] = None  # Current module being transpiled
         self.import_map: Dict[str, str] = {}  # local_name -> qualified_c_name
@@ -178,6 +183,36 @@ class Transpiler:
                 if op in self.func_returns_pointer:
                     return self.func_returns_pointer[op]
         return False
+
+    # ScopedPtr helper methods
+    def _push_scoped_scope(self):
+        """Push a new scope for scoped pointer tracking"""
+        self.scoped_vars.append({})
+
+    def _pop_scoped_scope(self) -> Dict[str, str]:
+        """Pop scope, returning scoped vars that need cleanup"""
+        return self.scoped_vars.pop()
+
+    def _register_scoped(self, name: str, c_type: str):
+        """Register a variable as holding a scoped pointer"""
+        self.scoped_vars[-1][name] = c_type
+
+    def _emit_scoped_cleanup(self, scoped: Dict[str, str]):
+        """Emit cleanup code for scoped variables"""
+        # Cleanup in reverse allocation order
+        for name in reversed(list(scoped.keys())):
+            c_name = self.to_c_name(name)
+            self.emit(f"if ({c_name}) free({c_name});")
+
+    def _is_scoped_ptr_type(self, type_expr: SExpr) -> bool:
+        """Check if a type expression is ScopedPtr"""
+        return is_form(type_expr, 'ScopedPtr')
+
+    def _get_scoped_pointee_type(self, type_expr: SExpr) -> str:
+        """Get C type of pointee from ScopedPtr type"""
+        if is_form(type_expr, 'ScopedPtr') and len(type_expr) >= 2:
+            return self.to_c_type(type_expr[1])
+        return 'void'
 
     def _parse_parameter_mode(self, param: SExpr) -> tuple:
         """Extract (mode, name, type) from parameter form.
@@ -1494,6 +1529,9 @@ class Transpiler:
         # Track field types for pointer detection
         self.record_fields[raw_name] = {}
 
+        # Track ScopedPtr fields for destructor generation
+        scoped_fields = []
+
         # Determine start index: skip name if bare form
         start_idx = 1
         if len(form) > 1 and isinstance(form[1], Symbol):
@@ -1512,6 +1550,9 @@ class Transpiler:
                     'is_pointer': self._is_pointer_type(field_type_expr),
                     'type': field_type_expr
                 }
+                # Track ScopedPtr fields
+                if self._is_scoped_ptr_type(field_type_expr):
+                    scoped_fields.append((raw_field_name, field_type_expr))
 
         self.indent -= 1
         self.emit(f"}};")
@@ -1521,6 +1562,36 @@ class Transpiler:
 
         # Track with raw name for lookup, but store qualified C type
         self.types[raw_name] = TypeInfo(raw_name, qualified_name)
+
+        # Generate destructor if record has ScopedPtr fields
+        if scoped_fields:
+            self.records_needing_destructor[qualified_name] = scoped_fields
+            self._generate_record_destructor(qualified_name, scoped_fields)
+
+    def _generate_record_destructor(self, type_name: str, scoped_fields: list):
+        """Generate destructor function for record with ScopedPtr fields"""
+        if type_name in self.generated_destructors:
+            return
+        self.generated_destructors.add(type_name)
+
+        self.emit(f"void {type_name}_free({type_name}* ptr) {{")
+        self.indent += 1
+        self.emit("if (!ptr) return;")
+
+        for raw_field_name, field_type_expr in scoped_fields:
+            c_field = self.to_c_name(raw_field_name)
+            # Get the pointee type to check if it needs a destructor
+            pointee_type = self._get_scoped_pointee_type(field_type_expr)
+            # Check if pointee has its own destructor
+            if pointee_type.rstrip('*') in self.records_needing_destructor:
+                self.emit(f"if (ptr->{c_field}) {pointee_type.rstrip('*')}_free(ptr->{c_field});")
+            else:
+                self.emit(f"if (ptr->{c_field}) free(ptr->{c_field});")
+
+        self.emit("free(ptr);")
+        self.indent -= 1
+        self.emit("}")
+        self.emit("")
 
     def transpile_enum(self, raw_name: str, qualified_name: str, form: SList):
         """Transpile enum
@@ -1874,11 +1945,27 @@ class Transpiler:
         bindings = expr[1]
         body = expr.items[2:]
 
+        # Push scope for ScopedPtr tracking
+        self._push_scoped_scope()
+
         # Emit bindings
         for binding in bindings:
             raw_name = binding[0].name
             var_name = self.to_c_name(raw_name)
-            init_expr = binding[1]
+
+            # Handle typed bindings: (name Type init) vs untyped: (name init)
+            if len(binding) >= 3:
+                # Typed binding: (name Type init)
+                type_expr = binding[1]
+                init_expr = binding[2]
+
+                # Check if this is a ScopedPtr binding
+                if self._is_scoped_ptr_type(type_expr):
+                    pointee_c_type = self._get_scoped_pointee_type(type_expr)
+                    self._register_scoped(raw_name, pointee_c_type)
+            else:
+                # Untyped binding: (name init)
+                init_expr = binding[1]
 
             # Track variable type for type flow analysis
             inferred_type = self._infer_type(init_expr)
@@ -1913,21 +2000,55 @@ class Transpiler:
                 # Type inference would go here; for now use auto
                 self.emit(f"__auto_type {var_name} = {var_expr};")
 
-        # Emit body
-        for i, item in enumerate(body):
-            is_last = (i == len(body) - 1)
-            self.transpile_statement(item, is_return and is_last)
+        # Pop scope now to check if we need special return handling
+        scoped = self._pop_scoped_scope()
+
+        # If returning and have scoped vars, need to capture value before cleanup
+        if is_return and scoped and body:
+            # Emit all but last statement normally
+            for item in body[:-1]:
+                self.transpile_statement(item, False)
+
+            # For last statement, capture into temp, cleanup, then return
+            last_expr = body[-1]
+            result_var = f"__scoped_result_{id(last_expr)}"
+            result_code = self.transpile_expr(last_expr)
+            self.emit(f"__auto_type {result_var} = {result_code};")
+            self._emit_scoped_cleanup(scoped)
+            self.emit(f"return {result_var};")
+        else:
+            # Normal case: emit body, then cleanup
+            for i, item in enumerate(body):
+                is_last = (i == len(body) - 1)
+                self.transpile_statement(item, is_return and is_last)
+
+            if scoped:
+                self._emit_scoped_cleanup(scoped)
 
     def transpile_let_with_capture(self, expr: SList, capture_var: str):
         """Transpile let binding, capturing the final value in a variable"""
         bindings = expr[1]
         body = expr.items[2:]
 
+        # Push scope for ScopedPtr tracking
+        self._push_scoped_scope()
+
         # Emit bindings
         for binding in bindings:
             raw_name = binding[0].name
             var_name = self.to_c_name(raw_name)
-            init_expr = binding[1]
+
+            # Handle typed bindings: (name Type init) vs untyped: (name init)
+            if len(binding) >= 3:
+                type_expr = binding[1]
+                init_expr = binding[2]
+
+                # Check if this is a ScopedPtr binding
+                if self._is_scoped_ptr_type(type_expr):
+                    pointee_c_type = self._get_scoped_pointee_type(type_expr)
+                    self._register_scoped(raw_name, pointee_c_type)
+            else:
+                init_expr = binding[1]
 
             # Register pointer variables
             if self._is_pointer_expr(init_expr):
@@ -1954,6 +2075,11 @@ class Transpiler:
                     self.emit(f"{capture_var} = {code};")
             else:
                 self.transpile_statement(item, False)
+
+        # Pop scope and emit cleanup for ScopedPtr variables
+        scoped = self._pop_scoped_scope()
+        if scoped:
+            self._emit_scoped_cleanup(scoped)
 
     def transpile_if(self, expr: SList, is_return: bool):
         """Transpile if expression"""
@@ -2536,7 +2662,9 @@ class Transpiler:
                     for binding in bindings.items:
                         if isinstance(binding, SList) and len(binding) >= 2:
                             var_name = self.to_c_name(binding[0].name)
-                            val = self.transpile_expr(binding[1])
+                            # Handle typed bindings: (name Type init) vs untyped: (name init)
+                            init_expr = binding[2] if len(binding) >= 3 else binding[1]
+                            val = self.transpile_expr(init_expr)
                             parts.append(f" __auto_type {var_name} = {val};")
 
                     # Emit body items (all but last as statements)
@@ -3334,6 +3462,11 @@ class Transpiler:
                         # (Ptr Storage) where Storage is Invoice[100] -> Invoice*
                         return type_info.c_type
                 inner = self.to_c_type(type_expr[1])
+                return f"{inner}*"
+
+            if head == 'ScopedPtr':
+                # ScopedPtr generates same C type as Ptr, cleanup is semantic
+                inner = self.to_c_type(type_expr[1]) if len(type_expr) > 1 else 'void'
                 return f"{inner}*"
 
             if head == 'Option':
