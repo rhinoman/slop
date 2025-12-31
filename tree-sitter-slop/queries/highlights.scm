@@ -37,7 +37,7 @@
     "fn" "sig" "impl" "module" "export" "import"
     "type" "const" "record" "enum" "union"
     "structure" "logic"
-    "let" "let*"
+    "let" "let*" "mut"
     "if" "cond" "match" "when"
     "while" "for" "for-each" "do"
     "hole" "ffi" "ffi-struct"))

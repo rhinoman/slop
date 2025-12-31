@@ -81,10 +81,15 @@ class Transpiler:
         self.generated_inline_records: Dict[str, str] = {}  # Track inline record types: type_name -> struct_body
         self.emitted_generated_types: Set[str] = set()  # Track which generated types have been emitted (to avoid duplicates)
 
+        # Static literal tracking for immutable collection literals
+        self.literal_counter: int = 0  # Counter for unique static literal names
+        self.static_literals: List[str] = []  # Static array declarations for list/map literals
+
         # ScopedPtr tracking - stack of scopes, each maps var_name -> pointee_c_type
         self.scoped_vars: List[Dict[str, str]] = [{}]
         self.records_needing_destructor: Dict[str, List[str]] = {}  # record_name -> [scoped_field_names]
         self.generated_destructors: Set[str] = set()  # Track which destructors have been generated
+        self.uses_scoped_ptr: bool = False  # Track if ScopedPtr/make-scoped is used (for auto-including stdlib.h)
 
         # Module system support
         self.current_module: Optional[str] = None  # Current module being transpiled
@@ -244,16 +249,20 @@ class Transpiler:
         """Transform C type based on parameter mode.
 
         - 'in':  Pass by value (default, unchanged)
-        - 'out': Always pointer (uninitialized)
-        - 'mut': Always pointer (initialized/mutable)
+        - 'out': Always pointer (output parameter)
+        - 'mut': Mutable - no type change (value types stay values, pointers stay pointers)
         """
         if mode == 'in':
             # Pass by value - no change
             return c_type
-        elif mode == 'out' or mode == 'mut':
-            # Always pointer for out/mut
+        elif mode == 'out':
+            # 'out' always needs pointer for output
             if not c_type.endswith('*'):
                 return f"{c_type}*"
+            return c_type
+        elif mode == 'mut':
+            # 'mut' on value types = mutable local copy (no pointer added)
+            # 'mut' on pointer types = mutable through pointer (unchanged)
             return c_type
 
         return c_type
@@ -327,6 +336,99 @@ class Transpiler:
         self.output = saved_output
         self.indent = saved_indent
         return result
+
+    def _transpile_print(self, arg_expr: SExpr, newline: bool) -> str:
+        """Transpile print/println with type-aware format specifier.
+
+        Supports:
+        - String: printf("%s", arg.data)
+        - Int/range types: printf("%lld", (long long)arg)
+        - Bool: printf("%s", arg ? "true" : "false")
+        - Float: printf("%f", arg)
+        """
+        nl = "\\n" if newline else ""
+
+        # Check if it's a string literal - bypass SLOP_STR wrapper
+        if isinstance(arg_expr, String):
+            escaped = arg_expr.value.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+            return f'printf("%s{nl}", "{escaped}")'
+
+        arg = self.transpile_expr(arg_expr)
+
+        # Check type through various means
+        arg_type = self._get_print_arg_type(arg_expr)
+
+        if arg_type == 'String':
+            return f'printf("%s{nl}", ({arg}).data)'
+        elif arg_type == 'Bool':
+            return f'printf("%s{nl}", ({arg}) ? "true" : "false")'
+        elif arg_type == 'Float':
+            return f'printf("%f{nl}", ({arg}))'
+        elif arg_type in ('Char',):
+            return f'printf("%c{nl}", ({arg}))'
+        else:
+            # Default to integer (Int, range types, etc.)
+            return f'printf("%lld{nl}", (long long)({arg}))'
+
+    def _get_print_arg_type(self, expr: SExpr) -> str:
+        """Determine the type category of a print argument.
+
+        Returns: 'String', 'Bool', 'Float', 'Char', or 'Int' (default for integers/ranges)
+        """
+        # Number literal
+        if isinstance(expr, Number):
+            if isinstance(expr.value, float) or '.' in str(expr.value):
+                return 'Float'
+            return 'Int'
+
+        # String literal
+        if isinstance(expr, String):
+            return 'String'
+
+        # Symbol - look up in var_types
+        if isinstance(expr, Symbol):
+            name = expr.name
+            if name in ('true', 'false'):
+                return 'Bool'
+            if name in self.var_types:
+                var_type = self.var_types[name]
+                return self._classify_c_type(var_type)
+            return 'Int'  # Default for unknown variables
+
+        # SList - function call or expression
+        if isinstance(expr, SList) and len(expr) >= 1:
+            head = expr[0]
+            if isinstance(head, Symbol):
+                op = head.name
+                # Comparison operators return bool
+                if op in ('==', '!=', '<', '<=', '>', '>=', 'and', 'or', 'not'):
+                    return 'Bool'
+                # Arithmetic returns the type of operands (assume Int for now)
+                if op in ('+', '-', '*', '/', '%'):
+                    return 'Int'
+                # String operations
+                if op == 'string-concat':
+                    return 'String'
+                # Field access - try to infer
+                if op == '.':
+                    field_type = self._get_expr_type(expr)
+                    if field_type:
+                        return self._classify_c_type(field_type)
+
+        return 'Int'  # Default
+
+    def _classify_c_type(self, c_type: str) -> str:
+        """Classify a C type name into print categories."""
+        if c_type in ('bool', 'Bool', '_Bool'):
+            return 'Bool'
+        if c_type in ('float', 'double', 'Float'):
+            return 'Float'
+        if c_type in ('char', 'Char'):
+            return 'Char'
+        if 'String' in c_type or 'slop_string' in c_type:
+            return 'String'
+        # Everything else is treated as integer
+        return 'Int'
 
     def _transpile_option_constructor_with_type(self, expr: SExpr, option_c_type: str) -> str:
         """Transpile an expression, using the given Option C type for some/none constructors.
@@ -1023,6 +1125,7 @@ class Transpiler:
         self.ffi_structs = {}
         self.ffi_struct_fields = {}
         self.ffi_includes = []
+        self.uses_scoped_ptr = False  # Reset for this transpilation
 
         # Check for unfilled holes - cannot transpile incomplete code
         all_holes = []
@@ -1039,6 +1142,11 @@ class Transpiler:
                 self._register_ffi(form)
             elif is_form(form, 'ffi-struct'):
                 self._register_ffi_struct(form)
+
+        # Pre-scan for ScopedPtr/make-scoped usage to auto-include stdlib.h
+        self._prescan_for_scoped_ptr(ast)
+        if self.uses_scoped_ptr and 'stdlib.h' not in self.ffi_includes:
+            self.ffi_includes.append('stdlib.h')
 
         # Header
         self.emit("/* Generated by SLOP transpiler */")
@@ -1091,13 +1199,25 @@ class Transpiler:
         for form in functions:
             self._scan_function_types(form)
 
-        # Emit generated Option/List/Result types BEFORE struct definitions
-        self._emit_generated_types()
-
-        # Process all type definitions
+        # FIRST PASS: Emit range types and simple aliases
+        # These must come before generated types like slop_list_Natural that reference them
         for form in types:
             if is_form(form, 'type'):
-                self.transpile_type(form)
+                type_expr = form[2]
+                # Only process range types/aliases (not records, enums, unions)
+                if not is_form(type_expr, 'record') and not is_form(type_expr, 'enum') and not is_form(type_expr, 'union'):
+                    self.transpile_type(form)
+
+        # SECOND: Emit generated Option/List/Result types (now base types are defined)
+        self._emit_generated_types()
+
+        # THIRD PASS: Process records, enums, unions
+        for form in types:
+            if is_form(form, 'type'):
+                type_expr = form[2]
+                # Process records, enums, unions (skip range types already processed)
+                if is_form(type_expr, 'record') or is_form(type_expr, 'enum') or is_form(type_expr, 'union'):
+                    self.transpile_type(form)
             elif is_form(form, 'record'):
                 name = form[1].name if len(form) > 1 and isinstance(form[1], Symbol) else "unnamed"
                 self.transpile_record(name, form)
@@ -1105,9 +1225,20 @@ class Transpiler:
                 name = form[1].name if len(form) > 1 and isinstance(form[1], Symbol) else "unnamed"
                 self.transpile_enum(name, form)
 
+        # Track position where types end (for inserting static literals)
+        types_end_pos = len(self.output)
+
         # Process all functions
         for form in functions:
             self.transpile_function(form)
+
+        # Insert static literals after types, before functions
+        if self.static_literals:
+            static_section = ["", "/* Static backing arrays for immutable list literals */"]
+            static_section.extend(self.static_literals)
+            static_section.append("")
+            # Insert at the position after types
+            self.output[types_end_pos:types_end_pos] = static_section
 
         return '\n'.join(self.output)
 
@@ -1384,9 +1515,12 @@ class Transpiler:
         param_strs = []
         for p in params:
             if isinstance(p, SList) and len(p) >= 2:
-                pname = self.to_c_name(p[0].name)
-                ptype = self.to_c_type(p[1])
-                param_strs.append(f"{ptype} {pname}")
+                mode, raw_pname, ptype_expr = self._parse_parameter_mode(p)
+                if raw_pname and ptype_expr:
+                    pname = self.to_c_name(raw_pname)
+                    ptype = self.to_c_type(ptype_expr)
+                    ptype = self._apply_parameter_mode(mode, ptype)
+                    param_strs.append(f"{ptype} {pname}")
 
         self.emit(f"{return_type} {name}({', '.join(param_strs) or 'void'});")
 
@@ -1950,22 +2084,32 @@ class Transpiler:
 
         # Emit bindings
         for binding in bindings:
-            raw_name = binding[0].name
+            # Skip 'mut' keyword if present: (mut name init) or (mut name Type init)
+            idx = 0
+            if isinstance(binding[0], Symbol) and binding[0].name == 'mut':
+                idx = 1
+
+            raw_name = binding[idx].name
             var_name = self.to_c_name(raw_name)
 
-            # Handle typed bindings: (name Type init) vs untyped: (name init)
-            if len(binding) >= 3:
-                # Typed binding: (name Type init)
-                type_expr = binding[1]
-                init_expr = binding[2]
+            # Handle typed bindings: (name Type init) or (mut name Type init)
+            if len(binding) >= idx + 3:
+                # Typed binding
+                type_expr = binding[idx + 1]
+                init_expr = binding[idx + 2]
 
                 # Check if this is a ScopedPtr binding
                 if self._is_scoped_ptr_type(type_expr):
                     pointee_c_type = self._get_scoped_pointee_type(type_expr)
                     self._register_scoped(raw_name, pointee_c_type)
             else:
-                # Untyped binding: (name init)
-                init_expr = binding[1]
+                # Untyped binding: (name init) or (mut name init)
+                init_expr = binding[idx + 1]
+
+            # Check if init expression is make-scoped (register for auto-cleanup)
+            if is_form(init_expr, 'make-scoped') and len(init_expr) >= 2:
+                pointee_c_type = self.to_c_type(init_expr[1])
+                self._register_scoped(raw_name, pointee_c_type)
 
             # Track variable type for type flow analysis
             inferred_type = self._infer_type(init_expr)
@@ -2035,20 +2179,31 @@ class Transpiler:
 
         # Emit bindings
         for binding in bindings:
-            raw_name = binding[0].name
+            # Skip 'mut' keyword if present: (mut name init) or (mut name Type init)
+            idx = 0
+            if isinstance(binding[0], Symbol) and binding[0].name == 'mut':
+                idx = 1
+
+            raw_name = binding[idx].name
             var_name = self.to_c_name(raw_name)
 
-            # Handle typed bindings: (name Type init) vs untyped: (name init)
-            if len(binding) >= 3:
-                type_expr = binding[1]
-                init_expr = binding[2]
+            # Handle typed bindings: (name Type init) or (mut name Type init)
+            if len(binding) >= idx + 3:
+                type_expr = binding[idx + 1]
+                init_expr = binding[idx + 2]
 
                 # Check if this is a ScopedPtr binding
                 if self._is_scoped_ptr_type(type_expr):
                     pointee_c_type = self._get_scoped_pointee_type(type_expr)
                     self._register_scoped(raw_name, pointee_c_type)
             else:
-                init_expr = binding[1]
+                # Untyped binding: (name init) or (mut name init)
+                init_expr = binding[idx + 1]
+
+            # Check if init expression is make-scoped (register for auto-cleanup)
+            if is_form(init_expr, 'make-scoped') and len(init_expr) >= 2:
+                pointee_c_type = self.to_c_type(init_expr[1])
+                self._register_scoped(raw_name, pointee_c_type)
 
             # Register pointer variables
             if self._is_pointer_expr(init_expr):
@@ -2811,6 +2966,20 @@ class Transpiler:
                         size = self.transpile_expr(size_expr)
                         return f"slop_arena_alloc({arena}, {size})"
 
+                if op == 'make-scoped':
+                    # (make-scoped Type count) -> malloc allocation with auto-cleanup
+                    self.uses_scoped_ptr = True
+                    type_arg = expr[1]
+                    c_type = self.to_c_type(type_arg)
+
+                    if len(expr) > 2:
+                        # (make-scoped Type count) -> allocate count elements
+                        count = self.transpile_expr(expr[2])
+                        return f"({c_type}*)malloc(sizeof({c_type}) * ({count}))"
+                    else:
+                        # (make-scoped Type) -> allocate single element
+                        return f"({c_type}*)malloc(sizeof({c_type}))"
+
                 if op == 'sizeof':
                     type_expr = expr[1]
                     # Handle both simple and complex type expressions
@@ -3092,12 +3261,10 @@ class Transpiler:
 
                 # I/O
                 if op == 'println':
-                    arg = self.transpile_expr(expr[1])
-                    return f'printf("%s\\n", ({arg}).data)'
+                    return self._transpile_print(expr[1], newline=True)
 
                 if op == 'print':
-                    arg = self.transpile_expr(expr[1])
-                    return f'printf("%s", ({arg}).data)'
+                    return self._transpile_print(expr[1], newline=False)
 
                 # Data construction
                 if op == 'list':
@@ -3128,14 +3295,29 @@ class Transpiler:
                             return f"(({list_type}){{ .data = NULL, .len = 0, .cap = 0 }})"
                         return "(slop_list_ptr){ .data = NULL, .len = 0, .cap = 0 }"
                     elems_str = ", ".join(elements)
+
+                    # Use static array for immutable list literal (safe to return from functions)
+                    lit_name = f"_slop_lit_{self.literal_counter}"
+                    self.literal_counter += 1
+
                     if list_type and elem_type:
-                        return f"(({list_type}){{ .data = ({elem_type}[]){{{elems_str}}}, .len = {n}, .cap = {n} }})"
+                        # Add static declaration for the backing array
+                        self.static_literals.append(
+                            f"static const {elem_type} {lit_name}[] = {{{elems_str}}};"
+                        )
+                        return f"(({list_type}){{ .data = ({elem_type}*){lit_name}, .len = {n}, .cap = {n} }})"
                     elif elem_type:
                         # Have explicit element type but no list type context
-                        return f"(slop_list_ptr){{ .data = ({elem_type}[]){{{elems_str}}}, .len = {n}, .cap = {n} }}"
+                        self.static_literals.append(
+                            f"static const {elem_type} {lit_name}[] = {{{elems_str}}};"
+                        )
+                        return f"(slop_list_ptr){{ .data = ({elem_type}*){lit_name}, .len = {n}, .cap = {n} }}"
                     # Fall back to void* array with casted elements
                     casted_elems = ", ".join([f"(void*)(intptr_t)({e})" for e in elements])
-                    return f"(slop_list_ptr){{ .data = (void*[]){{{casted_elems}}}, .len = {n}, .cap = {n} }}"
+                    self.static_literals.append(
+                        f"static void* const {lit_name}[] = {{{casted_elems}}};"
+                    )
+                    return f"(slop_list_ptr){{ .data = {lit_name}, .len = {n}, .cap = {n} }}"
 
                 if op == 'array':
                     # (array Type) with just a type = empty array, zero-initialized
@@ -3222,10 +3404,16 @@ class Transpiler:
                         # Empty map
                         return "(slop_map){ .entries = NULL, .len = 0, .cap = 0 }"
 
-                    # Generate compound literal with entries
-                    # Cast values to void* for slop_map_entry compatibility
+                    # Use static array for immutable map literal (safe to return from functions)
+                    lit_name = f"_slop_lit_{self.literal_counter}"
+                    self.literal_counter += 1
+
+                    # Generate static array declaration for the entries
                     entries = ", ".join([f"{{ .key = {k}, .value = (void*)(intptr_t)({v}), .occupied = true }}" for k, v in pairs])
-                    return f"(slop_map){{ .entries = (slop_map_entry[]){{{entries}}}, .len = {n}, .cap = {n} }}"
+                    self.static_literals.append(
+                        f"static slop_map_entry {lit_name}[] = {{{entries}}};"
+                    )
+                    return f"(slop_map){{ .entries = {lit_name}, .len = {n}, .cap = {n} }}"
 
                 # Union construction: (union-new Type Tag value?)
                 if op == 'union-new':
@@ -3466,6 +3654,7 @@ class Transpiler:
 
             if head == 'ScopedPtr':
                 # ScopedPtr generates same C type as Ptr, cleanup is semantic
+                self.uses_scoped_ptr = True  # Track for auto-including stdlib.h
                 inner = self.to_c_type(type_expr[1]) if len(type_expr) > 1 else 'void'
                 return f"{inner}*"
 
@@ -3545,6 +3734,30 @@ class Transpiler:
                 return self.types[head].c_type
 
         return "void*"
+
+    def _prescan_for_scoped_ptr(self, ast: List[SExpr]):
+        """Pre-scan AST to detect if ScopedPtr or make-scoped is used.
+
+        This must be called before emitting includes so we can auto-include
+        stdlib.h when needed for malloc/free.
+        """
+        def scan_expr(expr: SExpr) -> bool:
+            if isinstance(expr, SList) and len(expr) >= 1:
+                head = expr[0]
+                if isinstance(head, Symbol):
+                    # Check for ScopedPtr type or make-scoped call
+                    if head.name == 'ScopedPtr' or head.name == 'make-scoped':
+                        return True
+                # Recursively scan children
+                for item in expr.items:
+                    if scan_expr(item):
+                        return True
+            return False
+
+        for form in ast:
+            if scan_expr(form):
+                self.uses_scoped_ptr = True
+                return
 
     def _scan_type_definition(self, form: SList):
         """Pre-scan type definition to discover needed generic types.
@@ -3802,7 +4015,7 @@ class Transpiler:
         'string-len', 'string-concat', 'string-eq', 'string-new', 'string-slice',
         'string-split', 'int-to-string',
         # Arena/memory operations
-        'arena-new', 'arena-alloc', 'arena-free',
+        'arena-new', 'arena-alloc', 'arena-free', 'make-scoped',
         # List operations
         'list-new', 'list-push', 'list-get', 'list-len',
         # Map operations
@@ -3949,6 +4162,14 @@ def transpile_multi(modules: dict, order: list) -> str:
                 from slop.parser import String
                 if isinstance(form[1], String):
                     ffi_includes.add(form[1].value)
+
+    # Pre-scan all modules for ScopedPtr/make-scoped usage
+    for name in order:
+        info = modules[name]
+        transpiler._prescan_for_scoped_ptr(info.ast)
+        if transpiler.uses_scoped_ptr:
+            ffi_includes.add('stdlib.h')
+            break
 
     for header in sorted(ffi_includes):
         transpiler.emit(f'#include <{header}>')
@@ -4131,6 +4352,11 @@ def transpile_multi_split(modules: dict, order: list) -> dict:
                 if isinstance(form[1], String):
                     ffi_includes.add(form[1].value)
 
+        # Pre-scan for ScopedPtr/make-scoped usage
+        transpiler._prescan_for_scoped_ptr(module_forms)
+        if transpiler.uses_scoped_ptr:
+            ffi_includes.add('stdlib.h')
+
         # Register FFI functions and structs
         for form in module_forms:
             if is_form(form, 'ffi'):
@@ -4305,6 +4531,13 @@ def transpile_multi_split(modules: dict, order: list) -> dict:
         transpiler.output = []
         for fn in functions:
             transpiler.transpile_function(fn)
+
+        # Static literals need to be emitted before functions that use them
+        if transpiler.static_literals:
+            impl_lines.append("/* Static backing arrays for immutable list literals */")
+            impl_lines.extend(transpiler.static_literals)
+            impl_lines.append("")
+
         if transpiler.output:
             impl_lines.extend(transpiler.output)
 

@@ -196,6 +196,11 @@ class TypeChecker:
         self._param_modes: Dict[str, str] = {}
         # Track which 'out' parameters have been initialized (written to)
         self._out_initialized: Set[str] = set()
+        # Track which variables hold mutable collections (from list-new, map-new)
+        # Immutable literals (list, map) are not added here
+        self._mutable_collections: Set[str] = set()
+        # Track which variables are declared as mutable (with 'mut' keyword in let)
+        self._mutable_vars: Set[str] = set()
         # Track current function's return type (for ? operator validation)
         self._current_fn_return_type: Optional[Type] = None
         # Register built-in functions
@@ -823,6 +828,14 @@ class TypeChecker:
         if op == 'with-arena':
             return self._infer_with_arena(expr)
 
+        # Loop constructs
+        if op == 'for':
+            return self._infer_for(expr)
+        if op == 'for-each':
+            return self._infer_for_each(expr)
+        if op == 'while':
+            return self._infer_while(expr)
+
         # Function call
         return self._infer_call(expr)
 
@@ -1349,26 +1362,221 @@ class TypeChecker:
             )
 
     def _infer_let(self, expr: SList) -> Type:
-        """Infer type of let expression"""
+        """Infer type of let expression.
+
+        Syntax:
+          (let ((x init)) body)           - immutable binding
+          (let ((mut x init)) body)       - mutable binding (allows set!)
+          (let ((mut x Type init)) body)  - mutable with explicit type
+        """
         if len(expr) < 2:
             return UNKNOWN
 
         self.env.push_scope()
+        # Track which mutable collections are bound in this scope
+        scope_mutable_collections: Set[str] = set()
+        # Track which mutable vars are bound in this scope (for cleanup)
+        scope_mutable_vars: Set[str] = set()
 
         bindings = expr[1] if isinstance(expr[1], SList) else SList([])
         for binding in bindings:
             if isinstance(binding, SList) and len(binding) >= 2:
-                var_name = binding[0].name if isinstance(binding[0], Symbol) else str(binding[0])
-                var_type = self.infer_expr(binding[1])
+                is_mut = False
+                idx = 0
+
+                # Check for mut keyword at start of binding
+                if isinstance(binding[0], Symbol) and binding[0].name == 'mut':
+                    is_mut = True
+                    idx = 1
+
+                if idx >= len(binding):
+                    continue  # Malformed binding
+
+                var_name = binding[idx].name if isinstance(binding[idx], Symbol) else str(binding[idx])
+
+                # Check for explicit type annotation: (mut x Type init) or (x Type init)
+                if len(binding) > idx + 2:
+                    # Has explicit type annotation
+                    type_expr = binding[idx + 1]
+                    init_expr = binding[idx + 2]
+                    var_type = self.parse_type_expr(type_expr)
+                    # Type check the init expr against declared type
+                    init_type = self.infer_expr(init_expr)
+                    self._check_assignable(init_type, var_type, f"binding '{var_name}'", init_expr)
+                else:
+                    # No explicit type - infer from init
+                    init_expr = binding[idx + 1]
+                    var_type = self.infer_expr(init_expr)
+
+                    # Widen singleton range types for mut variables
+                    # This allows (let ((mut total 0)) (set! total (+ total 1)))
+                    if is_mut and isinstance(var_type, RangeType):
+                        # Widen to the base type (Int, I32, etc.)
+                        var_type = PrimitiveType(var_type.base)
+
                 self.env.bind_var(var_name, var_type)
+
+                # Track mutable variables
+                if is_mut:
+                    self._mutable_vars.add(var_name)
+                    scope_mutable_vars.add(var_name)
+
+                # Track if this is a mutable collection (list-new or map-new)
+                if self._is_mutable_collection_constructor(init_expr):
+                    self._mutable_collections.add(var_name)
+                    scope_mutable_collections.add(var_name)
 
         # Infer body type
         body_type = PrimitiveType('Unit')
         for body_expr in expr.items[2:]:
             body_type = self.infer_expr(body_expr)
 
+        # Clean up mutable collection tracking for this scope
+        for var_name in scope_mutable_collections:
+            self._mutable_collections.discard(var_name)
+
+        # Clean up mutable var tracking for this scope
+        for var_name in scope_mutable_vars:
+            self._mutable_vars.discard(var_name)
+
         self.env.pop_scope()
         return body_type
+
+    def _is_mutable_collection_constructor(self, expr: SExpr) -> bool:
+        """Check if expression creates a mutable collection (list-new or map-new)."""
+        if isinstance(expr, SList) and len(expr) >= 1:
+            head = expr[0]
+            if isinstance(head, Symbol):
+                return head.name in ('list-new', 'map-new')
+        return False
+
+    def _infer_for(self, expr: SList) -> Type:
+        """Infer type of for loop: (for (var start end) body...)
+
+        The loop variable is bound to a range type based on the bounds.
+        """
+        if len(expr) < 2:
+            return UNIT
+
+        binding = expr[1]
+        if not isinstance(binding, SList) or len(binding) < 3:
+            self.error("for loop requires (var start end) binding", expr)
+            return UNIT
+
+        var_name = binding[0].name if isinstance(binding[0], Symbol) else str(binding[0])
+        start_type = self.infer_expr(binding[1])
+        end_type = self.infer_expr(binding[2])
+
+        # Validate start and end are numeric
+        if not self._is_numeric_type(start_type):
+            self.error(f"for loop start must be numeric, got {start_type}", binding[1])
+        if not self._is_numeric_type(end_type):
+            self.error(f"for loop end must be numeric, got {end_type}", binding[2])
+
+        # Compute loop variable type from bounds
+        # For (for (i 0 count) ...) where count is (Int 0 .. 100),
+        # the loop variable i ranges from start to end-1
+        loop_var_type = self._compute_for_loop_var_type(start_type, end_type)
+
+        # Type-check body with loop variable bound
+        self.env.push_scope()
+        self.env.bind_var(var_name, loop_var_type)
+
+        for body_expr in expr.items[2:]:
+            self.infer_expr(body_expr)
+
+        self.env.pop_scope()
+        return UNIT
+
+    def _compute_for_loop_var_type(self, start_type: Type, end_type: Type) -> Type:
+        """Compute the type of a for loop variable from its bounds.
+
+        The loop variable ranges from start to end-1 (exclusive upper bound).
+        """
+        # Get the minimum value from start
+        start_min = None
+        if isinstance(start_type, RangeType):
+            start_min = start_type.bounds.min_val
+        elif isinstance(start_type, PrimitiveType) and start_type.name == 'Int':
+            start_min = None  # Unbounded
+
+        # Get the maximum value from end (subtract 1 for exclusive bound)
+        end_max = None
+        if isinstance(end_type, RangeType):
+            if end_type.bounds.max_val is not None:
+                end_max = end_type.bounds.max_val - 1
+            else:
+                end_max = None  # Unbounded
+        elif isinstance(end_type, PrimitiveType) and end_type.name == 'Int':
+            end_max = None  # Unbounded
+
+        # If we have concrete bounds, create a range type
+        if start_min is not None or end_max is not None:
+            return RangeType('Int', RangeBounds(start_min, end_max))
+
+        # Fall back to unbounded Int
+        return INT
+
+    def _infer_for_each(self, expr: SList) -> Type:
+        """Infer type of for-each loop: (for-each (var collection) body...)
+
+        The loop variable is bound to the element type of the collection.
+        """
+        if len(expr) < 2:
+            return UNIT
+
+        binding = expr[1]
+        if not isinstance(binding, SList) or len(binding) < 2:
+            self.error("for-each loop requires (var collection) binding", expr)
+            return UNIT
+
+        var_name = binding[0].name if isinstance(binding[0], Symbol) else str(binding[0])
+        collection_type = self.infer_expr(binding[1])
+
+        # Determine element type from collection
+        element_type = UNKNOWN
+        if isinstance(collection_type, ListType):
+            element_type = collection_type.element_type
+        elif isinstance(collection_type, PrimitiveType) and collection_type.name == 'String':
+            element_type = PrimitiveType('Char')
+        else:
+            self.error(f"for-each requires a List or String, got {collection_type}", binding[1])
+
+        # Type-check body with loop variable bound
+        self.env.push_scope()
+        self.env.bind_var(var_name, element_type)
+
+        for body_expr in expr.items[2:]:
+            self.infer_expr(body_expr)
+
+        self.env.pop_scope()
+        return UNIT
+
+    def _infer_while(self, expr: SList) -> Type:
+        """Infer type of while loop: (while condition body...)
+
+        Condition must be Bool.
+        """
+        if len(expr) < 2:
+            return UNIT
+
+        cond_type = self.infer_expr(expr[1])
+        if not isinstance(cond_type, PrimitiveType) or cond_type.name != 'Bool':
+            self.error(f"while condition must be Bool, got {cond_type}", expr[1])
+
+        # Type-check body
+        for body_expr in expr.items[2:]:
+            self.infer_expr(body_expr)
+
+        return UNIT
+
+    def _is_numeric_type(self, t: Type) -> bool:
+        """Check if a type is numeric (Int, Float, or range type)"""
+        if isinstance(t, RangeType):
+            return True
+        if isinstance(t, PrimitiveType):
+            return t.name in ('Int', 'Float', 'I8', 'I16', 'I32', 'I64', 'U8', 'U16', 'U32', 'U64')
+        return False
 
     def _infer_do(self, expr: SList) -> Type:
         """Infer type of do block - returns last expression's type"""
@@ -1465,8 +1673,9 @@ class TypeChecker:
                         self._check_assignable(value_type, target_type, f"assignment to '{name}'", expr[2])
                 else:
                     # Simple variable assignment
-                    # Check parameter mode constraints
+                    # Check mutability: must be either a mut let binding or a mutable parameter
                     if name in self._param_modes:
+                        # Parameter - check mode constraints
                         mode = self._param_modes[name]
                         if mode == 'in':
                             self.error(f"Cannot assign to 'in' parameter '{name}'", target,
@@ -1474,6 +1683,12 @@ class TypeChecker:
                         elif mode == 'out':
                             # Mark out parameter as initialized
                             self._out_initialized.add(name)
+                        # 'mut' and 'out' modes allow assignment
+                    elif name not in self._mutable_vars:
+                        # Not a mutable parameter and not a mut let binding
+                        self.error(f"Cannot assign to immutable variable '{name}'", target,
+                                  hint="Declare with 'mut' to allow mutation: (let ((mut x 0)) ...)")
+
                     expected = self.env.lookup_var(name)
                     if expected:
                         self._check_assignable(value_type, expected, f"assignment to '{name}'", expr[2])
@@ -1560,13 +1775,72 @@ class TypeChecker:
             self._check_assignable(size_type, INT, "argument 2 to 'arena-alloc'", size_arg)
             return PtrType(UNKNOWN)
 
-        # Special handling for map-put: accepts Map or Ptr<Map>
+        # Special handling for make-scoped
+        # (make-scoped Type) or (make-scoped Type count) -> (ScopedPtr Type)
+        if fn_name == 'make-scoped' and len(args) >= 1:
+            type_arg = args[0]
+            # First arg should be a type name
+            if isinstance(type_arg, Symbol):
+                pointee_type = self.env.lookup_type(type_arg.name)
+                if pointee_type is None:
+                    pointee_type = self.parse_type_expr(type_arg)
+            else:
+                pointee_type = self.parse_type_expr(type_arg)
+
+            # If count arg provided, validate it's an integer
+            if len(args) >= 2:
+                count_arg = args[1]
+                count_type = self.infer_expr(count_arg)
+                # Check if it's a numeric type
+                if not isinstance(count_type, UnknownType):
+                    is_numeric = (isinstance(count_type, RangeType) or
+                                  (isinstance(count_type, PrimitiveType) and
+                                   count_type.name in ('Int', 'I8', 'I16', 'I32', 'I64', 'U8', 'U16', 'U32', 'U64')))
+                    if not is_numeric:
+                        self.error(f"make-scoped count must be integer, got {count_type}", count_arg)
+
+            # Return owning pointer type (ScopedPtr)
+            return PtrType(pointee_type, owning=True)
+
+        # Special handling for list-push: requires mutable list
+        # (list-push list item)
+        if fn_name == 'list-push' and len(args) >= 2:
+            list_arg = args[0]
+            item_arg = args[1]
+            list_type = self.infer_expr(list_arg)
+            self.infer_expr(item_arg)
+
+            # Check mutability - list literals are immutable
+            # But pointers to lists (Ptr List) are always mutable through the pointer
+            if isinstance(list_arg, Symbol):
+                is_ptr_type = isinstance(list_type, PtrType)
+                if not is_ptr_type and list_arg.name not in self._mutable_collections:
+                    self.error(
+                        f"cannot push to immutable list '{list_arg.name}'",
+                        list_arg,
+                        hint="Use (list-new arena Type) to create a mutable list"
+                    )
+            return UNIT
+
+        # Special handling for map-put: requires mutable map
         # (map-put map key val)
         if fn_name == 'map-put' and len(args) == 3:
             map_arg = args[0]
             key_arg = args[1]
             val_arg = args[2]
             map_type = self.infer_expr(map_arg)
+
+            # Check mutability - map literals are immutable
+            # But pointers to maps (Ptr Map) are always mutable through the pointer
+            if isinstance(map_arg, Symbol):
+                is_ptr_type = isinstance(map_type, PtrType)
+                if not is_ptr_type and map_arg.name not in self._mutable_collections:
+                    self.error(
+                        f"cannot put to immutable map '{map_arg.name}'",
+                        map_arg,
+                        hint="Use (map-new arena K V) to create a mutable map"
+                    )
+
             # Accept either Map or Ptr<Map>
             if isinstance(map_type, PtrType) and isinstance(map_type.pointee, MapType):
                 # Pointer to map is valid
@@ -1579,6 +1853,23 @@ class TypeChecker:
             # Infer key and value types (no strict checking for polymorphic maps)
             self.infer_expr(key_arg)
             self.infer_expr(val_arg)
+            return UNIT
+
+        # Special handling for print/println - accept primitives (Int, Bool, String)
+        if fn_name in ('print', 'println') and len(args) == 1:
+            arg_type = self.infer_expr(args[0])
+            # Accept Int (including range types), Bool, or String
+            is_valid = False
+            if isinstance(arg_type, RangeType):
+                is_valid = True
+            elif isinstance(arg_type, PrimitiveType):
+                is_valid = arg_type.name in ('Int', 'Bool', 'String', 'Float',
+                                              'I8', 'I16', 'I32', 'I64',
+                                              'U8', 'U16', 'U32', 'U64', 'Char')
+            elif isinstance(arg_type, RecordType) and arg_type.name == 'String':
+                is_valid = True
+            if not is_valid and not isinstance(arg_type, UnknownType):
+                self.error(f"{fn_name} requires a primitive type (Int, Bool, String), got {arg_type}", args[0])
             return UNIT
 
         fn_type = self.env.lookup_function(fn_name)

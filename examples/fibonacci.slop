@@ -1,0 +1,42 @@
+;; fibonacci.slop
+(module fibonacci
+  (export fib fibonacci-sequence main))
+
+(type Natural (Int 0 ..))
+(type FibIndex (Int 0 .. 100))
+
+(fn fib ((in n FibIndex))
+  (@intent "Calculate the nth Fibonacci number")
+  (@spec ((FibIndex) -> Natural))
+  (@pre (>= n 0))
+  (@post (>= $result 0))
+  (@pure)
+  (@example (0) -> 0)
+  (@example (1) -> 1)
+  (@example (2) -> 1)
+  (@example (5) -> 5)
+  (@example (10) -> 55)
+  (cond
+    ((<= n 1) n)
+    (else (+ (fib (- n 1)) (fib (- n 2))))))
+
+(fn fibonacci-sequence ((in count FibIndex) (in arena Arena))
+  (@intent "Generate a list of the first count Fibonacci numbers")
+  (@spec ((FibIndex Arena) -> (List Natural)))
+  (@pre (> count 0))
+  (@example (1) -> (0))
+  (@example (5) -> (0 1 1 2 3))
+  (@example (10) -> (0 1 1 2 3 5 8 13 21 34))
+  (let ((result (list-new arena Natural)))
+    (for (i 0 count)
+      (list-push result (fib i)))
+    result))
+
+(fn main ()
+  (@intent "Print the first 10 Fibonacci numbers")
+  (@spec (() -> Unit))
+  (with-arena 4096
+    (let ((count (Int 0 .. 100) 10))
+      (let ((seq (fibonacci-sequence count arena)))
+        (for-each (n seq)
+          (println n))))))

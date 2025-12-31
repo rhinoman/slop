@@ -40,7 +40,7 @@
     (@spec ((U64) -> Bool))
     (@pre (> len 0))
     (@post (or (== $result true) (== $result false)))
-    (let ((temp (ScopedPtr U8) (cast (ScopedPtr U8) (malloc 1024))))
+    (let ((temp (make-scoped U8 1024)))
       ;; temp is automatically freed when let scope ends
       (!= temp nil)))
 
@@ -79,9 +79,9 @@
       (puts (cast (Ptr U8) "process-data: SUCCESS (temp buffer allocated and auto-freed)"))
       (puts (cast (Ptr U8) "process-data: FAILED")))
 
-    ;; Test 3: Demonstrate scoped cleanup in local scope
-    (puts (cast (Ptr U8) "\nTesting local scoped pointer..."))
-    (let ((local-buf (ScopedPtr U8) (cast (ScopedPtr U8) (malloc 512))))
+    ;; Test 3: Demonstrate scoped cleanup in local scope using make-scoped
+    (puts (cast (Ptr U8) "\nTesting local scoped pointer with make-scoped..."))
+    (let ((local-buf (make-scoped U8 512)))
       (if (!= local-buf nil)
         (puts (cast (Ptr U8) "Local buffer allocated (will be auto-freed at scope end)"))
         (puts (cast (Ptr U8) "Local buffer allocation failed"))))

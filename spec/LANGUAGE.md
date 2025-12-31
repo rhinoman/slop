@@ -139,8 +139,8 @@ literal     = number | string | 'true | 'false | 'nil
 
 ; Parameter modes
 (fn name ((in param Type)      ; Read-only (default) - pass by value
-          (out param Type)     ; Write-only - pointer to uninitialized
-          (mut param Type))    ; Read-write - pointer to initialized
+          (out param (Ptr T))  ; Write-only - output pointer
+          (mut param Type))    ; Mutable - value or pointer depending on Type
   ...)
 
 ; Memory context (explicit when needed)
@@ -194,8 +194,10 @@ true false nil           ; Boolean and nil
 
 ; Variables and binding
 identifier               ; Variable reference
-(let ((name expr)...) body)
-(let* ((name expr)...) body)
+(let ((name expr)...) body)           ; Immutable bindings (set! disallowed)
+(let ((mut name expr)...) body)       ; Mutable bindings (set! allowed)
+(let ((mut name Type expr)...) body)  ; Mutable with explicit type
+(let* ((name expr)...) body)          ; Sequential bindings
 
 ; Control flow
 (if cond then else)
@@ -237,7 +239,8 @@ identifier               ; Variable reference
 (. expr field)                   ; Field access (see semantics below)
 (@ expr index)                   ; Index access: expr[index]
 (put expr field value)           ; Functional update (returns new)
-(set! expr field value)          ; Mutation (modifies in place)
+(set! var value)                 ; Variable mutation (requires mut binding)
+(set! expr field value)          ; Field mutation (modifies in place)
 (deref ptr)                      ; Dereference pointer: (Ptr T) -> T
 (addr expr)                      ; Address-of: T -> (Ptr T)
 
