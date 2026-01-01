@@ -556,9 +556,17 @@ class ContractVerifier:
         # Declare parameter variables
         for param in params:
             if isinstance(param, SList) and len(param) >= 2:
-                param_name = param[0].name if isinstance(param[0], Symbol) else None
-                param_type_expr = param[1]
-                if param_name:
+                # Handle parameter modes: (name Type) or (in name Type) or (out name Type) or (mut name Type)
+                first = param[0]
+                if isinstance(first, Symbol) and first.name in ('in', 'out', 'mut'):
+                    # Mode is explicit: (in name Type)
+                    param_name = param[1].name if isinstance(param[1], Symbol) else None
+                    param_type_expr = param[2] if len(param) > 2 else None
+                else:
+                    # No mode: (name Type)
+                    param_name = first.name if isinstance(first, Symbol) else None
+                    param_type_expr = param[1]
+                if param_name and param_type_expr:
                     param_type = self.type_checker.parse_type_expr(param_type_expr)
                     translator.declare_variable(param_name, param_type)
 

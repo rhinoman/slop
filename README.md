@@ -27,10 +27,9 @@ SLOP makes the spec the source of truth:
 (fn transfer ((from Account) (to Account) (amount (Int 1 ..)))
   (@intent "Transfer funds between accounts")
   (@spec ((Account Account (Int 1 ..)) -> (Result Receipt Error)))
-  (@pre (!= from to))
-  (@pre (>= (. from balance) amount))
-  (@post (== (+ (. from balance) (. to balance))
-             (+ (old (. from balance)) (old (. to balance)))))
+  (@pre {from != to})
+  (@pre {(. from balance) >= amount})
+  (@post {(. from balance) + (. to balance) == (old (. from balance)) + (old (. to balance))})
   ...)
 ```
 
@@ -60,6 +59,7 @@ SLOP inverts the traditional programming model:
 - **Minimal spec**: ~50 built-ins, entire language fits in a prompt (~4K tokens)
 - **Range types**: `(Int 0 .. 100)` catches bounds errors at compile time (I also like Ada)
 - **Mandatory contracts**: `@intent`, `@spec`, `@pre`, `@post` define correctness
+- **Infix in contracts**: `{x > 0 and x < 100}` — readable math notation in `@pre`/`@post`
 - **Typed holes**: Explicit markers for LLM generation with complexity tiers
 - **Transpiles to C**: Maximum performance, universal FFI, minimal runtime 
 
@@ -68,14 +68,14 @@ SLOP inverts the traditional programming model:
 ```lisp
 (module rate-limiter
   (export (acquire 1))
-  
+
   (type Tokens (Int 0 .. 10000))
-  
+
   (fn acquire ((limiter (Ptr Limiter)))
     (@intent "Try to acquire one token")
     (@spec (((Ptr Limiter)) -> AcquireResult))
-    (@pre (!= limiter nil))
-    
+    (@pre {limiter != nil})
+
     (if (> (. limiter tokens) 0)
       (do
         (set! limiter tokens (- (. limiter tokens) 1))
