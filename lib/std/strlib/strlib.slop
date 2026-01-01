@@ -469,7 +469,7 @@
     (@spec ((Arena String (Int 0 ..) (Int 0 ..)) -> String))
     (@alloc arena)
     (@pure)
-    (@pre (<= start (. s len)))
+    (@pre {start <= (. s len)})
     (@example (arena "hello world" 0 5) -> "hello")
     (@example (arena "hello world" 6 5) -> "world")
     (let ((slen (cast Int (. s len)))

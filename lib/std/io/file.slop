@@ -96,7 +96,7 @@
   (fn file-open ((path String) (mode FileMode))
     (@intent "Open a file with the specified mode, returning a File handle or error")
     (@spec ((String FileMode) -> (Result File FileError)))
-    (@pre (> (. path len) 0))
+    (@pre {(. path len) > 0})
     (@example ("test.txt" 'read) -> (ok (File _ 'read true)))
     (@example ("missing.txt" 'read) -> (error 'not-found))
     (@example ("output.txt" 'write) -> (ok (File _ 'write true)))
@@ -221,7 +221,7 @@
     (@intent "Seek to position in file (whence: 0=start, 1=current, 2=end)")
     (@spec (((Ptr File) I64 Int) -> (Result Bool FileError)))
     (@pre (. (deref f) is-open))
-    (@pre (and (>= whence 0) (<= whence 2)))
+    (@pre {whence >= 0 and whence <= 2})
     (@example (file 0 0) -> (ok true))
     (@example (file -10 2) -> (ok true))
 

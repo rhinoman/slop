@@ -108,7 +108,14 @@
 
    :language 'slop
    :feature 'bracket
-   '(["(" ")"] @font-lock-bracket-face))
+   '(["(" ")" "{" "}"] @font-lock-bracket-face)
+
+   :language 'slop
+   :feature 'infix
+   '((infix_binary ["and" "or"] @font-lock-keyword-face)
+     (infix_binary ["==" "!=" "<" "<=" ">" ">=" "+" "-" "*" "/" "%"] @font-lock-operator-face)
+     (infix_unary "not" @font-lock-keyword-face)
+     (infix_unary "-" @font-lock-operator-face)))
   "Tree-sitter font-lock settings for SLOP.")
 
 ;; Indentation
@@ -116,7 +123,9 @@
   '((slop
      ((parent-is "source_file") column-0 0)
      ((node-is ")") parent-bol 0)
-     ((parent-is "list") parent-bol slop-ts-mode-indent-offset)))
+     ((node-is "}") parent-bol 0)
+     ((parent-is "list") parent-bol slop-ts-mode-indent-offset)
+     ((parent-is "infix_expr") parent-bol slop-ts-mode-indent-offset)))
   "Tree-sitter indentation rules for SLOP.")
 
 ;;;###autoload
@@ -141,7 +150,7 @@
   (setq-local treesit-font-lock-feature-list
               '((comment string)
                 (keyword type annotation)
-                (constant number property operator function definition)
+                (constant number property operator function definition infix)
                 (variable bracket)))
 
   ;; Indentation

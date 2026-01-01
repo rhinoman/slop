@@ -103,12 +103,21 @@ TOPICS = {
 (@pre condition)           ; Input validation, checked on entry
 (@post condition)          ; Output guarantee, $result = return value
 
-; Example
+; Contracts support optional infix notation with curly braces:
+(@pre {x > 0})             ; Equivalent to (@pre (> x 0))
+(@pre {x >= 0 and x <= 100})  ; Equivalent to (@pre (and (>= x 0) (<= x 100)))
+(@post {$result == a + b}) ; Equivalent to (@post (== $result (+ a b)))
+
+; Infix precedence: *, /, % > +, - > comparisons > and > or
+; Use () for grouping: {(a + b) * c}
+; Use prefix notation for function calls within infix: {(len arr) > 0}
+
+; Example (both styles work)
 (fn divide ((a Int) (b Int))
   (@intent "Divide a by b")
   (@spec ((Int Int) -> Int))
-  (@pre (!= b 0))
-  (@post (== (* $result b) a))
+  (@pre {b != 0})                  ; Infix style
+  (@post (== (* $result b) a))     ; Prefix style
   (/ a b))
 
 ### Assumptions (for FFI and trusted behavior)

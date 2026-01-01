@@ -116,3 +116,18 @@
 ; Brackets
 "(" @punctuation.bracket
 ")" @punctuation.bracket
+"{" @punctuation.bracket
+"}" @punctuation.bracket
+
+; Infix operators
+(infix_binary
+  ["and" "or"] @keyword.operator)
+
+(infix_binary
+  ["==" "!=" "<" "<=" ">" ">=" "+" "-" "*" "/" "%"] @operator)
+
+(infix_unary
+  "not" @keyword.operator)
+
+(infix_unary
+  "-" @operator)

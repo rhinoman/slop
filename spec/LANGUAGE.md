@@ -155,10 +155,18 @@ literal     = number | string | 'true | 'false | 'nil
 (@intent "Human-readable description")
 (@spec ((ParamTypes...) -> ReturnType))
 
-; Optional annotations
+; Optional annotations (prefix or infix notation)
 (@pre boolean-expr)              ; Precondition
 (@post boolean-expr)             ; Postcondition ($result for return value)
 (@assume boolean-expr)           ; Trusted axiom for verification (e.g., FFI behavior)
+
+; Infix notation (contracts only) - curly braces denote infix expressions
+(@pre {x > 0})                   ; Equivalent to (@pre (> x 0))
+(@pre {x >= 0 and x <= 100})     ; Equivalent to (@pre (and (>= x 0) (<= x 100)))
+(@post {$result == a + b})       ; Equivalent to (@post (== $result (+ a b)))
+; Precedence: *, /, % > +, - > comparisons > and > or
+; Use () for grouping: {(a + b) * c}
+; Use prefix for function calls: {(len arr) > 0}
 (@example (args...) -> result)   ; Example for testing
 (@property (forall (x T) expr))  ; Property that should hold
 (@deprecated "message")          ; Mark as deprecated with migration hint
