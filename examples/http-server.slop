@@ -75,10 +75,10 @@
 
             ;; Set SO_REUSEADDR (SOL_SOCKET=1, SO_REUSEADDR=2)
             (set! (deref opt) 1)
-            (setsockopt sock 1 2 opt 4)
+            (setsockopt sock 1 2 (cast (Ptr Void) opt) 4)
 
             ;; Zero out sockaddr_in
-            (memset addr 0 (sizeof sockaddr_in))
+            (memset addr 0 (cast U64 (sizeof sockaddr_in)))
 
             ;; Configure address (AF_INET=2, INADDR_ANY=0)
             (set! addr.sin_family 2)
@@ -86,8 +86,8 @@
             ;; sin_addr is a nested struct - now supported!
             (set! addr.sin_addr.s_addr 0)
 
-            ;; Bind (cast sockaddr_in* to sockaddr*)
-            (if (< (bind sock (cast (Ptr sockaddr) addr) (sizeof sockaddr_in)) 0)
+            ;; Bind (cast sockaddr_in* to void*)
+            (if (< (bind sock (cast (Ptr Void) addr) (cast U32 (sizeof sockaddr_in))) 0)
               (do
                 (println "Failed to bind")
                 (close sock)
@@ -109,12 +109,12 @@
                           ;; Read request
                           (recv client buf 4095 0)
 
-                          ;; Route request (string auto-converts to C string for FFI)
-                          (let ((resp (if (strstr buf "GET /health")
+                          ;; Route request
+                          (let ((resp (if (!= (strstr buf (. "GET /health" data)) nil)
                                         (response-ok)
                                         (response-404))))
-                            ;; Send response (use . for struct value access)
-                            (send client (. resp data) (. resp len) 0))
+                            ;; Send response
+                            (send client (cast (Ptr Void) (. resp data)) (. resp len) 0))
 
                           ;; Close client
                           (close client))))))

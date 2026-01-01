@@ -225,9 +225,57 @@ def _normalize_quotes(expr: SExpr) -> SExpr:
     return expr
 
 
+def _normalize_bare_forms(ast: List[SExpr]) -> List[SExpr]:
+    """Normalize bare record/enum forms to wrapped (type Name ...) form.
+
+    Converts:
+        (record Name (field Type) ...) → (type Name (record (field Type) ...))
+        (enum Name variant ...)        → (type Name (enum variant ...))
+
+    This allows the transpiler to handle a single form instead of both.
+    """
+    result = []
+    for form in ast:
+        if is_form(form, 'record') and len(form) >= 2 and isinstance(form[1], Symbol):
+            # (record Name fields...) → (type Name (record fields...))
+            name = form[1]
+            record_body = SList([Symbol('record')] + list(form.items[2:]))
+            # Preserve source location if available
+            if hasattr(form, 'line'):
+                record_body.line = form.line
+            wrapped = SList([Symbol('type'), name, record_body])
+            if hasattr(form, 'line'):
+                wrapped.line = form.line
+            result.append(wrapped)
+        elif is_form(form, 'enum') and len(form) >= 2 and isinstance(form[1], Symbol):
+            # (enum Name variants...) → (type Name (enum variants...))
+            name = form[1]
+            enum_body = SList([Symbol('enum')] + list(form.items[2:]))
+            if hasattr(form, 'line'):
+                enum_body.line = form.line
+            wrapped = SList([Symbol('type'), name, enum_body])
+            if hasattr(form, 'line'):
+                wrapped.line = form.line
+            result.append(wrapped)
+        elif is_form(form, 'module'):
+            # Recursively normalize inside module
+            # Keep module keyword and name, normalize the rest
+            normalized_items = list(form.items[:2])  # 'module' and name
+            normalized_items.extend(_normalize_bare_forms(list(form.items[2:])))
+            normalized = SList(normalized_items)
+            if hasattr(form, 'line'):
+                normalized.line = form.line
+            result.append(normalized)
+        else:
+            result.append(form)
+    return result
+
+
 def parse(source: str) -> List[SExpr]:
     forms = Parser(source).parse()
-    return [_normalize_quotes(form) for form in forms]
+    forms = [_normalize_quotes(form) for form in forms]
+    forms = _normalize_bare_forms(forms)
+    return forms
 
 def parse_file(path: str) -> List[SExpr]:
     with open(path) as f:
