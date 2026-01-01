@@ -309,7 +309,7 @@ Holes are routed to appropriately-sized models:
 
 (hole (Result User Error) "Validate and update user"
   :complexity tier-3   ; Needs larger model
-  :must-use (input db-update validate-email))
+  :required (input db-update validate-email))
 ```
 
 ## Why C?

@@ -16,7 +16,7 @@
     (@pure)
     (hole FizzBuzzResult
       "check divisibility by 3 and 5, return appropriate enum variant"
-      :must-use (n)
+      :required (n)
       :complexity tier-2))
 
   (fn main ()
@@ -25,4 +25,4 @@
     (hole (Int)
       "loop 1 to 100, call fizzbuzz, print result for each"
       :complexity tier-3
-      :must-use (fizzbuzz))))
+      :required (fizzbuzz))))

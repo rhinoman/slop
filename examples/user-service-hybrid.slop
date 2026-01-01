@@ -113,7 +113,7 @@
             (hole (Result Unit UserError)
               "Check email and username don't already exist in database"
               :complexity tier-2
-              :must-use (input db-find-by-email db-find-by-username))))
+              :required (input db-find-by-email db-find-by-username))))
       
       (match validation-result
         ((error e) (error e))
@@ -123,13 +123,13 @@
                   (hole HashedPassword
                     "Hash the password using bcrypt"
                     :complexity tier-1
-                    :must-use ((. input password) crypto-hash-password))))
+                    :required ((. input password) crypto-hash-password))))
             
             ;; Tier 2: create and save
             (hole (Result (Ptr User) UserError)
               "Allocate User in arena, set fields from input, generate ID, set timestamps, save to DB"
               :complexity tier-2
-              :must-use (arena input password-hash db-insert-user now-ms)))))))
+              :required (arena input password-hash db-insert-user now-ms)))))))
   
   ;; ----------------------------------------------------------
   ;; Find by ID
@@ -147,7 +147,7 @@
     (hole (Result (Ptr User) UserError)
       "Look up user by ID in database, return not-found if missing"
       :complexity tier-1
-      :must-use (arena id db-get-user)
+      :required (arena id db-get-user)
       :examples (((id: 1) -> (ok user))
                  ((id: 99999) -> (error not-found)))))
   
@@ -166,7 +166,7 @@
     (hole (Result (Ptr User) UserError)
       "Look up user by email, return not-found if missing"
       :complexity tier-1
-      :must-use (arena email db-find-by-email)))
+      :required (arena email db-find-by-email)))
   
   ;; ----------------------------------------------------------
   ;; Update User
@@ -181,7 +181,7 @@
     (hole (Result (Ptr User) UserError)
       "Find user, validate uniqueness for changed email/username, hash new password if provided, update only non-nil fields, set updated-at timestamp"
       :complexity tier-3
-      :must-use (arena id input db-get-user db-update-user db-find-by-email 
+      :required (arena id input db-get-user db-update-user db-find-by-email 
                  crypto-hash-password now-ms)
       :constraints
         ((only-update-provided-fields)
@@ -203,7 +203,7 @@
     (hole (Result (Ptr User) UserError)
       "Find user, set status to deleted, update timestamp, save"
       :complexity tier-2
-      :must-use (arena id db-get-user db-update-user now-ms)))
+      :required (arena id db-get-user db-update-user now-ms)))
   
   ;; ----------------------------------------------------------
   ;; List Active Users
@@ -216,7 +216,7 @@
     (hole (Result (Ptr (List (Ptr User))) UserError)
       "Query database for all users where status = active, return as list"
       :complexity tier-1
-      :must-use (arena db-find-users-by-status)))
+      :required (arena db-find-users-by-status)))
   
   ;; ----------------------------------------------------------
   ;; Authenticate
@@ -233,7 +233,7 @@
     (hole (Result AuthResult UserError)
       "Find user by email, verify password hash, check status is active"
       :complexity tier-2
-      :must-use (arena email password db-find-by-email crypto-verify-password)
+      :required (arena email password db-find-by-email crypto-verify-password)
       :constraints
         ((check-password-before-status)
          (return-invalid-credentials-for-wrong-password)

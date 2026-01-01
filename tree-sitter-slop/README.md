@@ -115,5 +115,5 @@ The grammar includes queries for:
 (fn validate ((user User))
   (hole Bool "Check if user is valid"
     :complexity tier-1
-    :must-use (user)))
+    :required (user)))
 ```

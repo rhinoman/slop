@@ -16,7 +16,7 @@
 ; Quoted symbols (enum values like 'ok, 'error)
 (quoted_symbol) @constant
 
-; Keywords (:complexity, :must-use, etc.)
+; Keywords (:complexity, :required, etc.)
 (keyword) @property
 
 ; Type names (PascalCase)
