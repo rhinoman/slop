@@ -58,7 +58,7 @@ class Transpiler:
     }
 
     # SLOP forms that should be transpiled as statements, not expressions
-    STATEMENT_FORMS = {'for-each', 'for', 'while', 'set!', 'if', 'when', 'unless'}
+    STATEMENT_FORMS = {'for-each', 'for', 'while', 'set!', 'if', 'when'}
 
     def __init__(self):
         self.types: Dict[str, TypeInfo] = {}
