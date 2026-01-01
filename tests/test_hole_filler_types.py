@@ -282,7 +282,7 @@ class TestContextValidation:
         )
         context = {
             'defined_functions': ['printf'],
-            'ffi_specs': [{'name': 'printf', 'params': [], 'return': 'Int'}]
+            'ffi_specs': [{'name': 'printf', 'params': '((msg String))', 'return_type': 'Int'}]
         }
 
         valid, error = filler._validate(expr, hole, context)

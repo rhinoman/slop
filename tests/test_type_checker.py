@@ -537,3 +537,75 @@ class TestMatchExhaustiveness:
         diagnostics = check_source(source)
         errors = [d for d in diagnostics if d.severity == 'error']
         assert len(errors) == 0
+
+
+class TestCollectionMutability:
+    """Test that list-push/map-put require mutable collections"""
+
+    def test_list_push_to_literal_errors(self):
+        """Cannot push to list literal - it uses static const backing array"""
+        source = """
+        (module test
+          (fn bad ((arena Arena))
+            (@spec ((Arena) -> Unit))
+            (let ((xs (list Int 1 2 3)))
+              (list-push xs 5))))
+        """
+        diagnostics = check_source(source)
+        errors = [d for d in diagnostics if d.severity == 'error']
+        assert len(errors) == 1
+        assert "cannot push to immutable list" in errors[0].message
+
+    def test_list_push_to_mut_literal_errors(self):
+        """mut binding doesn't make list literal mutable"""
+        source = """
+        (module test
+          (fn bad ((arena Arena))
+            (@spec ((Arena) -> Unit))
+            (let ((mut xs (list Int 1 2 3)))
+              (list-push xs 5))))
+        """
+        diagnostics = check_source(source)
+        errors = [d for d in diagnostics if d.severity == 'error']
+        assert len(errors) == 1
+        assert "cannot push to immutable list" in errors[0].message
+
+    def test_list_push_to_list_new_ok(self):
+        """Can push to list from list-new"""
+        source = """
+        (module test
+          (fn ok ((arena Arena))
+            (@spec ((Arena) -> Unit))
+            (let ((xs (list-new arena Int)))
+              (list-push xs 5))))
+        """
+        diagnostics = check_source(source)
+        errors = [d for d in diagnostics if d.severity == 'error']
+        assert len(errors) == 0
+
+    def test_map_put_to_literal_errors(self):
+        """Cannot put to map literal"""
+        source = """
+        (module test
+          (fn bad ((arena Arena))
+            (@spec ((Arena) -> Unit))
+            (let ((m (map String Int ("a" 1))))
+              (map-put m "b" 2))))
+        """
+        diagnostics = check_source(source)
+        errors = [d for d in diagnostics if d.severity == 'error']
+        assert len(errors) == 1
+        assert "cannot put to immutable map" in errors[0].message
+
+    def test_map_put_to_map_new_ok(self):
+        """Can put to map from map-new"""
+        source = """
+        (module test
+          (fn ok ((arena Arena))
+            (@spec ((Arena) -> Unit))
+            (let ((m (map-new arena String Int)))
+              (map-put m "a" 1))))
+        """
+        diagnostics = check_source(source)
+        errors = [d for d in diagnostics if d.severity == 'error']
+        assert len(errors) == 0

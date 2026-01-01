@@ -146,6 +146,11 @@ slop verify examples/rate-limiter.slop
 # Full build (requires cc)
 slop build examples/rate-limiter.slop -o rate_limiter
 
+# Language reference (for AI coding assistants)
+slop ref                      # Full reference
+slop ref types                # Just type system
+slop ref --list               # List available topics
+
 # Validate a hole implementation against expected type
 slop check-hole '(+ x 1)' -t Int -p '((x Int))'
 

@@ -500,9 +500,11 @@ BUILTIN_FUNCTIONS = {
     # List operations
     'list-new', 'list-push', 'list-get', 'list-len',
     # Map operations
-    'map-new', 'map-put', 'map-get', 'map-has',
+    'map-new', 'map-put', 'map-get', 'map-has', 'map-empty',
     # Result operations
     'is-ok', 'unwrap',
     # Time
     'now-ms', 'sleep-ms',
+    # Math
+    'min', 'max',
 }

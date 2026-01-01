@@ -11,6 +11,7 @@ Handles:
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Set
 from slop.parser import SExpr, SList, Symbol, String, Number, is_form, parse, find_holes
+from slop.types import BUILTIN_FUNCTIONS
 
 
 class UnfilledHoleError(Exception):
@@ -1126,6 +1127,7 @@ class Transpiler:
         self.ffi_struct_fields = {}
         self.ffi_includes = []
         self.uses_scoped_ptr = False  # Reset for this transpilation
+        self.defined_functions: set = set()  # Track defined function names
 
         # Check for unfilled holes - cannot transpile incomplete code
         all_holes = []
@@ -1195,9 +1197,12 @@ class Transpiler:
         for form in types:
             self._scan_type_definition(form)
 
-        # Pre-scan functions to discover needed generic types
+        # Pre-scan functions to discover needed generic types and track names
         for form in functions:
             self._scan_function_types(form)
+            # Track function name
+            if len(form) >= 2 and isinstance(form[1], Symbol):
+                self.defined_functions.add(form[1].name)
 
         # FIRST PASS: Emit range types and simple aliases
         # These must come before generated types like slop_list_Natural that reference them
@@ -1494,6 +1499,9 @@ class Transpiler:
         if functions:
             self.emit("/* Forward declarations */")
             for fn in functions:
+                # Track function name
+                if len(fn) >= 2 and isinstance(fn[1], Symbol):
+                    self.defined_functions.add(fn[1].name)
                 self.emit_forward_declaration(fn)
             self.emit("")
 

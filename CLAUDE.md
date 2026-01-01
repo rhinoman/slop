@@ -68,8 +68,9 @@ SLOP source → parser.py → AST → type_checker.py → transpiler.py → C co
 The authoritative language specification is in `spec/LANGUAGE.md`. When modifying the language:
 1. Update `spec/LANGUAGE.md`
 2. Update `.claude/skills/slop/SKILL.md` (Claude's quick reference)
-3. Update parser/transpiler/type_checker as needed
-4. Update `tree-sitter-slop/` grammar and highlights if syntax changes
+3. Update `src/slop/reference.py` (CLI reference for `slop ref` command)
+4. Update parser/transpiler/type_checker as needed
+5. Update `tree-sitter-slop/` grammar and highlights if syntax changes
 
 ### Tree-sitter Grammar
 

@@ -1585,6 +1585,25 @@ def cmd_format(args):
     return exit_code
 
 
+def cmd_ref(args):
+    """Display language reference for AI assistants"""
+    from slop.reference import get_reference, list_topics, TOPICS
+
+    if args.list:
+        for topic in list_topics():
+            print(topic)
+        return 0
+
+    topic = args.topic or 'all'
+    if topic != 'all' and topic not in TOPICS:
+        print(f"Unknown topic: {topic}", file=sys.stderr)
+        print(f"Available: {', '.join(list_topics())}", file=sys.stderr)
+        return 1
+
+    print(get_reference(topic))
+    return 0
+
+
 def cmd_verify(args):
     """Verify contracts and range safety with Z3"""
     try:
@@ -1594,8 +1613,12 @@ def cmd_verify(args):
         return 1
 
     if not Z3_AVAILABLE:
-        print("Error: Z3 solver not available. Install with: pip install z3-solver",
-              file=sys.stderr)
+        print("Error: Z3 solver not available.", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("Install with one of:", file=sys.stderr)
+        print("  uv sync --extra verify     # if using uv (recommended)", file=sys.stderr)
+        print("  uv pip install z3-solver   # alternative for uv", file=sys.stderr)
+        print("  pip install z3-solver      # if using pip", file=sys.stderr)
         return 1
 
     # Determine failure mode
@@ -1766,6 +1789,13 @@ def main():
     p.add_argument('-v', '--verbose', action='store_true',
         help='Show counterexamples and skipped contracts')
 
+    # ref
+    p = subparsers.add_parser('ref', help='Language reference for AI assistants')
+    p.add_argument('topic', nargs='?', default='all',
+        help='Topic: types, functions, contracts, holes, memory, ffi, stdlib, expressions, patterns')
+    p.add_argument('--list', action='store_true',
+        help='List available topics')
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1782,6 +1812,7 @@ def main():
         'derive': cmd_derive,
         'format': cmd_format,
         'verify': cmd_verify,
+        'ref': cmd_ref,
     }
 
     return commands[args.command](args)
