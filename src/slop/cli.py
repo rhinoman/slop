@@ -564,6 +564,335 @@ def extract_file_context(filepath: str, fn_name: str = None) -> dict:
     return context
 
 
+def extract_documentation(ast) -> dict:
+    """Extract structured documentation from SLOP AST.
+
+    Returns dict with module info, types, functions, and constants.
+    """
+    from slop.parser import Symbol, String
+
+    doc = {
+        'module': None,
+        'exports': [],
+        'types': [],
+        'functions': [],
+        'constants': [],
+    }
+
+    # Find module name and exports
+    for form in ast:
+        if is_form(form, 'module') and len(form) >= 2:
+            if isinstance(form[1], Symbol):
+                doc['module'] = form[1].name
+            # Check for export list
+            for item in form.items[2:]:
+                if is_form(item, 'export'):
+                    for exp in item.items[1:]:
+                        if isinstance(exp, Symbol):
+                            doc['exports'].append(exp.name)
+                        elif isinstance(exp, SList) and len(exp) >= 1:
+                            # (fn-name arity) form
+                            if isinstance(exp[0], Symbol):
+                                doc['exports'].append(exp[0].name)
+            break
+
+    export_set = set(doc['exports'])
+
+    def extract_type_info(type_form) -> dict:
+        """Extract type definition info."""
+        if len(type_form) < 2:
+            return None
+
+        name = type_form[1].name if isinstance(type_form[1], Symbol) else str(type_form[1])
+        type_info = {'name': name, 'definition': pretty_print(type_form)}
+
+        if len(type_form) > 2:
+            body = type_form[2]
+            if is_form(body, 'record'):
+                type_info['kind'] = 'record'
+                type_info['fields'] = []
+                for field in body.items[1:]:
+                    if isinstance(field, SList) and len(field) >= 2:
+                        fname = field[0].name if isinstance(field[0], Symbol) else str(field[0])
+                        ftype = pretty_print(field[1]) if len(field) > 1 else 'Unknown'
+                        type_info['fields'].append({'name': fname, 'type': ftype})
+            elif is_form(body, 'enum'):
+                type_info['kind'] = 'enum'
+                type_info['variants'] = []
+                for v in body.items[1:]:
+                    if isinstance(v, Symbol):
+                        type_info['variants'].append(v.name)
+            elif isinstance(body, SList) and len(body) >= 3:
+                # Range type: (Int min .. max)
+                type_info['kind'] = 'range'
+            else:
+                type_info['kind'] = 'alias'
+        else:
+            type_info['kind'] = 'alias'
+
+        return type_info
+
+    def extract_fn_info(fn_form) -> dict:
+        """Extract function documentation info."""
+        if len(fn_form) < 3:
+            return None
+
+        name = fn_form[1].name if isinstance(fn_form[1], Symbol) else str(fn_form[1])
+
+        fn_info = {
+            'name': name,
+            'exported': name in export_set or not doc['exports'],
+            'params': [],
+            'intent': None,
+            'spec': None,
+            'pre': [],
+            'post': [],
+            'examples': [],
+            'pure': False,
+            'alloc': None,
+            'deprecated': None,
+        }
+
+        # Extract parameters
+        params_list = fn_form[2]
+        if isinstance(params_list, SList):
+            for p in params_list.items:
+                if isinstance(p, SList) and len(p) >= 2:
+                    # Handle different param forms: (name Type), (in name Type), (out name Type)
+                    if isinstance(p[0], Symbol) and p[0].name in ('in', 'out', 'inout'):
+                        # Directional param: (in name Type)
+                        pname = p[1].name if isinstance(p[1], Symbol) else str(p[1])
+                        ptype = pretty_print(p[2]) if len(p) > 2 else 'Unknown'
+                        fn_info['params'].append({'name': pname, 'type': ptype, 'direction': p[0].name})
+                    else:
+                        # Regular param: (name Type)
+                        pname = p[0].name if isinstance(p[0], Symbol) else str(p[0])
+                        ptype = pretty_print(p[1]) if len(p) > 1 else 'Unknown'
+                        fn_info['params'].append({'name': pname, 'type': ptype})
+
+        def compact(s: str) -> str:
+            """Normalize whitespace to single spaces."""
+            import re
+            return re.sub(r'\s+', ' ', s).strip()
+
+        # Extract annotations
+        for item in fn_form.items[3:]:
+            if is_form(item, '@intent') and len(item) > 1:
+                fn_info['intent'] = item[1].value if isinstance(item[1], String) else str(item[1])
+            elif is_form(item, '@spec') and len(item) > 1:
+                fn_info['spec'] = compact(pretty_print(item[1]))
+            elif is_form(item, '@pre') and len(item) > 1:
+                fn_info['pre'].append(compact(pretty_print(item[1])))
+            elif is_form(item, '@post') and len(item) > 1:
+                fn_info['post'].append(compact(pretty_print(item[1])))
+            elif is_form(item, '@example') and len(item) > 1:
+                # Format: (@example (args...) -> result)
+                example_str = compact(pretty_print(SList(item.items[1:])))
+                fn_info['examples'].append(example_str)
+            elif is_form(item, '@pure'):
+                fn_info['pure'] = True
+            elif is_form(item, '@alloc') and len(item) > 1:
+                fn_info['alloc'] = item[1].name if isinstance(item[1], Symbol) else str(item[1])
+            elif is_form(item, '@deprecated') and len(item) > 1:
+                fn_info['deprecated'] = item[1].value if isinstance(item[1], String) else str(item[1])
+
+        return fn_info
+
+    def extract_const_info(const_form) -> dict:
+        """Extract constant documentation info."""
+        if len(const_form) < 4:
+            return None
+
+        name = const_form[1].name if isinstance(const_form[1], Symbol) else str(const_form[1])
+        type_expr = pretty_print(const_form[2])
+        value = pretty_print(const_form[3])
+
+        return {'name': name, 'type': type_expr, 'value': value}
+
+    # Process top-level forms
+    for form in ast:
+        if is_form(form, 'type'):
+            info = extract_type_info(form)
+            if info:
+                doc['types'].append(info)
+        elif is_form(form, 'fn') or is_form(form, 'impl'):
+            info = extract_fn_info(form)
+            if info:
+                doc['functions'].append(info)
+        elif is_form(form, 'const'):
+            info = extract_const_info(form)
+            if info:
+                doc['constants'].append(info)
+        elif is_form(form, 'module'):
+            # Process forms inside module
+            for item in form.items:
+                if is_form(item, 'type'):
+                    info = extract_type_info(item)
+                    if info:
+                        doc['types'].append(info)
+                elif is_form(item, 'fn') or is_form(item, 'impl'):
+                    info = extract_fn_info(item)
+                    if info:
+                        doc['functions'].append(info)
+                elif is_form(item, 'const'):
+                    info = extract_const_info(item)
+                    if info:
+                        doc['constants'].append(info)
+
+    return doc
+
+
+def render_markdown(doc: dict) -> str:
+    """Render documentation dict as Markdown."""
+    lines = []
+
+    # Module header
+    if doc['module']:
+        lines.append(f"# {doc['module']}")
+    else:
+        lines.append("# Module Documentation")
+    lines.append("")
+
+    # Types section
+    if doc['types']:
+        lines.append("## Types")
+        lines.append("")
+
+        for t in doc['types']:
+            lines.append(f"### {t['name']}")
+            lines.append("")
+            lines.append("```lisp")
+            lines.append(t['definition'])
+            lines.append("```")
+
+            if t['kind'] == 'record' and t.get('fields'):
+                lines.append("")
+                lines.append("**Fields:**")
+                for f in t['fields']:
+                    lines.append(f"- `{f['name']}` — {f['type']}")
+            elif t['kind'] == 'enum' and t.get('variants'):
+                lines.append("")
+                lines.append("**Variants:** " + ", ".join(f"`{v}`" for v in t['variants']))
+
+            lines.append("")
+            lines.append("---")
+            lines.append("")
+
+    # Constants section
+    if doc['constants']:
+        lines.append("## Constants")
+        lines.append("")
+
+        for c in doc['constants']:
+            lines.append(f"### {c['name']}")
+            lines.append("")
+            lines.append(f"**Type:** `{c['type']}`")
+            lines.append("")
+            lines.append(f"**Value:** `{c['value']}`")
+            lines.append("")
+            lines.append("---")
+            lines.append("")
+
+    # Functions section
+    if doc['functions']:
+        lines.append("## Functions")
+        lines.append("")
+
+        for fn in doc['functions']:
+            # Function name with internal marker if not exported
+            if fn['exported']:
+                lines.append(f"### {fn['name']}")
+            else:
+                lines.append(f"### {fn['name']} *(internal)*")
+            lines.append("")
+
+            # Deprecation warning
+            if fn['deprecated']:
+                lines.append(f"**DEPRECATED:** {fn['deprecated']}")
+                lines.append("")
+
+            # Intent
+            if fn['intent']:
+                lines.append(f"> {fn['intent']}")
+                lines.append("")
+
+            # Signature
+            if fn['spec']:
+                lines.append(f"**Signature:** `{fn['spec']}`")
+                lines.append("")
+
+            # Parameters
+            if fn['params']:
+                lines.append("**Parameters:**")
+                for p in fn['params']:
+                    direction = f" *({p['direction']})* " if p.get('direction') else " "
+                    lines.append(f"- `{p['name']}`{direction}— {p['type']}")
+                lines.append("")
+
+            # Preconditions
+            if fn['pre']:
+                lines.append("**Preconditions:**")
+                for pre in fn['pre']:
+                    lines.append(f"- `{pre}`")
+                lines.append("")
+
+            # Postconditions
+            if fn['post']:
+                lines.append("**Postconditions:**")
+                for post in fn['post']:
+                    lines.append(f"- `{post}`")
+                lines.append("")
+
+            # Examples
+            if fn['examples']:
+                lines.append("**Examples:**")
+                lines.append("```lisp")
+                for ex in fn['examples']:
+                    lines.append(f"({fn['name']} {ex})")
+                lines.append("```")
+                lines.append("")
+
+            # Notes (pure, alloc)
+            notes = []
+            if fn['pure']:
+                notes.append("Pure function")
+            if fn['alloc']:
+                notes.append(f"Allocates in `{fn['alloc']}`")
+            if notes:
+                lines.append("*" + " | ".join(notes) + "*")
+                lines.append("")
+
+            lines.append("---")
+            lines.append("")
+
+    return "\n".join(lines)
+
+
+def cmd_doc(args):
+    """Generate documentation from SLOP source."""
+    import json
+
+    try:
+        ast = parse_file(args.input)
+        doc = extract_documentation(ast)
+
+        if args.format == 'json':
+            output = json.dumps(doc, indent=2)
+        else:
+            output = render_markdown(doc)
+
+        if args.output:
+            Path(args.output).write_text(output)
+            print(f"Wrote {args.output}")
+        else:
+            print(output)
+
+        return 0
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+
 def cmd_fill(args):
     """Fill holes with LLM"""
     import logging
@@ -1797,6 +2126,13 @@ def main():
     p.add_argument('--list', action='store_true',
         help='List available topics')
 
+    # doc
+    p = subparsers.add_parser('doc', help='Generate documentation from SLOP source')
+    p.add_argument('input', help='Input SLOP file')
+    p.add_argument('-o', '--output', help='Output file (default: stdout)')
+    p.add_argument('-f', '--format', choices=['markdown', 'json'], default='markdown',
+        help='Output format (default: markdown)')
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1814,6 +2150,7 @@ def main():
         'format': cmd_format,
         'verify': cmd_verify,
         'ref': cmd_ref,
+        'doc': cmd_doc,
     }
 
     return commands[args.command](args)

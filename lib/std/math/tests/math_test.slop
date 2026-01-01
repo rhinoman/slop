@@ -1,0 +1,427 @@
+;; ============================================================
+;; Math Test Module
+;;
+;; Tests for the math.slop standard library functions.
+;;
+;; Run via: slop build lib/std/math/tests/math_test.slop && ./math_test
+;; Returns 0 on success, non-zero = number of failed tests.
+;; ============================================================
+
+(module math-test
+  (export main)
+
+  (import mathlib (
+    ;; Constants
+    PI E TAU
+    ;; Integer operations
+    abs sign clamp gcd lcm
+    ;; Float operations
+    abs-float floor ceil round trunc frac clamp-float
+    ;; Power and roots
+    sqrt cbrt pow exp exp2 log log10 log2
+    ;; Trigonometry
+    sin cos tan asin acos atan atan2
+    degrees-to-radians radians-to-degrees
+    ;; Hyperbolic
+    sinh cosh tanh
+    ;; Utilities
+    is-nan is-inf is-finite copysign lerp))
+
+  ;; ============================================================
+  ;; Helper: Float comparison with tolerance
+  ;; ============================================================
+
+  (fn approx-eq ((a Float) (b Float) (epsilon Float))
+    (@intent "Check if two floats are approximately equal within epsilon")
+    (@spec ((Float Float Float) -> Bool))
+    (@pure)
+    (< (abs-float (- a b)) epsilon))
+
+  ;; ============================================================
+  ;; Tests: Constants
+  ;; ============================================================
+
+  (fn test-constants ()
+    (@intent "Test math constants have correct approximate values")
+    (@spec (() -> Bool))
+    (and (approx-eq PI 3.14159265 0.0001)
+         (approx-eq E 2.71828182 0.0001)
+         (approx-eq TAU 6.28318530 0.0001)
+         (approx-eq TAU (* 2.0 PI) 0.0001)))
+
+  ;; ============================================================
+  ;; Tests: Integer Operations
+  ;; ============================================================
+
+  (fn test-abs ()
+    (@intent "Test abs returns absolute value of integer")
+    (@spec (() -> Bool))
+    (and (== (abs 5) 5)
+         (== (abs -5) 5)
+         (== (abs 0) 0)))
+
+  (fn test-sign ()
+    (@intent "Test sign returns -1, 0, or 1")
+    (@spec (() -> Bool))
+    (and (== (sign 42) 1)
+         (== (sign -42) -1)
+         (== (sign 0) 0)))
+
+  (fn test-clamp ()
+    (@intent "Test clamp restricts value to range")
+    (@spec (() -> Bool))
+    (and (== (clamp 5 0 10) 5)
+         (== (clamp -5 0 10) 0)
+         (== (clamp 15 0 10) 10)
+         (== (clamp 0 0 10) 0)
+         (== (clamp 10 0 10) 10)))
+
+  (fn test-gcd ()
+    (@intent "Test gcd computes greatest common divisor")
+    (@spec (() -> Bool))
+    (and (== (gcd 48 18) 6)
+         (== (gcd 17 13) 1)
+         (== (gcd 0 5) 5)
+         (== (gcd 5 0) 5)
+         (== (gcd -48 18) 6)))
+
+  (fn test-lcm ()
+    (@intent "Test lcm computes least common multiple")
+    (@spec (() -> Bool))
+    (and (== (lcm 4 6) 12)
+         (== (lcm 3 5) 15)
+         (== (lcm 0 5) 0)
+         (== (lcm 7 7) 7)))
+
+  ;; ============================================================
+  ;; Tests: Float Operations
+  ;; ============================================================
+
+  (fn test-abs-float ()
+    (@intent "Test abs-float returns absolute value of float")
+    (@spec (() -> Bool))
+    (and (approx-eq (abs-float 3.14) 3.14 0.001)
+         (approx-eq (abs-float -3.14) 3.14 0.001)
+         (approx-eq (abs-float 0.0) 0.0 0.001)))
+
+  (fn test-floor ()
+    (@intent "Test floor rounds down")
+    (@spec (() -> Bool))
+    (and (approx-eq (floor 3.7) 3.0 0.001)
+         (approx-eq (floor -3.2) -4.0 0.001)
+         (approx-eq (floor 5.0) 5.0 0.001)))
+
+  (fn test-ceil ()
+    (@intent "Test ceil rounds up")
+    (@spec (() -> Bool))
+    (and (approx-eq (ceil 3.2) 4.0 0.001)
+         (approx-eq (ceil -3.7) -3.0 0.001)
+         (approx-eq (ceil 5.0) 5.0 0.001)))
+
+  (fn test-round ()
+    (@intent "Test round rounds to nearest")
+    (@spec (() -> Bool))
+    (and (approx-eq (round 3.5) 4.0 0.001)
+         (approx-eq (round 3.4) 3.0 0.001)
+         (approx-eq (round -3.5) -4.0 0.001)))
+
+  (fn test-trunc ()
+    (@intent "Test trunc truncates toward zero")
+    (@spec (() -> Bool))
+    (and (approx-eq (trunc 3.7) 3.0 0.001)
+         (approx-eq (trunc -3.7) -3.0 0.001)))
+
+  (fn test-frac ()
+    (@intent "Test frac returns fractional part")
+    (@spec (() -> Bool))
+    (and (approx-eq (frac 3.14) 0.14 0.001)
+         (approx-eq (frac -3.14) -0.14 0.001)))
+
+  (fn test-clamp-float ()
+    (@intent "Test clamp-float restricts value to range")
+    (@spec (() -> Bool))
+    (and (approx-eq (clamp-float 0.5 0.0 1.0) 0.5 0.001)
+         (approx-eq (clamp-float -0.5 0.0 1.0) 0.0 0.001)
+         (approx-eq (clamp-float 1.5 0.0 1.0) 1.0 0.001)))
+
+  ;; ============================================================
+  ;; Tests: Power and Roots
+  ;; ============================================================
+
+  (fn test-sqrt ()
+    (@intent "Test sqrt computes square root")
+    (@spec (() -> Bool))
+    (and (approx-eq (sqrt 4.0) 2.0 0.001)
+         (approx-eq (sqrt 9.0) 3.0 0.001)
+         (approx-eq (sqrt 2.0) 1.41421356 0.0001)))
+
+  (fn test-cbrt ()
+    (@intent "Test cbrt computes cube root")
+    (@spec (() -> Bool))
+    (and (approx-eq (cbrt 8.0) 2.0 0.001)
+         (approx-eq (cbrt 27.0) 3.0 0.001)
+         (approx-eq (cbrt -8.0) -2.0 0.001)))
+
+  (fn test-pow ()
+    (@intent "Test pow raises base to power")
+    (@spec (() -> Bool))
+    (and (approx-eq (pow 2.0 3.0) 8.0 0.001)
+         (approx-eq (pow 2.0 0.5) 1.41421356 0.0001)
+         (approx-eq (pow 10.0 -1.0) 0.1 0.001)))
+
+  (fn test-exp ()
+    (@intent "Test exp computes e^x")
+    (@spec (() -> Bool))
+    (and (approx-eq (exp 0.0) 1.0 0.001)
+         (approx-eq (exp 1.0) E 0.001)))
+
+  (fn test-exp2 ()
+    (@intent "Test exp2 computes 2^x")
+    (@spec (() -> Bool))
+    (and (approx-eq (exp2 3.0) 8.0 0.001)
+         (approx-eq (exp2 0.0) 1.0 0.001)))
+
+  (fn test-log ()
+    (@intent "Test log computes natural logarithm")
+    (@spec (() -> Bool))
+    (and (approx-eq (log 1.0) 0.0 0.001)
+         (approx-eq (log E) 1.0 0.001)))
+
+  (fn test-log10 ()
+    (@intent "Test log10 computes base-10 logarithm")
+    (@spec (() -> Bool))
+    (and (approx-eq (log10 10.0) 1.0 0.001)
+         (approx-eq (log10 100.0) 2.0 0.001)
+         (approx-eq (log10 1.0) 0.0 0.001)))
+
+  (fn test-log2 ()
+    (@intent "Test log2 computes base-2 logarithm")
+    (@spec (() -> Bool))
+    (and (approx-eq (log2 2.0) 1.0 0.001)
+         (approx-eq (log2 8.0) 3.0 0.001)
+         (approx-eq (log2 1.0) 0.0 0.001)))
+
+  ;; ============================================================
+  ;; Tests: Trigonometry
+  ;; ============================================================
+
+  (fn test-sin ()
+    (@intent "Test sin computes sine")
+    (@spec (() -> Bool))
+    (and (approx-eq (sin 0.0) 0.0 0.001)
+         (approx-eq (sin (/ PI 2.0)) 1.0 0.001)
+         (approx-eq (sin PI) 0.0 0.001)))
+
+  (fn test-cos ()
+    (@intent "Test cos computes cosine")
+    (@spec (() -> Bool))
+    (and (approx-eq (cos 0.0) 1.0 0.001)
+         (approx-eq (cos (/ PI 2.0)) 0.0 0.001)
+         (approx-eq (cos PI) -1.0 0.001)))
+
+  (fn test-tan ()
+    (@intent "Test tan computes tangent")
+    (@spec (() -> Bool))
+    (and (approx-eq (tan 0.0) 0.0 0.001)
+         (approx-eq (tan (/ PI 4.0)) 1.0 0.001)))
+
+  (fn test-asin ()
+    (@intent "Test asin computes arc sine")
+    (@spec (() -> Bool))
+    (and (approx-eq (asin 0.0) 0.0 0.001)
+         (approx-eq (asin 1.0) (/ PI 2.0) 0.001)))
+
+  (fn test-acos ()
+    (@intent "Test acos computes arc cosine")
+    (@spec (() -> Bool))
+    (and (approx-eq (acos 1.0) 0.0 0.001)
+         (approx-eq (acos 0.0) (/ PI 2.0) 0.001)))
+
+  (fn test-atan ()
+    (@intent "Test atan computes arc tangent")
+    (@spec (() -> Bool))
+    (and (approx-eq (atan 0.0) 0.0 0.001)
+         (approx-eq (atan 1.0) (/ PI 4.0) 0.001)))
+
+  (fn test-atan2 ()
+    (@intent "Test atan2 computes arc tangent with quadrant")
+    (@spec (() -> Bool))
+    (and (approx-eq (atan2 1.0 1.0) (/ PI 4.0) 0.001)
+         (approx-eq (atan2 0.0 1.0) 0.0 0.001)))
+
+  (fn test-degrees-radians ()
+    (@intent "Test degree/radian conversion")
+    (@spec (() -> Bool))
+    (and (approx-eq (degrees-to-radians 180.0) PI 0.001)
+         (approx-eq (degrees-to-radians 90.0) (/ PI 2.0) 0.001)
+         (approx-eq (radians-to-degrees PI) 180.0 0.001)
+         (approx-eq (radians-to-degrees (/ PI 2.0)) 90.0 0.001)))
+
+  ;; ============================================================
+  ;; Tests: Hyperbolic
+  ;; ============================================================
+
+  (fn test-sinh ()
+    (@intent "Test sinh computes hyperbolic sine")
+    (@spec (() -> Bool))
+    (approx-eq (sinh 0.0) 0.0 0.001))
+
+  (fn test-cosh ()
+    (@intent "Test cosh computes hyperbolic cosine")
+    (@spec (() -> Bool))
+    (approx-eq (cosh 0.0) 1.0 0.001))
+
+  (fn test-tanh ()
+    (@intent "Test tanh computes hyperbolic tangent")
+    (@spec (() -> Bool))
+    (approx-eq (tanh 0.0) 0.0 0.001))
+
+  ;; ============================================================
+  ;; Tests: Utilities
+  ;; ============================================================
+
+  (fn test-is-finite ()
+    (@intent "Test is-finite identifies finite numbers")
+    (@spec (() -> Bool))
+    (and (is-finite 1.0)
+         (is-finite 0.0)
+         (is-finite -1.0)))
+
+  (fn test-copysign ()
+    (@intent "Test copysign copies sign from second arg")
+    (@spec (() -> Bool))
+    (and (approx-eq (copysign 3.0 -1.0) -3.0 0.001)
+         (approx-eq (copysign -3.0 1.0) 3.0 0.001)))
+
+  (fn test-lerp ()
+    (@intent "Test lerp performs linear interpolation")
+    (@spec (() -> Bool))
+    (and (approx-eq (lerp 0.0 10.0 0.5) 5.0 0.001)
+         (approx-eq (lerp 0.0 10.0 0.0) 0.0 0.001)
+         (approx-eq (lerp 0.0 10.0 1.0) 10.0 0.001)
+         (approx-eq (lerp 5.0 15.0 0.25) 7.5 0.001)))
+
+  ;; ============================================================
+  ;; Main Entry Point
+  ;; ============================================================
+
+  (fn main ()
+    (@intent "Run all math tests and return failure count (0 = all passed)")
+    (@spec (() -> Int))
+
+    (let ((mut failures 0))
+      (do
+        ;; Constants
+        (if (not (test-constants))
+            (do (println "FAIL: test-constants") (set! failures (+ failures 1)))
+            ())
+        ;; Integer operations
+        (if (not (test-abs))
+            (do (println "FAIL: test-abs") (set! failures (+ failures 1)))
+            ())
+        (if (not (test-sign))
+            (do (println "FAIL: test-sign") (set! failures (+ failures 1)))
+            ())
+        (if (not (test-clamp))
+            (do (println "FAIL: test-clamp") (set! failures (+ failures 1)))
+            ())
+        (if (not (test-gcd))
+            (do (println "FAIL: test-gcd") (set! failures (+ failures 1)))
+            ())
+        (if (not (test-lcm))
+            (do (println "FAIL: test-lcm") (set! failures (+ failures 1)))
+            ())
+        ;; Float operations
+        (if (not (test-abs-float))
+            (do (println "FAIL: test-abs-float") (set! failures (+ failures 1)))
+            ())
+        (if (not (test-floor))
+            (do (println "FAIL: test-floor") (set! failures (+ failures 1)))
+            ())
+        (if (not (test-ceil))
+            (do (println "FAIL: test-ceil") (set! failures (+ failures 1)))
+            ())
+        (if (not (test-round))
+            (do (println "FAIL: test-round") (set! failures (+ failures 1)))
+            ())
+        (if (not (test-trunc))
+            (do (println "FAIL: test-trunc") (set! failures (+ failures 1)))
+            ())
+        (if (not (test-frac))
+            (do (println "FAIL: test-frac") (set! failures (+ failures 1)))
+            ())
+        (if (not (test-clamp-float))
+            (do (println "FAIL: test-clamp-float") (set! failures (+ failures 1)))
+            ())
+        ;; Power and roots
+        (if (not (test-sqrt))
+            (do (println "FAIL: test-sqrt") (set! failures (+ failures 1)))
+            ())
+        (if (not (test-cbrt))
+            (do (println "FAIL: test-cbrt") (set! failures (+ failures 1)))
+            ())
+        (if (not (test-pow))
+            (do (println "FAIL: test-pow") (set! failures (+ failures 1)))
+            ())
+        (if (not (test-exp))
+            (do (println "FAIL: test-exp") (set! failures (+ failures 1)))
+            ())
+        (if (not (test-exp2))
+            (do (println "FAIL: test-exp2") (set! failures (+ failures 1)))
+            ())
+        (if (not (test-log))
+            (do (println "FAIL: test-log") (set! failures (+ failures 1)))
+            ())
+        (if (not (test-log10))
+            (do (println "FAIL: test-log10") (set! failures (+ failures 1)))
+            ())
+        (if (not (test-log2))
+            (do (println "FAIL: test-log2") (set! failures (+ failures 1)))
+            ())
+        ;; Trigonometry
+        (if (not (test-sin))
+            (do (println "FAIL: test-sin") (set! failures (+ failures 1)))
+            ())
+        (if (not (test-cos))
+            (do (println "FAIL: test-cos") (set! failures (+ failures 1)))
+            ())
+        (if (not (test-tan))
+            (do (println "FAIL: test-tan") (set! failures (+ failures 1)))
+            ())
+        (if (not (test-asin))
+            (do (println "FAIL: test-asin") (set! failures (+ failures 1)))
+            ())
+        (if (not (test-acos))
+            (do (println "FAIL: test-acos") (set! failures (+ failures 1)))
+            ())
+        (if (not (test-atan))
+            (do (println "FAIL: test-atan") (set! failures (+ failures 1)))
+            ())
+        (if (not (test-atan2))
+            (do (println "FAIL: test-atan2") (set! failures (+ failures 1)))
+            ())
+        (if (not (test-degrees-radians))
+            (do (println "FAIL: test-degrees-radians") (set! failures (+ failures 1)))
+            ())
+        ;; Hyperbolic
+        (if (not (test-sinh))
+            (do (println "FAIL: test-sinh") (set! failures (+ failures 1)))
+            ())
+        (if (not (test-cosh))
+            (do (println "FAIL: test-cosh") (set! failures (+ failures 1)))
+            ())
+        (if (not (test-tanh))
+            (do (println "FAIL: test-tanh") (set! failures (+ failures 1)))
+            ())
+        ;; Utilities
+        (if (not (test-is-finite))
+            (do (println "FAIL: test-is-finite") (set! failures (+ failures 1)))
+            ())
+        (if (not (test-copysign))
+            (do (println "FAIL: test-copysign") (set! failures (+ failures 1)))
+            ())
+        (if (not (test-lerp))
+            (do (println "FAIL: test-lerp") (set! failures (+ failures 1)))
+            ())
+        failures)))
+)

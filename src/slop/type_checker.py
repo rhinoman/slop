@@ -52,6 +52,7 @@ class TypeEnv:
         self.function_sigs: Dict[str, FnType] = {}
         self.imported_functions: Dict[str, FnType] = {}  # imported fn name -> type
         self.imported_types: Dict[str, Type] = {}  # imported type name -> type
+        self.deprecated_functions: Dict[str, str] = {}  # fn name -> deprecation message
         self._init_builtins()
 
     def _init_builtins(self):
@@ -102,6 +103,14 @@ class TypeEnv:
 
     def register_function(self, name: str, sig: FnType):
         self.function_sigs[name] = sig
+
+    def register_deprecated(self, name: str, message: str):
+        """Mark a function as deprecated with a message."""
+        self.deprecated_functions[name] = message
+
+    def get_deprecation_message(self, name: str) -> Optional[str]:
+        """Get deprecation message for a function, or None if not deprecated."""
+        return self.deprecated_functions.get(name)
 
     def lookup_function(self, name: str) -> Optional[FnType]:
         # Check local functions first
@@ -2091,6 +2100,11 @@ class TypeChecker:
             self.error(f"Undefined function or operator: '{fn_name}'", expr)
             return UNKNOWN
 
+        # Check if function is deprecated
+        deprecation_msg = self.env.get_deprecation_message(fn_name)
+        if deprecation_msg:
+            self.warning(f"'{fn_name}' is deprecated: {deprecation_msg}", expr)
+
         # Check argument count
         if len(args) != len(fn_type.param_types):
             self.error(f"Function '{fn_name}' expects {len(fn_type.param_types)} arguments, got {len(args)}", expr)
@@ -2417,8 +2431,9 @@ class TypeChecker:
                     param_type = self.parse_type_expr(ptype_expr)
                     param_types.append(param_type)
 
-        # Extract return type from @spec
+        # Extract return type from @spec and check for @deprecated
         return_type: Type = PrimitiveType('Unit')
+        deprecated_msg: Optional[str] = None
         for item in form.items[3:]:
             if is_form(item, '@spec') and len(item) > 1:
                 spec = item[1]
@@ -2429,9 +2444,19 @@ class TypeChecker:
                             if i + 1 < len(spec):
                                 return_type = self.parse_type_expr(spec[i + 1])
                             break
+            elif is_form(item, '@deprecated') and len(item) > 1:
+                # Extract deprecation message
+                if isinstance(item[1], String):
+                    deprecated_msg = item[1].value
+                else:
+                    deprecated_msg = str(item[1])
 
         fn_type = FnType(tuple(param_types), return_type)
         self.env.register_function(name, fn_type)
+
+        # Register deprecation if present
+        if deprecated_msg is not None:
+            self.env.register_deprecated(name, deprecated_msg)
 
     def _register_ffi_funcs(self, form: SList):
         """Register FFI function signatures and constants.

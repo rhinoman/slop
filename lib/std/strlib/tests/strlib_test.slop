@@ -1,0 +1,312 @@
+;; ============================================================
+;; Strings Test Module
+;;
+;; Tests for the strings.slop standard library functions.
+;;
+;; Run via: slop build lib/std/strings/tests/strings_test.slop && ./strings_test
+;; Returns 0 on success, non-zero = number of failed tests.
+;; ============================================================
+
+(module strlib-test
+  (export main)
+
+  (import strlib (
+    ;; Types
+    AsciiChar
+    ;; Character classification
+    is-alpha is-digit is-alnum is-space is-upper is-lower
+    is-ascii is-printable is-control
+    ;; Character conversion
+    char-to-upper char-to-lower
+    ;; String searching
+    index-of last-index-of contains starts-with ends-with
+    count-occurrences
+    ;; String manipulation
+    trim trim-start trim-end
+    pad-start pad-end
+    reverse repeat
+    substring
+    ;; String case conversion
+    to-upper to-lower to-title capitalize))
+
+  ;; ============================================================
+  ;; Tests: Character Classification
+  ;; ============================================================
+
+  (fn test-is-alpha ()
+    (@intent "Test is-alpha correctly identifies alphabetic characters")
+    (@spec (() -> Bool))
+    (and (is-alpha 65)      ;; 'A'
+         (is-alpha 97)      ;; 'a'
+         (not (is-alpha 48)) ;; '0'
+         (not (is-alpha 32)))) ;; ' '
+
+  (fn test-is-digit ()
+    (@intent "Test is-digit correctly identifies decimal digits")
+    (@spec (() -> Bool))
+    (and (is-digit 48)      ;; '0'
+         (is-digit 57)      ;; '9'
+         (not (is-digit 65)) ;; 'A'
+         (not (is-digit 32)))) ;; ' '
+
+  (fn test-is-alnum ()
+    (@intent "Test is-alnum correctly identifies alphanumeric characters")
+    (@spec (() -> Bool))
+    (and (is-alnum 65)      ;; 'A'
+         (is-alnum 48)      ;; '0'
+         (not (is-alnum 32)) ;; ' '
+         (not (is-alnum 45)))) ;; '-'
+
+  (fn test-is-space ()
+    (@intent "Test is-space correctly identifies whitespace")
+    (@spec (() -> Bool))
+    (and (is-space 32)      ;; ' '
+         (is-space 9)       ;; '\t'
+         (is-space 10)      ;; '\n'
+         (not (is-space 65)))) ;; 'A'
+
+  (fn test-is-upper-lower ()
+    (@intent "Test is-upper and is-lower correctly identify case")
+    (@spec (() -> Bool))
+    (and (is-upper 65)      ;; 'A'
+         (not (is-upper 97)) ;; 'a'
+         (is-lower 97)      ;; 'a'
+         (not (is-lower 65)))) ;; 'A'
+
+  (fn test-is-ascii ()
+    (@intent "Test is-ascii validates ASCII range")
+    (@spec (() -> Bool))
+    (and (is-ascii 0)
+         (is-ascii 127)
+         (not (is-ascii 128))
+         (not (is-ascii -1))))
+
+  (fn test-is-printable ()
+    (@intent "Test is-printable identifies visible characters")
+    (@spec (() -> Bool))
+    (and (is-printable 65)   ;; 'A'
+         (is-printable 32)   ;; ' '
+         (not (is-printable 0))   ;; NUL
+         (not (is-printable 27)))) ;; ESC
+
+  (fn test-is-control ()
+    (@intent "Test is-control identifies control characters")
+    (@spec (() -> Bool))
+    (and (is-control 0)      ;; NUL
+         (is-control 27)     ;; ESC
+         (not (is-control 65)) ;; 'A'
+         (not (is-control 32)))) ;; ' '
+
+  ;; ============================================================
+  ;; Tests: Character Conversion
+  ;; ============================================================
+
+  (fn test-char-to-upper ()
+    (@intent "Test char-to-upper converts lowercase to uppercase")
+    (@spec (() -> Bool))
+    (and (== (char-to-upper 97) 65)   ;; 'a' -> 'A'
+         (== (char-to-upper 65) 65)   ;; 'A' -> 'A'
+         (== (char-to-upper 48) 48))) ;; '0' -> '0'
+
+  (fn test-char-to-lower ()
+    (@intent "Test char-to-lower converts uppercase to lowercase")
+    (@spec (() -> Bool))
+    (and (== (char-to-lower 65) 97)   ;; 'A' -> 'a'
+         (== (char-to-lower 97) 97)   ;; 'a' -> 'a'
+         (== (char-to-lower 48) 48))) ;; '0' -> '0'
+
+  ;; ============================================================
+  ;; Tests: String Searching
+  ;; ============================================================
+
+  (fn test-index-of ()
+    (@intent "Test index-of finds first occurrence of substring")
+    (@spec (() -> Bool))
+    (and (match (index-of "hello world" "world")
+           ((some idx) (== idx 6))
+           ((none) false))
+         (match (index-of "hello" "xyz")
+           ((some _) false)
+           ((none) true))
+         (match (index-of "hello" "")
+           ((some idx) (== idx 0))
+           ((none) false))))
+
+  (fn test-last-index-of ()
+    (@intent "Test last-index-of finds last occurrence of substring")
+    (@spec (() -> Bool))
+    (and (match (last-index-of "hello hello" "hello")
+           ((some idx) (== idx 6))
+           ((none) false))
+         (match (last-index-of "hello" "xyz")
+           ((some _) false)
+           ((none) true))))
+
+  (fn test-contains ()
+    (@intent "Test contains checks for substring presence")
+    (@spec (() -> Bool))
+    (and (contains "hello world" "world")
+         (not (contains "hello" "xyz"))
+         (contains "hello" "")))
+
+  (fn test-starts-with ()
+    (@intent "Test starts-with checks string prefix")
+    (@spec (() -> Bool))
+    (and (starts-with "hello world" "hello")
+         (not (starts-with "hello" "world"))
+         (starts-with "hello" "")))
+
+  (fn test-ends-with ()
+    (@intent "Test ends-with checks string suffix")
+    (@spec (() -> Bool))
+    (and (ends-with "hello world" "world")
+         (not (ends-with "hello" "world"))
+         (ends-with "hello" "")))
+
+  (fn test-count-occurrences ()
+    (@intent "Test count-occurrences counts non-overlapping matches")
+    (@spec (() -> Bool))
+    (and (== (count-occurrences "ababa" "aba") 1)
+         (== (count-occurrences "hello hello hello" "hello") 3)
+         (== (count-occurrences "hello" "xyz") 0)))
+
+  ;; ============================================================
+  ;; Tests: String Manipulation
+  ;; ============================================================
+
+  (fn test-trim ()
+    (@intent "Test trim removes leading and trailing whitespace")
+    (@spec (() -> Bool))
+    (with-arena 256
+      (and (string-eq (trim arena "  hello  ") "hello")
+           (string-eq (trim arena "hello") "hello")
+           (== (. (trim arena "   ") len) 0))))
+
+  (fn test-trim-start ()
+    (@intent "Test trim-start removes leading whitespace")
+    (@spec (() -> Bool))
+    (with-arena 256
+      (and (string-eq (trim-start arena "  hello") "hello")
+           (string-eq (trim-start arena "hello  ") "hello  "))))
+
+  (fn test-trim-end ()
+    (@intent "Test trim-end removes trailing whitespace")
+    (@spec (() -> Bool))
+    (with-arena 256
+      (and (string-eq (trim-end arena "hello  ") "hello")
+           (string-eq (trim-end arena "  hello") "  hello"))))
+
+  (fn test-pad-start ()
+    (@intent "Test pad-start pads string at beginning")
+    (@spec (() -> Bool))
+    (with-arena 256
+      (and (string-eq (pad-start arena "hi" 5 32) "   hi")
+           (string-eq (pad-start arena "hello" 3 32) "hello"))))
+
+  (fn test-pad-end ()
+    (@intent "Test pad-end pads string at end")
+    (@spec (() -> Bool))
+    (with-arena 256
+      (and (string-eq (pad-end arena "hi" 5 32) "hi   ")
+           (string-eq (pad-end arena "hello" 3 32) "hello"))))
+
+  (fn test-reverse ()
+    (@intent "Test reverse reverses string characters")
+    (@spec (() -> Bool))
+    (with-arena 256
+      (and (string-eq (reverse arena "hello") "olleh")
+           (string-eq (reverse arena "a") "a")
+           (== (. (reverse arena "") len) 0))))
+
+  (fn test-repeat ()
+    (@intent "Test repeat duplicates string n times")
+    (@spec (() -> Bool))
+    (with-arena 256
+      (and (string-eq (repeat arena "ab" 3) "ababab")
+           (== (. (repeat arena "hello" 0) len) 0)
+           (== (. (repeat arena "" 5) len) 0))))
+
+  (fn test-substring ()
+    (@intent "Test substring extracts portion of string")
+    (@spec (() -> Bool))
+    (with-arena 256
+      (and (string-eq (substring arena "hello world" 0 5) "hello")
+           (string-eq (substring arena "hello world" 6 5) "world"))))
+
+  ;; ============================================================
+  ;; Tests: String Case Conversion
+  ;; ============================================================
+
+  (fn test-to-upper ()
+    (@intent "Test to-upper converts all characters to uppercase")
+    (@spec (() -> Bool))
+    (with-arena 256
+      (and (string-eq (to-upper arena "Hello World") "HELLO WORLD")
+           (string-eq (to-upper arena "123") "123"))))
+
+  (fn test-to-lower ()
+    (@intent "Test to-lower converts all characters to lowercase")
+    (@spec (() -> Bool))
+    (with-arena 256
+      (and (string-eq (to-lower arena "Hello World") "hello world")
+           (string-eq (to-lower arena "123") "123"))))
+
+  (fn test-to-title ()
+    (@intent "Test to-title capitalizes first letter of each word")
+    (@spec (() -> Bool))
+    (with-arena 256
+      (and (string-eq (to-title arena "hello world") "Hello World")
+           (string-eq (to-title arena "HELLO WORLD") "Hello World"))))
+
+  (fn test-capitalize ()
+    (@intent "Test capitalize uppercases first character only")
+    (@spec (() -> Bool))
+    (with-arena 256
+      (and (string-eq (capitalize arena "hello") "Hello")
+           (string-eq (capitalize arena "HELLO") "HELLO"))))
+
+  ;; ============================================================
+  ;; Main Entry Point
+  ;; ============================================================
+
+  (fn main ()
+    (@intent "Run all string tests and return failure count (0 = all passed)")
+    (@spec (() -> Int))
+
+    (let ((mut failures 0))
+      (do
+        ;; Character classification
+        (if (not (test-is-alpha)) (set! failures (+ failures 1)) ())
+        (if (not (test-is-digit)) (set! failures (+ failures 1)) ())
+        (if (not (test-is-alnum)) (set! failures (+ failures 1)) ())
+        (if (not (test-is-space)) (set! failures (+ failures 1)) ())
+        (if (not (test-is-upper-lower)) (set! failures (+ failures 1)) ())
+        (if (not (test-is-ascii)) (set! failures (+ failures 1)) ())
+        (if (not (test-is-printable)) (set! failures (+ failures 1)) ())
+        (if (not (test-is-control)) (set! failures (+ failures 1)) ())
+        ;; Character conversion
+        (if (not (test-char-to-upper)) (set! failures (+ failures 1)) ())
+        (if (not (test-char-to-lower)) (set! failures (+ failures 1)) ())
+        ;; String searching
+        (if (not (test-index-of)) (set! failures (+ failures 1)) ())
+        (if (not (test-last-index-of)) (set! failures (+ failures 1)) ())
+        (if (not (test-contains)) (set! failures (+ failures 1)) ())
+        (if (not (test-starts-with)) (set! failures (+ failures 1)) ())
+        (if (not (test-ends-with)) (set! failures (+ failures 1)) ())
+        (if (not (test-count-occurrences)) (set! failures (+ failures 1)) ())
+        ;; String manipulation
+        (if (not (test-trim)) (set! failures (+ failures 1)) ())
+        (if (not (test-trim-start)) (set! failures (+ failures 1)) ())
+        (if (not (test-trim-end)) (set! failures (+ failures 1)) ())
+        (if (not (test-pad-start)) (set! failures (+ failures 1)) ())
+        (if (not (test-pad-end)) (set! failures (+ failures 1)) ())
+        (if (not (test-reverse)) (set! failures (+ failures 1)) ())
+        (if (not (test-repeat)) (set! failures (+ failures 1)) ())
+        (if (not (test-substring)) (set! failures (+ failures 1)) ())
+        ;; String case conversion
+        (if (not (test-to-upper)) (set! failures (+ failures 1)) ())
+        (if (not (test-to-lower)) (set! failures (+ failures 1)) ())
+        (if (not (test-to-title)) (set! failures (+ failures 1)) ())
+        (if (not (test-capitalize)) (set! failures (+ failures 1)) ())
+        failures)))
+)

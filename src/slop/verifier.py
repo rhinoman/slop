@@ -231,6 +231,13 @@ class Z3Translator:
                 if op == 'nil':
                     return z3.IntVal(0)  # nil is address 0
 
+                # Control flow - path sensitive analysis
+                if op == 'if':
+                    return self._translate_if(expr)
+
+                if op == 'cond':
+                    return self._translate_cond(expr)
+
         return None
 
     def _translate_symbol(self, sym: Symbol) -> Optional[z3.ExprRef]:
@@ -377,6 +384,64 @@ class Z3Translator:
 
         return func(obj)
 
+    def _translate_if(self, expr: SList) -> Optional[z3.ExprRef]:
+        """Translate if expression to Z3 If()"""
+        # (if cond then else)
+        if len(expr) < 3:
+            return None
+
+        cond = self.translate_expr(expr[1])
+        then_expr = self.translate_expr(expr[2])
+
+        if cond is None or then_expr is None:
+            return None
+
+        # else is optional, defaults to 0
+        if len(expr) > 3:
+            else_expr = self.translate_expr(expr[3])
+            if else_expr is None:
+                return None
+        else:
+            # Default else to 0 (Unit)
+            else_expr = z3.IntVal(0)
+
+        return z3.If(cond, then_expr, else_expr)
+
+    def _translate_cond(self, expr: SList) -> Optional[z3.ExprRef]:
+        """Translate cond expression to nested Z3 If()"""
+        # (cond (test1 e1) (test2 e2) (else default))
+        # -> If(test1, e1, If(test2, e2, default))
+        if len(expr) < 2:
+            return None
+
+        result: Optional[z3.ExprRef] = None
+
+        # Process clauses in reverse order to build nested If
+        for clause in reversed(expr.items[1:]):
+            if not isinstance(clause, SList) or len(clause) < 2:
+                continue
+
+            first = clause[0]
+
+            # Check for (else body) clause
+            if isinstance(first, Symbol) and first.name == 'else':
+                result = self.translate_expr(clause[1])
+            else:
+                # Regular clause: (test body)
+                test = self.translate_expr(first)
+                body = self.translate_expr(clause[1])
+
+                if test is None or body is None:
+                    return None
+
+                if result is None:
+                    # Last clause without else - use body as default
+                    result = body
+                else:
+                    result = z3.If(test, body, result)
+
+        return result
+
 
 # ============================================================================
 # Contract Verifier
@@ -424,16 +489,25 @@ class ContractVerifier:
         fn_name = fn_form[1].name if isinstance(fn_form[1], Symbol) else "unknown"
         params = fn_form[2] if isinstance(fn_form[2], SList) else SList([])
 
-        # Extract contracts
+        # Extract contracts and function body
         preconditions: List[SExpr] = []
         postconditions: List[SExpr] = []
+        assumptions: List[SExpr] = []  # @assume - trusted axioms for verification
         spec_return_type: Optional[Type] = None
+        fn_body: Optional[SExpr] = None  # Function body for path-sensitive analysis
+
+        # Annotation forms to skip when looking for body
+        annotation_forms = {'@intent', '@spec', '@pre', '@post', '@assume', '@pure',
+                           '@alloc', '@example', '@deprecated', '@property',
+                           '@generation-mode', '@requires'}
 
         for item in fn_form.items[3:]:
             if is_form(item, '@pre') and len(item) > 1:
                 preconditions.append(item[1])
             elif is_form(item, '@post') and len(item) > 1:
                 postconditions.append(item[1])
+            elif is_form(item, '@assume') and len(item) > 1:
+                assumptions.append(item[1])
             elif is_form(item, '@spec') and len(item) > 1:
                 spec = item[1]
                 if isinstance(spec, SList) and len(spec) >= 3:
@@ -444,9 +518,19 @@ class ContractVerifier:
                             if i + 1 < len(spec):
                                 spec_return_type = self.type_checker.parse_type_expr(spec[i + 1])
                             break
+            elif isinstance(item, SList) and len(item) > 0:
+                # Check if this is an annotation form
+                head = item[0]
+                if isinstance(head, Symbol) and head.name in annotation_forms:
+                    continue
+                # This is the function body
+                fn_body = item
+            elif isinstance(item, (Symbol, Number)):
+                # Simple expression as body
+                fn_body = item
 
         # Skip if no contracts to verify
-        if not preconditions and not postconditions:
+        if not preconditions and not postconditions and not assumptions:
             return VerificationResult(
                 name=fn_name,
                 verified=True,
@@ -478,8 +562,8 @@ class ContractVerifier:
                     param_type = self.type_checker.parse_type_expr(param_type_expr)
                     translator.declare_variable(param_name, param_type)
 
-        # Declare $result for postconditions
-        if postconditions:
+        # Declare $result for postconditions and assumptions
+        if postconditions or assumptions:
             if spec_return_type:
                 # For enum return types, use Int and constrain to valid range
                 if isinstance(spec_return_type, EnumType):
@@ -514,6 +598,23 @@ class ContractVerifier:
             else:
                 failed_posts.append(post)
 
+        # Translate assumptions (trusted axioms)
+        assume_z3: List[z3.BoolRef] = []
+        failed_assumes: List[SExpr] = []
+        for assume in assumptions:
+            z3_assume = translator.translate_expr(assume)
+            if z3_assume is not None:
+                assume_z3.append(z3_assume)
+            else:
+                failed_assumes.append(assume)
+
+        # Translate function body for path-sensitive analysis
+        body_z3: Optional[z3.ExprRef] = None
+        if fn_body is not None and postconditions:
+            body_z3 = translator.translate_expr(fn_body)
+            # If we can translate the body, constrain $result to equal it
+            # This enables path-sensitive reasoning through conditionals
+
         # Report translation failures
         if failed_pres:
             return VerificationResult(
@@ -533,7 +634,26 @@ class ContractVerifier:
                 location=SourceLocation(self.type_checker.filename, fn_form.line, fn_form.col)
             )
 
+        if failed_assumes:
+            return VerificationResult(
+                name=fn_name,
+                verified=False,
+                status="failed",
+                message=f"Could not translate {len(failed_assumes)} assumption(s)",
+                location=SourceLocation(self.type_checker.filename, fn_form.line, fn_form.col)
+            )
+
         if not post_z3 and not postconditions:
+            # No postconditions to verify
+            if assume_z3:
+                # Only @assume (trusted axioms), consider verified via assumption
+                return VerificationResult(
+                    name=fn_name,
+                    verified=True,
+                    status="verified",
+                    message="Verified via @assume (trusted)",
+                    location=SourceLocation(self.type_checker.filename, fn_form.line, fn_form.col)
+                )
             # No postconditions at all, check if preconditions are satisfiable
             solver = z3.Solver()
             solver.set("timeout", self.timeout_ms)
@@ -572,6 +692,17 @@ class ContractVerifier:
         # Add preconditions
         for p in pre_z3:
             solver.add(p)
+
+        # Add assumptions as trusted axioms
+        for a in assume_z3:
+            solver.add(a)
+
+        # Add body constraint for path-sensitive analysis
+        # This constrains $result to equal the translated function body
+        if body_z3 is not None:
+            result_var = translator.variables.get('$result')
+            if result_var is not None:
+                solver.add(result_var == body_z3)
 
         # Add negation of postconditions
         solver.add(z3.Not(z3.And(*post_z3)))

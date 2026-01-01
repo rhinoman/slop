@@ -110,6 +110,7 @@ class Transpiler:
             'U16': 'uint16_t',
             'U32': 'uint32_t',
             'U64': 'uint64_t',
+            'Char': 'char',  # For C string interop (strtol, etc.)
             'Float': 'double',
             'F32': 'float',
             'Bool': 'uint8_t',
@@ -1155,6 +1156,78 @@ class Transpiler:
 
         return None
 
+    def _infer_expr_c_type(self, expr: SExpr) -> Optional[str]:
+        """Infer the C type of an expression for code generation.
+
+        Returns the C type name (e.g., 'double', 'int64_t') or None if unknown.
+        """
+        # Number literals
+        if isinstance(expr, Number):
+            if isinstance(expr.value, float):
+                return "double"
+            return "int64_t"
+
+        # String literals
+        if isinstance(expr, String):
+            return "slop_string"
+
+        # Symbol - check variable types
+        if isinstance(expr, Symbol):
+            name = expr.name
+            if name in self.var_types:
+                slop_type = self.var_types[name]
+                # Convert SLOP type to C type
+                if slop_type == 'Int':
+                    return 'int64_t'
+                elif slop_type == 'Float':
+                    return 'double'
+                elif slop_type == 'Bool':
+                    return 'uint8_t'
+                elif slop_type == 'String':
+                    return 'slop_string'
+                else:
+                    # It might already be a C type, or a custom type
+                    return slop_type
+            # Check for function call to known function
+            if name in self.functions:
+                return_type = self.functions[name].get('return_type')
+                if return_type:
+                    return self.to_c_type(return_type)
+            return None
+
+        # S-expression (function call or special form)
+        if isinstance(expr, SList) and len(expr) >= 1:
+            head = expr[0]
+            if isinstance(head, Symbol):
+                op = head.name
+                # Function call - check return type
+                if op in self.functions:
+                    return_type = self.functions[op].get('return_type')
+                    if return_type:
+                        return self.to_c_type(return_type)
+                # Module-prefixed call
+                if '/' in op:
+                    mod_name, fn_name = op.split('/', 1)
+                    prefixed_key = f"{mod_name}/{fn_name}"
+                    if prefixed_key in self.functions:
+                        return_type = self.functions[prefixed_key].get('return_type')
+                        if return_type:
+                            return self.to_c_type(return_type)
+                # Arithmetic operations return same type as operands
+                if op in ('+', '-', '*', '/', '%'):
+                    if len(expr) >= 2:
+                        operand_type = self._infer_expr_c_type(expr[1])
+                        if operand_type:
+                            return operand_type
+                # Comparison operations return bool
+                if op in ('==', '!=', '<', '<=', '>', '>=', 'and', 'or', 'not'):
+                    return "uint8_t"
+                # Cast expression
+                if op == 'cast' and len(expr) >= 2:
+                    return self.to_c_type(expr[1])
+
+        return None
+
     def _is_string_expr(self, expr: SExpr) -> bool:
         """Check if expression is a string type"""
         # Try resolved type first (set by type checker)
@@ -1995,6 +2068,9 @@ class Transpiler:
                 annotations.setdefault('pre', []).append(item[1] if len(item) > 1 else None)
             elif is_form(item, '@post'):
                 annotations.setdefault('post', []).append(item[1] if len(item) > 1 else None)
+            elif is_form(item, '@assume'):
+                # @assume is like @post for runtime checks (trusted axiom)
+                annotations.setdefault('assume', []).append(item[1] if len(item) > 1 else None)
             elif is_form(item, '@alloc'):
                 annotations['alloc'] = item[1].name if len(item) > 1 else None
             elif is_form(item, '@example'):
@@ -2044,8 +2120,8 @@ class Transpiler:
                 cond = self.transpile_expr(pre)
                 self.emit(f'SLOP_PRE({cond}, "{self.expr_to_str(pre)}");')
 
-        # Check if we have postconditions
-        has_post = bool(annotations.get('post'))
+        # Check if we have postconditions or assumptions (both need _retval)
+        has_post = bool(annotations.get('post')) or bool(annotations.get('assume'))
         needs_retval = has_post and return_type != 'void'
 
         # Declare return value variable if needed for postconditions
@@ -2089,6 +2165,14 @@ class Transpiler:
                 # Replace $result with _retval
                 cond = cond.replace('_result', '_retval')
                 self.emit(f'SLOP_POST({cond}, "{self.expr_to_str(post)}");')
+
+        # Emit runtime checks for assumptions (same as postconditions)
+        for assume in annotations.get('assume', []):
+            if assume:
+                cond = self.transpile_expr(assume)
+                # Replace $result with _retval
+                cond = cond.replace('_result', '_retval')
+                self.emit(f'SLOP_POST({cond}, "{self.expr_to_str(assume)}");')
 
         # Emit return after postconditions
         if needs_retval:
@@ -2148,6 +2232,10 @@ class Transpiler:
         """Transpile let binding"""
         bindings = expr[1]
         body = expr.items[2:]
+
+        # Open a new C block scope - allows variable shadowing without redefinition errors
+        self.emit("{")
+        self.indent += 1
 
         # Push scope for ScopedPtr tracking
         self._push_scoped_scope()
@@ -2239,10 +2327,18 @@ class Transpiler:
             if scoped:
                 self._emit_scoped_cleanup(scoped)
 
+        # Close the C block scope
+        self.indent -= 1
+        self.emit("}")
+
     def transpile_let_with_capture(self, expr: SList, capture_var: str):
         """Transpile let binding, capturing the final value in a variable"""
         bindings = expr[1]
         body = expr.items[2:]
+
+        # Open a new C block scope - allows variable shadowing without redefinition errors
+        self.emit("{")
+        self.indent += 1
 
         # Push scope for ScopedPtr tracking
         self._push_scoped_scope()
@@ -2305,6 +2401,10 @@ class Transpiler:
         scoped = self._pop_scoped_scope()
         if scoped:
             self._emit_scoped_cleanup(scoped)
+
+        # Close the C block scope
+        self.indent -= 1
+        self.emit("}")
 
     def transpile_if(self, expr: SList, is_return: bool):
         """Transpile if expression"""
@@ -2886,9 +2986,17 @@ class Transpiler:
                     # Emit bindings
                     for binding in bindings.items:
                         if isinstance(binding, SList) and len(binding) >= 2:
-                            var_name = self.to_c_name(binding[0].name)
-                            # Handle typed bindings: (name Type init) vs untyped: (name init)
-                            init_expr = binding[2] if len(binding) >= 3 else binding[1]
+                            # Skip 'mut' keyword if present: (mut name init) or (mut name Type init)
+                            idx = 0
+                            if isinstance(binding[0], Symbol) and binding[0].name == 'mut':
+                                idx = 1
+
+                            var_name = self.to_c_name(binding[idx].name)
+                            # Handle typed bindings: (name Type init) or (mut name Type init) vs untyped
+                            if len(binding) >= idx + 3:
+                                init_expr = binding[idx + 2]  # typed: (name Type init)
+                            else:
+                                init_expr = binding[idx + 1]  # untyped: (name init)
                             val = self.transpile_expr(init_expr)
                             parts.append(f" __auto_type {var_name} = {val};")
 
@@ -2956,7 +3064,16 @@ class Transpiler:
 
                 # Cond as expression (GCC statement expression)
                 if op == 'cond':
-                    parts = ["({ int64_t _cond_result; "]
+                    # Infer result type from first branch body
+                    result_type = "int64_t"  # default fallback
+                    for clause in expr.items[1:]:
+                        if isinstance(clause, SList) and len(clause) >= 2:
+                            body = clause.items[-1]
+                            inferred = self._infer_expr_c_type(body)
+                            if inferred:
+                                result_type = inferred
+                                break
+                    parts = [f"({{ {result_type} _cond_result; "]
                     first = True
                     for clause in expr.items[1:]:
                         if isinstance(clause, SList) and len(clause) >= 2:
@@ -3033,8 +3150,10 @@ class Transpiler:
                         c_type = self.to_c_type(size_expr)
                         return f"(({c_type}*)slop_arena_alloc({arena}, sizeof({c_type})))"
                     else:
+                        # No type info available - default to uint8_t* for byte-level access
+                        # This allows (@ buf i) to work without void* indexing errors
                         size = self.transpile_expr(size_expr)
-                        return f"slop_arena_alloc({arena}, {size})"
+                        return f"(uint8_t*)slop_arena_alloc({arena}, {size})"
 
                 if op == 'make-scoped':
                     # (make-scoped Type count) -> malloc allocation with auto-cleanup
