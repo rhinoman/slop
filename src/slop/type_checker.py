@@ -397,6 +397,18 @@ class TypeChecker:
 
         return typ  # Can't refine non-numeric types
 
+    def _refine_type_with_bounds(self, typ: Type, bounds: RangeBounds) -> Type:
+        """Apply bounds directly to refine a type's range."""
+        if isinstance(typ, RangeType):
+            new_bounds = typ.bounds.intersect(bounds)
+            return RangeType(typ.base, new_bounds)
+
+        if isinstance(typ, PrimitiveType):
+            if typ.name in ('Int', 'I8', 'I16', 'I32', 'I64', 'U8', 'U16', 'U32', 'U64'):
+                return RangeType(typ.name, bounds)
+
+        return typ  # Can't refine non-numeric types
+
     # ========================================================================
     # Type Expression Parsing
     # ========================================================================
@@ -728,21 +740,73 @@ class TypeChecker:
                 self.infer_expr(expr[2])  # type check body but ignore result
             return UNIT
 
-        # Cond expression (multi-way conditional)
+        # Cond expression (multi-way conditional) with path-sensitive refinement
         if op == 'cond':
             # (cond (test1 body1) (test2 body2) ... (else bodyN))
-            result_type: Type = UNIT
+            # Each clause's body sees: its condition is true AND all previous conditions were false
+            result_types: List[Type] = []
+            accumulated_negations: Dict[str, RangeBounds] = {}  # var -> accumulated bounds
+
             for clause in expr.items[1:]:
-                if isinstance(clause, SList) and len(clause) >= 2:
-                    test = clause[0]
-                    body = clause[1]
-                    # Check condition (unless 'else')
-                    if not (isinstance(test, Symbol) and test.name == 'else'):
-                        test_type = self.infer_expr(test)
-                        self._expect_type(test_type, PrimitiveType('Bool'), "cond test", test)
-                    # Infer body type
-                    result_type = self.infer_expr(body)
-            return result_type
+                if not isinstance(clause, SList) or len(clause) < 2:
+                    continue
+
+                test = clause[0]
+                body = clause[1]
+
+                if isinstance(test, Symbol) and test.name == 'else':
+                    # Else clause: apply all accumulated negations
+                    refinements: Dict[str, Type] = {}
+                    for var, bounds in accumulated_negations.items():
+                        var_type = self._lookup_var_for_refinement(var)
+                        if var_type:
+                            refined = self._refine_type_with_bounds(var_type, bounds)
+                            refinements[var] = refined
+
+                    self._push_refinements(refinements)
+                    result_types.append(self.infer_expr(body))
+                    self._pop_refinements()
+                else:
+                    # Regular clause: type check condition
+                    test_type = self.infer_expr(test)
+                    self._expect_type(test_type, PrimitiveType('Bool'), "cond test", test)
+
+                    # Extract constraint for path-sensitive refinement
+                    constraint = self._extract_constraint(test)
+
+                    refinements = {}
+                    if constraint:
+                        var_type = self._lookup_var_for_refinement(constraint.var)
+                        if var_type:
+                            # Start with accumulated bounds for this var (if any)
+                            if constraint.var in accumulated_negations:
+                                base_bounds = accumulated_negations[constraint.var]
+                                var_type = self._refine_type_with_bounds(var_type, base_bounds)
+
+                            # Apply this clause's condition
+                            refined = self._refine_type_with_constraint(var_type, constraint)
+                            refinements[constraint.var] = refined
+
+                            # Update accumulated negations for subsequent clauses
+                            negated = constraint.negate()
+                            neg_bounds = negated.to_bounds()
+                            if constraint.var in accumulated_negations:
+                                accumulated_negations[constraint.var] = \
+                                    accumulated_negations[constraint.var].intersect(neg_bounds)
+                            else:
+                                accumulated_negations[constraint.var] = neg_bounds
+
+                    self._push_refinements(refinements)
+                    result_types.append(self.infer_expr(body))
+                    self._pop_refinements()
+
+            # Unify all branch types
+            if not result_types:
+                return UNIT
+            result = result_types[0]
+            for t in result_types[1:]:
+                result = self._unify_branch_types(result, t)
+            return result
 
         # Match expression
         if op == 'match':
