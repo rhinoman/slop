@@ -256,6 +256,7 @@ identifier               ; Variable reference
 ; Arithmetic
 (+ a b) (- a b) (* a b) (/ a b) (% a b)
 (& a b) (| a b) (^ a b) (<< a n) (>> a n)
+(min a b) (max a b)              ; Minimum/maximum of two values
 
 ; Comparison  
 (== a b) (!= a b) (< a b) (<= a b) (> a b) (>= a b)

@@ -1459,6 +1459,11 @@ class HoleFiller:
             context_set = set(hole.context)
             # Include FFI functions - they're globally available
             ffi_names = {s['name'] for s in context.get('ffi_specs', [])}
+            # Validate context items are actually defined
+            valid_items = VALID_EXPRESSION_FORMS | BUILTIN_FUNCTIONS | defined_fns | enum_variants | ffi_names
+            invalid_context = context_set - valid_items
+            if invalid_context:
+                errors.append(f"Invalid context items (not defined): {', '.join(sorted(invalid_context))}")
             # Allow built-in forms, built-in functions, enum variants, FFI functions, and context items
             context_allowed = VALID_EXPRESSION_FORMS | BUILTIN_FUNCTIONS | enum_variants | ffi_names | context_set
             disallowed = calls - context_allowed

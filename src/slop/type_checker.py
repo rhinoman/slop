@@ -692,8 +692,16 @@ class TypeChecker:
         if op in ('+', '-', '*', '/', '%'):
             return self._infer_arithmetic(op, expr)
 
-        # Comparisons
-        if op in ('==', '!=', '<', '<=', '>', '>='):
+        # Bitwise operators - return Int
+        if op in ('&', '|', '^', '<<', '>>'):
+            # Type check operands as Int
+            for arg in expr.items[1:]:
+                arg_type = self.infer_expr(arg)
+                self._expect_type(arg_type, PrimitiveType('Int'), f"bitwise {op} operand", arg)
+            return PrimitiveType('Int')
+
+        # Comparisons (= is an alias for ==)
+        if op in ('==', '!=', '<', '<=', '>', '>=', '='):
             self._check_comparison(expr)
             return PrimitiveType('Bool')
 
@@ -711,6 +719,31 @@ class TypeChecker:
         if op == 'if':
             return self._infer_if(expr)
 
+        # When expression (if without else, returns Unit)
+        if op == 'when':
+            if len(expr) >= 2:
+                cond_type = self.infer_expr(expr[1])
+                self._expect_type(cond_type, PrimitiveType('Bool'), "when condition", expr[1])
+            if len(expr) >= 3:
+                self.infer_expr(expr[2])  # type check body but ignore result
+            return UNIT
+
+        # Cond expression (multi-way conditional)
+        if op == 'cond':
+            # (cond (test1 body1) (test2 body2) ... (else bodyN))
+            result_type: Type = UNIT
+            for clause in expr.items[1:]:
+                if isinstance(clause, SList) and len(clause) >= 2:
+                    test = clause[0]
+                    body = clause[1]
+                    # Check condition (unless 'else')
+                    if not (isinstance(test, Symbol) and test.name == 'else'):
+                        test_type = self.infer_expr(test)
+                        self._expect_type(test_type, PrimitiveType('Bool'), "cond test", test)
+                    # Infer body type
+                    result_type = self.infer_expr(body)
+            return result_type
+
         # Match expression
         if op == 'match':
             return self._infer_match(expr)
@@ -722,6 +755,16 @@ class TypeChecker:
         # Do block
         if op == 'do':
             return self._infer_do(expr)
+
+        # Control flow - break, continue, return
+        if op == 'break':
+            return UNIT
+        if op == 'continue':
+            return UNIT
+        if op == 'return':
+            if len(expr) >= 2:
+                return self.infer_expr(expr[1])
+            return UNIT
 
         # Field access
         if op == '.':
@@ -793,6 +836,24 @@ class TypeChecker:
         if op == 'list':
             return self._infer_list_literal(expr)
 
+        # Array literal: (array e1 e2 ...)
+        if op == 'array':
+            if len(expr) >= 2:
+                elem_types = [self.infer_expr(e) for e in expr.items[1:]]
+                if elem_types:
+                    return ArrayType(elem_types[0], len(elem_types))
+            return UNKNOWN
+
+        # Union construction: (union-new Type Tag value)
+        if op == 'union-new':
+            if len(expr) >= 2:
+                type_expr = expr[1]
+                type_name = type_expr.name if isinstance(type_expr, Symbol) else str(type_expr)
+                union_type = self.env.lookup_type(type_name)
+                if union_type:
+                    return union_type
+            return UNKNOWN
+
         # Quote - check if it's an enum variant
         if op == 'quote':
             if len(expr) > 1 and isinstance(expr[1], Symbol):
@@ -822,6 +883,62 @@ class TypeChecker:
         if op == 'cast':
             if len(expr) >= 2:
                 return self.parse_type_expr(expr[1])
+            return UNKNOWN
+
+        # Sizeof - returns Int
+        if op == 'sizeof':
+            # (sizeof Type) - just validate type exists, return Int
+            return PrimitiveType('Int')
+
+        # Address-of - returns pointer to type
+        if op == 'addr':
+            if len(expr) >= 2:
+                inner_type = self.infer_expr(expr[1])
+                return PtrType(inner_type)
+            return UNKNOWN
+
+        # Dereference - unwrap pointer
+        if op == 'deref':
+            if len(expr) >= 2:
+                ptr_type = self.infer_expr(expr[1])
+                if isinstance(ptr_type, PtrType):
+                    return ptr_type.pointee
+            return UNKNOWN
+
+        # Record-new - create record with field values
+        if op == 'record-new':
+            # (record-new Type (field1 val1) (field2 val2) ...)
+            if len(expr) >= 2:
+                type_expr = expr[1]
+                # Handle inline record type: (record-new (record (x Int) (y Int)) ...)
+                if is_form(type_expr, 'record'):
+                    record_type = self.parse_type_expr(type_expr)
+                    # Type check field values
+                    if isinstance(record_type, RecordType):
+                        for field_init in expr.items[2:]:
+                            if isinstance(field_init, SList) and len(field_init) >= 2:
+                                field_name = field_init[0].name if isinstance(field_init[0], Symbol) else str(field_init[0])
+                                field_val = field_init[1]
+                                expected_type = record_type.fields.get(field_name)
+                                if expected_type:
+                                    actual_type = self.infer_expr(field_val)
+                                    self._check_assignable(actual_type, expected_type, f"field '{field_name}'", field_val)
+                    return record_type
+                else:
+                    # Named record type: (record-new Point (x 1) (y 2))
+                    type_name = type_expr.name if isinstance(type_expr, Symbol) else str(type_expr)
+                    record_type = self.env.lookup_type(type_name)
+                    if record_type and isinstance(record_type, RecordType):
+                        # Type check field values
+                        for field_init in expr.items[2:]:
+                            if isinstance(field_init, SList) and len(field_init) >= 2:
+                                field_name = field_init[0].name if isinstance(field_init[0], Symbol) else str(field_init[0])
+                                field_val = field_init[1]
+                                expected_type = record_type.fields.get(field_name)
+                                if expected_type:
+                                    actual_type = self.infer_expr(field_val)
+                                    self._check_assignable(actual_type, expected_type, f"field '{field_name}'", field_val)
+                        return record_type
             return UNKNOWN
 
         # With-arena
@@ -1890,7 +2007,12 @@ class TypeChecker:
                 elif isinstance(type_obj, EnumType):
                     # Enum used as type - just return the type
                     return type_obj
-            # Unknown function - might be FFI or runtime
+            # Check if it's a known builtin
+            if fn_name in BUILTIN_FUNCTIONS:
+                # Builtin functions - return UNKNOWN type but don't error
+                return UNKNOWN
+            # Undefined function - reject it
+            self.error(f"Undefined function or operator: '{fn_name}'", expr)
             return UNKNOWN
 
         # Check argument count
