@@ -650,6 +650,7 @@ def extract_documentation(ast) -> dict:
             'examples': [],
             'pure': False,
             'alloc': None,
+            'deprecated': None,
         }
 
         # Extract parameters
@@ -692,6 +693,8 @@ def extract_documentation(ast) -> dict:
                 fn_info['pure'] = True
             elif is_form(item, '@alloc') and len(item) > 1:
                 fn_info['alloc'] = item[1].name if isinstance(item[1], Symbol) else str(item[1])
+            elif is_form(item, '@deprecated') and len(item) > 1:
+                fn_info['deprecated'] = item[1].value if isinstance(item[1], String) else str(item[1])
 
         return fn_info
 
@@ -802,6 +805,11 @@ def render_markdown(doc: dict) -> str:
             else:
                 lines.append(f"### {fn['name']} *(internal)*")
             lines.append("")
+
+            # Deprecation warning
+            if fn['deprecated']:
+                lines.append(f"**DEPRECATED:** {fn['deprecated']}")
+                lines.append("")
 
             # Intent
             if fn['intent']:

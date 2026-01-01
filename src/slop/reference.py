@@ -128,6 +128,18 @@ TOPICS = {
   (@example (5) -> 120)
   ...)
 
+### Deprecation
+(@deprecated "message")                 ; Mark function as deprecated
+
+; Example
+(fn old-api ((x Int))
+  (@intent "Old API function")
+  (@spec ((Int) -> Int))
+  (@deprecated "use new-api instead")
+  x)
+
+; Calling deprecated functions emits a warning during type checking
+
 ### Advanced Annotations
 (@property (forall (x T) expr))        ; Property assertion
 (@generation-mode mode)                 ; deterministic|template|llm

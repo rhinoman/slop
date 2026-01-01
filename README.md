@@ -151,6 +151,11 @@ slop ref                      # Full reference
 slop ref types                # Just type system
 slop ref --list               # List available topics
 
+# Generate documentation from source
+slop doc examples/fibonacci.slop           # Markdown to stdout
+slop doc examples/fibonacci.slop -o doc.md # Write to file
+slop doc examples/fibonacci.slop -f json   # JSON output for tooling
+
 # Validate a hole implementation against expected type
 slop check-hole '(+ x 1)' -t Int -p '((x Int))'
 
