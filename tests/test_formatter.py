@@ -141,12 +141,12 @@ class TestFormatHole:
     """Test hole expression formatting."""
 
     def test_hole_multiline(self):
-        source = '(hole Int "compute something" :complexity tier-2 :must-use (x y))'
+        source = '(hole Int "compute something" :complexity tier-2 :required (x y))'
         result = format_source(source)
         lines = result.strip().split('\n')
         assert lines[0] == "(hole Int"
         assert any(":complexity" in line for line in lines)
-        assert any(":must-use" in line for line in lines)
+        assert any(":required" in line for line in lines)
 
 
 class TestRoundTrip:

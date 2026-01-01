@@ -1378,8 +1378,6 @@ def cmd_check(args):
             for h in holes:
                 info = extract_hole(h)
                 errors.append(f"Unfilled hole: {info.prompt}")
-                if not info.context:
-                    warnings.append(f"Hole missing :context - add for better LLM guidance: {info.prompt[:50]}...")
 
             if is_form(form, 'fn') or is_form(form, 'impl'):
                 has_intent = any(is_form(item, '@intent') for item in form.items)

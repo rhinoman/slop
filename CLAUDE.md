@@ -102,7 +102,7 @@ Located in `tree-sitter-slop/`:
   body)
 
 ;; Holes for LLM generation
-(hole Type "prompt" :complexity tier-2 :must-use (var1 var2))
+(hole Type "prompt" :complexity tier-2 :required (var1 var2))
 
 ;; FFI
 (ffi "header.h" (func-name ((param Type)) ReturnType))

@@ -373,7 +373,7 @@ class TestSlopFunctionOutput:
         assert "@pre" not in output
         assert "@post" not in output
         assert "@example" not in output
-        assert ":must-use" not in output
+        assert ":required" not in output
 
 
 class TestStorageModes:
