@@ -6,14 +6,9 @@
   (fn fizzbuzz ((n (Int 1 .. 100)))
     (@intent "Return Fizz for multiples of 3, Buzz for multiples of 5, FizzBuzz for both, Number otherwise")
     (@spec (((Int 1 .. 100)) -> FizzBuzzResult))
-    (@pre (>= n 1))
-    (@pre (<= n 100))
-    (@post
-      (or
-        (== $result 'Fizz)
-        (== $result 'Buzz)
-        (== $result 'FizzBuzz)
-        (== $result 'Number)))
+    (@pre {n >= 1})
+    (@pre {n <= 100})
+    (@post {$result == 'Fizz or $result == 'Buzz or $result == 'FizzBuzz or $result == 'Number})
     (@example (15) -> FizzBuzz)
     (@example (9) -> Fizz)
     (@example (10) -> Buzz)
