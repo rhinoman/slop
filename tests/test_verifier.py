@@ -404,3 +404,119 @@ class TestZ3Available:
         """Z3_AVAILABLE should be True when z3 is installed"""
         from slop.verifier import Z3_AVAILABLE
         assert Z3_AVAILABLE is True
+
+
+class TestInfixContractVerification:
+    """Test that infix contract notation works with Z3 verification"""
+
+    def test_infix_precondition_verifies(self):
+        """Infix @pre works with verification"""
+        from slop.verifier import verify_source
+
+        source = """
+        (module test
+          (fn positive ((x Int))
+            (@spec ((Int) -> Bool))
+            (@pre {x > 0})
+            (@post (== $result true))
+            true))
+        """
+        results = verify_source(source)
+        assert len(results) >= 1
+
+    def test_infix_postcondition_verifies(self):
+        """Infix @post works with verification"""
+        from slop.verifier import verify_source
+
+        source = """
+        (module test
+          (fn identity ((x Int))
+            (@spec ((Int) -> Int))
+            (@pre (> x 0))
+            (@post {$result == x})
+            x))
+        """
+        results = verify_source(source)
+        verified = [r for r in results if r.status == 'verified']
+        assert len(verified) >= 1
+
+    def test_infix_and_prefix_equivalent(self):
+        """Infix and prefix produce identical verification results"""
+        from slop.verifier import verify_source
+
+        # Prefix version
+        source_prefix = """
+        (module test
+          (fn check ((x Int))
+            (@spec ((Int) -> Int))
+            (@pre (and (>= x 0) (<= x 100)))
+            (@post (>= $result 0))
+            x))
+        """
+
+        # Infix version - semantically identical
+        source_infix = """
+        (module test
+          (fn check ((x Int))
+            (@spec ((Int) -> Int))
+            (@pre {x >= 0 and x <= 100})
+            (@post {$result >= 0})
+            x))
+        """
+
+        results_prefix = verify_source(source_prefix)
+        results_infix = verify_source(source_infix)
+
+        # Both should have same verification outcome
+        assert len(results_prefix) == len(results_infix)
+        for rp, ri in zip(results_prefix, results_infix):
+            assert rp.status == ri.status
+
+    def test_infix_complex_expression(self):
+        """Complex infix expressions verify correctly"""
+        from slop.verifier import verify_source
+
+        source = """
+        (module test
+          (fn range-check ((x Int) (y Int))
+            (@spec ((Int Int) -> Bool))
+            (@pre {x >= 0 and y >= 0 and x < 100 and y < 100})
+            (@post {$result == true or $result == false})
+            (< x y)))
+        """
+        results = verify_source(source)
+        verified = [r for r in results if r.status == 'verified']
+        assert len(verified) >= 1
+
+    def test_infix_with_arithmetic(self):
+        """Infix arithmetic in contracts verifies correctly"""
+        from slop.verifier import verify_source
+
+        source = """
+        (module test
+          (fn double ((x Int))
+            (@spec ((Int) -> Int))
+            (@pre {x >= 0})
+            (@post {$result >= x})
+            (* x 2)))
+        """
+        results = verify_source(source)
+        # Should have results (verification may or may not succeed
+        # depending on body analysis, but should not error)
+        assert len(results) >= 1
+
+    def test_infix_assume(self):
+        """Infix @assume works with verification"""
+        from slop.verifier import verify_source
+
+        source = """
+        (module test
+          (fn positive-result ((x Int))
+            (@spec ((Int) -> Int))
+            (@pre {x > 0})
+            (@assume {$result > 0})
+            x))
+        """
+        results = verify_source(source)
+        # Should process without errors
+        assert len(results) >= 1

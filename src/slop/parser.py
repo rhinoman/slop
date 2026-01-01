@@ -96,6 +96,8 @@ class Lexer:
         ('WHITESPACE', r'\s+'),
         ('LPAREN', r'\('),
         ('RPAREN', r'\)'),
+        ('LBRACE', r'\{'),
+        ('RBRACE', r'\}'),
         ('STRING', r'"(?:[^"\\]|\\.)*"'),
         ('NUMBER', r'-?\d+\.?\d*'),
         ('QUOTE', r"'"),
@@ -145,10 +147,22 @@ class Lexer:
         return tokens
 
 
+# Operator precedence for infix expressions (higher = binds tighter)
+INFIX_PRECEDENCE = {
+    'or': 1,
+    'and': 2,
+    '==': 3, '!=': 3,
+    '<': 4, '<=': 4, '>': 4, '>=': 4,
+    '+': 5, '-': 5,
+    '*': 6, '/': 6, '%': 6,
+}
+
+
 class Parser:
     def __init__(self, source: str):
         self.tokens = Lexer(source).tokenize()
         self.pos = 0
+        self.in_contract = False  # Track if inside @pre/@post/@assume
 
     def parse(self) -> List[SExpr]:
         forms = []
@@ -162,7 +176,9 @@ class Parser:
 
         kind, value, line, col = self.tokens[self.pos]
 
-        if kind == 'LPAREN':
+        if kind == 'LBRACE':
+            return self.parse_infix_expr()
+        elif kind == 'LPAREN':
             return self.parse_list()
         elif kind == 'NUMBER':
             self.pos += 1
@@ -200,14 +216,215 @@ class Parser:
         self.pos += 1
         items = []
 
+        # Track if this is a contract form for infix support
+        is_contract_form = False
+
         while self.pos < len(self.tokens):
-            kind, _, _, _ = self.tokens[self.pos]
+            kind, value, _, _ = self.tokens[self.pos]
             if kind == 'RPAREN':
                 self.pos += 1
                 return SList(items, line, col)
-            items.append(self.parse_expr())
+
+            # Detect contract annotations after parsing first item
+            if len(items) == 0 and kind == 'SYMBOL' and value in ('@pre', '@post', '@assume'):
+                is_contract_form = True
+
+            # Set in_contract context when parsing the argument of a contract
+            if is_contract_form and len(items) == 1:
+                old_in_contract = self.in_contract
+                self.in_contract = True
+                try:
+                    items.append(self.parse_expr())
+                finally:
+                    self.in_contract = old_in_contract
+            else:
+                items.append(self.parse_expr())
 
         raise ParseError("Unclosed list", line, col)
+
+    def parse_infix_expr(self) -> SExpr:
+        """Parse {infix expression} and convert to prefix AST.
+
+        Only allowed inside @pre, @post, or @assume contracts.
+        """
+        _, _, line, col = self.tokens[self.pos]
+
+        if not self.in_contract:
+            raise ParseError(
+                "Infix syntax {expr} is only allowed inside @pre, @post, or @assume",
+                line, col
+            )
+
+        self.pos += 1  # consume LBRACE
+
+        if self.pos >= len(self.tokens):
+            raise ParseError("Unexpected end of input in infix expression", line, col)
+
+        # Check for empty braces
+        if self.tokens[self.pos][0] == 'RBRACE':
+            raise ParseError("Empty infix expression", line, col)
+
+        ast = self._parse_infix_precedence(0)
+
+        # Expect RBRACE
+        if self.pos >= len(self.tokens):
+            raise ParseError("Expected '}' to close infix expression", line, col)
+        if self.tokens[self.pos][0] != 'RBRACE':
+            _, val, ln, cl = self.tokens[self.pos]
+            raise ParseError(f"Expected '}}', got '{val}'", ln, cl)
+        self.pos += 1
+
+        return ast
+
+    def _parse_infix_precedence(self, min_prec: int) -> SExpr:
+        """Precedence climbing algorithm for infix expressions."""
+        left = self._parse_infix_atom()
+
+        while True:
+            op = self._peek_binary_op()
+            if op is None:
+                break
+            op_prec = INFIX_PRECEDENCE.get(op)
+            if op_prec is None or op_prec < min_prec:
+                break
+
+            # Consume operator
+            _, _, op_line, op_col = self.tokens[self.pos]
+            self.pos += 1
+
+            # Left associative: use op_prec + 1 for right operand
+            right = self._parse_infix_precedence(op_prec + 1)
+
+            # Convert to prefix form: a + b -> (+ a b)
+            left = SList([Symbol(op, op_line, op_col), left, right], left.line, left.col)
+
+        return left
+
+    def _peek_binary_op(self) -> str | None:
+        """Peek at current token and return operator name if it's a binary operator."""
+        if self.pos >= len(self.tokens):
+            return None
+
+        kind, value, _, _ = self.tokens[self.pos]
+
+        # Check for RBRACE or RPAREN - end of expression
+        if kind in ('RBRACE', 'RPAREN'):
+            return None
+
+        # 'and' and 'or' are symbols, not operators
+        if kind == 'SYMBOL' and value in ('and', 'or'):
+            return value
+
+        # Standard operators
+        if kind == 'OPERATOR' and value in INFIX_PRECEDENCE:
+            return value
+
+        return None
+
+    def _parse_infix_atom(self) -> SExpr:
+        """Parse atomic element in infix expression."""
+        if self.pos >= len(self.tokens):
+            raise ParseError("Unexpected end of input in infix expression")
+
+        kind, value, line, col = self.tokens[self.pos]
+
+        # Unary 'not'
+        if kind == 'SYMBOL' and value == 'not':
+            self.pos += 1
+            operand = self._parse_infix_atom()
+            return SList([Symbol('not', line, col), operand], line, col)
+
+        # Unary minus (only at start or after operator, handled by context)
+        if kind == 'OPERATOR' and value == '-':
+            self.pos += 1
+            operand = self._parse_infix_atom()
+            # Convert to (- 0 x) for unary negation
+            return SList([Symbol('-', line, col), Number(0, line, col), operand], line, col)
+
+        # Parenthesized expression - could be grouping OR prefix S-expression
+        if kind == 'LPAREN':
+            return self._parse_infix_paren()
+
+        # Number
+        if kind == 'NUMBER':
+            self.pos += 1
+            return Number(float(value) if '.' in value else int(value), line, col)
+
+        # String
+        if kind == 'STRING':
+            self.pos += 1
+            return String(_unescape_string(value[1:-1]), line, col)
+
+        # Symbol (variable, $result, etc.)
+        if kind == 'SYMBOL':
+            self.pos += 1
+            return Symbol(value, line, col)
+
+        # Quote
+        if kind == 'QUOTE':
+            self.pos += 1
+            quoted = self._parse_infix_atom()
+            return SList([Symbol('quote', line, col), quoted], line, col)
+
+        raise ParseError(f"Unexpected token in infix expression: {value}", line, col)
+
+    def _parse_infix_paren(self) -> SExpr:
+        """Parse parenthesized expression in infix context.
+
+        Distinguishes between:
+        - Grouping: (a + b) -> recurse infix
+        - Prefix form: (len arr) or (. ptr field) -> parse as S-expression
+        """
+        _, _, line, col = self.tokens[self.pos]
+
+        # Look ahead to determine if this is a function call or grouping
+        # Save position for potential backtracking
+        save_pos = self.pos
+        self.pos += 1  # consume LPAREN
+
+        if self.pos >= len(self.tokens):
+            raise ParseError("Unexpected end of input after '('", line, col)
+
+        kind, value, _, _ = self.tokens[self.pos]
+
+        # If first element is a symbol, check if it's followed by an operator
+        # If not followed by an operator, it's likely a function call
+        if kind == 'SYMBOL':
+            # Check next token
+            if self.pos + 1 < len(self.tokens):
+                next_kind, next_val, _, _ = self.tokens[self.pos + 1]
+                # If next is RPAREN, it could be (x) grouping or (x) single element
+                # If next is not an operator, treat as prefix call
+                if next_kind == 'RPAREN':
+                    # Single element in parens, treat as grouping
+                    self.pos += 1  # consume symbol
+                    result = Symbol(value, line, col)
+                    self.pos += 1  # consume RPAREN
+                    return result
+                elif next_kind not in ('OPERATOR',) and next_val not in ('and', 'or'):
+                    # This is a function call like (len arr) - parse as prefix
+                    self.pos = save_pos
+                    # Temporarily exit contract mode to parse the S-expression normally
+                    return self.parse_list()
+
+        # Special case: if first element is an operator like '.', '-', '+', etc.
+        # These are prefix function calls like (. obj field) or (- 0 n)
+        if kind == 'OPERATOR':
+            self.pos = save_pos
+            return self.parse_list()
+
+        # Otherwise treat as grouping - parse as infix
+        expr = self._parse_infix_precedence(0)
+
+        # Expect RPAREN
+        if self.pos >= len(self.tokens):
+            raise ParseError("Expected ')' in infix grouping", line, col)
+        if self.tokens[self.pos][0] != 'RPAREN':
+            _, val, ln, cl = self.tokens[self.pos]
+            raise ParseError(f"Expected ')', got '{val}'", ln, cl)
+        self.pos += 1
+
+        return expr
 
 
 def _normalize_quotes(expr: SExpr) -> SExpr:

@@ -87,8 +87,8 @@
     (@intent "Return absolute value of integer")
     (@spec ((Int) -> (Int 0 ..)))
     (@pure)
-    (@post (>= $result 0))
-    (@post (or (== $result n) (== $result (- 0 n))))
+    (@post {$result >= 0})
+    (@post {$result == n or $result == -n})
     (@example (5) -> 5)
     (@example (-5) -> 5)
     (@example (0) -> 0)
@@ -98,7 +98,7 @@
     (@intent "Return sign of integer: -1, 0, or 1")
     (@spec ((Int) -> (Int -1 .. 1)))
     (@pure)
-    (@post (or (== $result -1) (== $result 0) (== $result 1)))
+    (@post {$result == -1 or $result == 0 or $result == 1})
     (@example (42) -> 1)
     (@example (-42) -> -1)
     (@example (0) -> 0)
@@ -110,9 +110,9 @@
   (fn clamp ((value Int) (min-val Int) (max-val Int))
     (@intent "Clamp integer to range [min-val, max-val]")
     (@spec ((Int Int Int) -> Int))
-    (@pre (<= min-val max-val))
-    (@post (>= $result min-val))
-    (@post (<= $result max-val))
+    (@pre {min-val <= max-val})
+    (@post {$result >= min-val})
+    (@post {$result <= max-val})
     (@pure)
     (@example (5 0 10) -> 5)
     (@example (-5 0 10) -> 0)
@@ -126,7 +126,7 @@
     (@intent "Compute greatest common divisor using Euclidean algorithm")
     (@spec ((Int Int) -> (Int 0 ..)))
     (@pure)
-    (@post (>= $result 0))
+    (@post {$result >= 0})
     (@example (48 18) -> 6)
     (@example (17 13) -> 1)
     (@example (0 5) -> 5)
@@ -146,7 +146,7 @@
     (@intent "Compute least common multiple")
     (@spec ((Int Int) -> (Int 0 ..)))
     (@pure)
-    (@post (>= $result 0))
+    (@post {$result >= 0})
     (@example (4 6) -> 12)
     (@example (3 5) -> 15)
     (@example (0 5) -> 0)
@@ -163,7 +163,7 @@
     (@intent "Return absolute value of float")
     (@spec ((Float) -> Float))
     (@pure)
-    (@assume (>= $result 0.0))  ;; Trusted FFI behavior
+    (@assume {$result >= 0.0})  ;; Trusted FFI behavior
     (@example (3.14) -> 3.14)
     (@example (-3.14) -> 3.14)
     (@example (0.0) -> 0.0)
@@ -173,7 +173,7 @@
     (@intent "Round down to nearest integer")
     (@spec ((Float) -> Float))
     (@pure)
-    (@assume (<= $result x))  ;; Trusted FFI behavior
+    (@assume {$result <= x})  ;; Trusted FFI behavior
     (@example (3.7) -> 3.0)
     (@example (-3.2) -> -4.0)
     (@example (5.0) -> 5.0)
@@ -183,7 +183,7 @@
     (@intent "Round up to nearest integer")
     (@spec ((Float) -> Float))
     (@pure)
-    (@assume (>= $result x))  ;; Trusted FFI behavior
+    (@assume {$result >= x})  ;; Trusted FFI behavior
     (@example (3.2) -> 4.0)
     (@example (-3.7) -> -3.0)
     (@example (5.0) -> 5.0)
@@ -217,9 +217,9 @@
   (fn clamp-float ((value Float) (min-val Float) (max-val Float))
     (@intent "Clamp float to range [min-val, max-val]")
     (@spec ((Float Float Float) -> Float))
-    (@pre (<= min-val max-val))
-    (@post (>= $result min-val))
-    (@post (<= $result max-val))
+    (@pre {min-val <= max-val})
+    (@post {$result >= min-val})
+    (@post {$result <= max-val})
     (@pure)
     (@example (0.5 0.0 1.0) -> 0.5)
     (@example (-0.5 0.0 1.0) -> 0.0)
@@ -236,8 +236,8 @@
   (fn sqrt ((x Float))
     (@intent "Compute square root")
     (@spec ((Float) -> Float))
-    (@pre (>= x 0.0))
-    (@assume (>= $result 0.0))  ;; Trusted FFI behavior
+    (@pre {x >= 0.0})
+    (@assume {$result >= 0.0})  ;; Trusted FFI behavior
     (@pure)
     (@example (4.0) -> 2.0)
     (@example (9.0) -> 3.0)
@@ -266,7 +266,7 @@
     (@intent "Compute e^x (natural exponential)")
     (@spec ((Float) -> Float))
     (@pure)
-    (@assume (> $result 0.0))  ;; Trusted FFI behavior
+    (@assume {$result > 0.0})  ;; Trusted FFI behavior
     (@example (0.0) -> 1.0)
     (@example (1.0) -> 2.71828182)
     (exp x))
@@ -275,7 +275,7 @@
     (@intent "Compute 2^x")
     (@spec ((Float) -> Float))
     (@pure)
-    (@assume (> $result 0.0))  ;; Trusted FFI behavior
+    (@assume {$result > 0.0})  ;; Trusted FFI behavior
     (@example (3.0) -> 8.0)
     (@example (0.0) -> 1.0)
     (exp2 x))
@@ -283,7 +283,7 @@
   (fn log ((x Float))
     (@intent "Compute natural logarithm (ln)")
     (@spec ((Float) -> Float))
-    (@pre (> x 0.0))
+    (@pre {x > 0.0})
     (@pure)
     (@example (1.0) -> 0.0)
     (@example (2.71828182) -> 1.0)
@@ -292,7 +292,7 @@
   (fn log10 ((x Float))
     (@intent "Compute base-10 logarithm")
     (@spec ((Float) -> Float))
-    (@pre (> x 0.0))
+    (@pre {x > 0.0})
     (@pure)
     (@example (10.0) -> 1.0)
     (@example (100.0) -> 2.0)
@@ -302,7 +302,7 @@
   (fn log2 ((x Float))
     (@intent "Compute base-2 logarithm")
     (@spec ((Float) -> Float))
-    (@pre (> x 0.0))
+    (@pre {x > 0.0})
     (@pure)
     (@example (2.0) -> 1.0)
     (@example (8.0) -> 3.0)
@@ -317,8 +317,8 @@
     (@intent "Compute sine (x in radians)")
     (@spec ((Float) -> Float))
     (@pure)
-    (@assume (>= $result -1.0))  ;; Trusted FFI behavior
-    (@assume (<= $result 1.0))
+    (@assume {$result >= -1.0})  ;; Trusted FFI behavior
+    (@assume {$result <= 1.0})
     (@example (0.0) -> 0.0)
     (sin x))
 
@@ -326,8 +326,8 @@
     (@intent "Compute cosine (x in radians)")
     (@spec ((Float) -> Float))
     (@pure)
-    (@assume (>= $result -1.0))  ;; Trusted FFI behavior
-    (@assume (<= $result 1.0))
+    (@assume {$result >= -1.0})  ;; Trusted FFI behavior
+    (@assume {$result <= 1.0})
     (@example (0.0) -> 1.0)
     (cos x))
 
@@ -341,8 +341,8 @@
   (fn asin ((x Float))
     (@intent "Compute arc sine, result in radians")
     (@spec ((Float) -> Float))
-    (@pre (>= x -1.0))
-    (@pre (<= x 1.0))
+    (@pre {x >= -1.0})
+    (@pre {x <= 1.0})
     (@pure)
     (@example (0.0) -> 0.0)
     (@example (1.0) -> 1.5707963)
@@ -351,9 +351,9 @@
   (fn acos ((x Float))
     (@intent "Compute arc cosine, result in radians")
     (@spec ((Float) -> Float))
-    (@pre (>= x -1.0))
-    (@pre (<= x 1.0))
-    (@assume (>= $result 0.0))  ;; Trusted FFI behavior
+    (@pre {x >= -1.0})
+    (@pre {x <= 1.0})
+    (@assume {$result >= 0.0})  ;; Trusted FFI behavior
     (@pure)
     (@example (1.0) -> 0.0)
     (@example (0.0) -> 1.5707963)
@@ -408,7 +408,7 @@
     (@intent "Compute hyperbolic cosine")
     (@spec ((Float) -> Float))
     (@pure)
-    (@assume (>= $result 1.0))  ;; Trusted FFI behavior
+    (@assume {$result >= 1.0})  ;; Trusted FFI behavior
     (@example (0.0) -> 1.0)
     (cosh x))
 
@@ -416,8 +416,8 @@
     (@intent "Compute hyperbolic tangent")
     (@spec ((Float) -> Float))
     (@pure)
-    (@assume (>= $result -1.0))  ;; Trusted FFI behavior
-    (@assume (<= $result 1.0))   ;; Trusted FFI behavior
+    (@assume {$result >= -1.0})  ;; Trusted FFI behavior
+    (@assume {$result <= 1.0})   ;; Trusted FFI behavior
     (@example (0.0) -> 0.0)
     (tanh x))
 
@@ -454,8 +454,8 @@
   (fn lerp ((a Float) (b Float) (t Float))
     (@intent "Linear interpolation between a and b by factor t")
     (@spec ((Float Float Float) -> Float))
-    (@pre (>= t 0.0))
-    (@pre (<= t 1.0))
+    (@pre {t >= 0.0})
+    (@pre {t <= 1.0})
     (@pure)
     (@example (0.0 10.0 0.5) -> 5.0)
     (@example (0.0 10.0 0.0) -> 0.0)
