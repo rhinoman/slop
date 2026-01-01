@@ -28,6 +28,33 @@ These functions/patterns do NOT exist in SLOP - use the alternatives:
 | `parse-int` | Implement manually or FFI |
 | `json-parse` | Implement manually or FFI |
 | `string-find` | Iterate with for-each |
+| Definitions outside `(module ...)` | All `(type)`, `(fn)`, `(const)` go inside the module form |
+
+## Module Structure
+
+All definitions must be inside the module form:
+
+```lisp
+(module my-module
+  (export public-fn)
+  (import other-module (helper))
+
+  (type MyType (Int 0 ..))
+
+  (fn public-fn (...)
+    ...)
+
+  (fn private-fn (...)
+    ...))  ; <-- closing paren wraps entire module
+```
+
+**Wrong** (definitions outside module):
+```lisp
+(module my-module
+  (export public-fn))
+
+(fn public-fn ...)  ; ERROR: outside module form
+```
 
 ## Built-in Functions
 

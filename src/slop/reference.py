@@ -380,6 +380,53 @@ literal                     ; Literal match (number, string)
 All variants must be covered, or use wildcard (_).
 Type checker enforces exhaustive matching.
 """,
+
+    'mistakes': """## Common Mistakes
+
+These DO NOT exist in SLOP - use the alternatives:
+
+| Don't Use | Use Instead |
+|-----------|-------------|
+| `print-int n` | `(println (int-to-string arena n))` |
+| `print-float n` | `(println (float-to-string arena n))` |
+| `(println enum-value)` | Use `match` to print different strings |
+| `arena` outside with-arena | Wrap code in `(with-arena size ...)` |
+| `(block ...)` | `(do ...)` for sequencing |
+| `(begin ...)` | `(do ...)` for sequencing |
+| `strlen s` | `(string-len s)` |
+| `malloc` | `(arena-alloc arena size)` |
+| `list.length` | `(list-len list)` |
+| `list-append` | `(list-push list elem)` |
+| `map-set` | `(map-put map key val)` |
+| `hash-get` | `(map-get map key)` |
+| Definitions outside module | All `(type)`, `(fn)`, `(const)` inside `(module ...)` |
+
+### Module Structure
+
+All definitions must be INSIDE the module form:
+
+; CORRECT:
+(module my-module
+  (export public-fn)
+
+  (type MyType (Int 0 ..))
+
+  (fn public-fn (...)
+    ...))  ; <-- closing paren wraps entire module
+
+; WRONG:
+(module my-module
+  (export public-fn))
+
+(fn public-fn ...)  ; ERROR: outside module form
+
+### Error Returns
+
+IMPORTANT: Quote error variants!
+
+(error 'not-found)     ; CORRECT: quoted
+(error not-found)      ; WRONG: undefined variable
+""",
 }
 
 # Ordered list of topics for display
@@ -393,6 +440,7 @@ TOPIC_ORDER = [
     'stdlib',
     'expressions',
     'patterns',
+    'mistakes',
 ]
 
 

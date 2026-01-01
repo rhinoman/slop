@@ -981,6 +981,8 @@ def _validate_expr_type(
                 pass
 
         # Parse and bind parameters
+        # Handles both (name Type) and (mode name Type) formats
+        PARAM_MODES = {'in', 'out', 'mut'}
         params_str = context.get('params', '')
         if params_str:
             try:
@@ -988,8 +990,17 @@ def _validate_expr_type(
                 if params_ast and isinstance(params_ast[0], SList):
                     for param in params_ast[0].items:
                         if isinstance(param, SList) and len(param) >= 2:
-                            param_name = param[0].name if isinstance(param[0], Symbol) else str(param[0])
-                            param_type = checker.parse_type_expr(param[1])
+                            first = param[0].name if isinstance(param[0], Symbol) else str(param[0])
+
+                            if first in PARAM_MODES and len(param) >= 3:
+                                # Mode format: (in name Type)
+                                param_name = param[1].name if isinstance(param[1], Symbol) else str(param[1])
+                                param_type = checker.parse_type_expr(param[2])
+                            else:
+                                # Standard format: (name Type)
+                                param_name = first
+                                param_type = checker.parse_type_expr(param[1])
+
                             checker.env.bind_var(param_name, param_type)
             except Exception:
                 pass
@@ -1009,7 +1020,13 @@ def _validate_expr_type(
                             if params_ast and isinstance(params_ast[0], SList):
                                 for param in params_ast[0].items:
                                     if isinstance(param, SList) and len(param) >= 2:
-                                        param_type = checker.parse_type_expr(param[1])
+                                        first = param[0].name if isinstance(param[0], Symbol) else str(param[0])
+                                        if first in PARAM_MODES and len(param) >= 3:
+                                            # Mode format: (in name Type)
+                                            param_type = checker.parse_type_expr(param[2])
+                                        else:
+                                            # Standard format: (name Type)
+                                            param_type = checker.parse_type_expr(param[1])
                                         param_types.append(param_type)
                         checker.env.register_function(fn_name, FnType(tuple(param_types), ret_type))
             except Exception:
@@ -1030,7 +1047,13 @@ def _validate_expr_type(
                             if params_ast and isinstance(params_ast[0], SList):
                                 for param in params_ast[0].items:
                                     if isinstance(param, SList) and len(param) >= 2:
-                                        param_type = checker.parse_type_expr(param[1])
+                                        first = param[0].name if isinstance(param[0], Symbol) else str(param[0])
+                                        if first in PARAM_MODES and len(param) >= 3:
+                                            # Mode format: (in name Type)
+                                            param_type = checker.parse_type_expr(param[2])
+                                        else:
+                                            # Standard format: (name Type)
+                                            param_type = checker.parse_type_expr(param[1])
                                         param_types.append(param_type)
                         checker.env.register_function(fn_name, FnType(tuple(param_types), ret_type))
             except Exception:
@@ -1051,7 +1074,13 @@ def _validate_expr_type(
                             if params_ast and isinstance(params_ast[0], SList):
                                 for param in params_ast[0].items:
                                     if isinstance(param, SList) and len(param) >= 2:
-                                        param_type = checker.parse_type_expr(param[1])
+                                        first = param[0].name if isinstance(param[0], Symbol) else str(param[0])
+                                        if first in PARAM_MODES and len(param) >= 3:
+                                            # Mode format: (in name Type)
+                                            param_type = checker.parse_type_expr(param[2])
+                                        else:
+                                            # Standard format: (name Type)
+                                            param_type = checker.parse_type_expr(param[1])
                                         param_types.append(param_type)
                         checker.env.register_function(fn_name, FnType(tuple(param_types), ret_type))
             except Exception:

@@ -1,6 +1,6 @@
 ;; fibonacci.slop
 (module fibonacci
-  (export fib fibonacci-sequence main))
+  (export fib fibonacci-sequence main)
 
 (type Natural (Int 0 ..))
 (type FibIndex (Int 0 .. 100))
@@ -40,3 +40,4 @@
       (let ((seq (fibonacci-sequence count arena)))
         (for-each (n seq)
           (println n))))))
+) ; end module
