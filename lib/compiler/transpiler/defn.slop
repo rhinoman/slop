@@ -47,7 +47,6 @@
   (import ctype (to-c-type get-range-bounds select-int-type
                  is-pointer-type is-void-type))
   (import names (to-c-name to-qualified-name to-qualified-type-name))
-  (import strlib (string-eq string-concat int-to-string))
 
   ;; ============================================================
   ;; Local Helpers
@@ -174,11 +173,12 @@
     (@pre (!= em nil))
     (@pre (!= form nil))
     (@pre (is-form form "fn"))
-    (let ((name (get-function-name form))
-          (params (get-function-params form))
+    (let ((arena (. (deref ctx) arena))
+          (name (get-function-name form))
+          (params (get-function-params arena form))
           (return-type (extract-return-type form))
-          (contracts (extract-contracts form))
-          (body (get-function-body form)))
+          (contracts (extract-contracts arena form))
+          (body (get-function-body arena form)))
       ;; Set return type for inference in body
       (ctx-set-return-type ctx (match return-type
                                   ((some rt) (some (to-c-type ctx rt)))
@@ -218,8 +218,9 @@
     (@pre (!= em nil))
     (@pre (!= form nil))
     (@pre (is-form form "fn"))
-    (let ((name (get-function-name form))
-          (params (get-function-params form))
+    (let ((arena (. (deref ctx) arena))
+          (name (get-function-name form))
+          (params (get-function-params arena form))
           (return-type (extract-return-type form)))
       (emit-function-signature ctx em name params return-type)
       (emit-line em ";")))
@@ -378,20 +379,20 @@
             result)))
       (_ (none))))
 
-  (fn extract-contracts ((form (Ptr SExpr)))
+  (fn extract-contracts ((arena Arena) (form (Ptr SExpr)))
     (@intent "Extract all contract annotations from function")
-    (@spec (((Ptr SExpr)) -> ContractInfo))
+    (@spec ((Arena (Ptr SExpr)) -> ContractInfo))
     (@pre (!= form nil))
-    (@pure)
+    (@alloc arena)
     (match (deref form)
       ((list lst)
         (let ((items (. lst items))
               (len (list-len items))
               (pre-list (list-new arena (Ptr SExpr)))
               (post-list (list-new arena (Ptr SExpr)))
-              (mut intent-val (none))
+              (mut intent-val (Option String) (none))
               (mut pure-val false)
-              (mut alloc-val (none)))
+              (mut alloc-val (Option String) (none)))
           (do
             ;; Iterate through form elements looking for contracts
             (for (i 0 len)
@@ -457,11 +458,11 @@
           ((none) "")))
       (_ "")))
 
-  (fn get-function-params ((form (Ptr SExpr)))
+  (fn get-function-params ((arena Arena) (form (Ptr SExpr)))
     (@intent "Extract parameter list from fn form")
-    (@spec (((Ptr SExpr)) -> (List (Ptr SExpr))))
+    (@spec ((Arena (Ptr SExpr)) -> (List (Ptr SExpr))))
     (@pre (!= form nil))
-    (@pure)
+    (@alloc arena)
     ;; (fn name ((param1 Type1) (param2 Type2)) ...)
     (match (deref form)
       ((list lst)
@@ -473,11 +474,11 @@
           ((none) (list-new arena (Ptr SExpr)))))
       (_ (list-new arena (Ptr SExpr)))))
 
-  (fn get-function-body ((form (Ptr SExpr)))
+  (fn get-function-body ((arena Arena) (form (Ptr SExpr)))
     (@intent "Extract body forms from fn form (after contracts)")
-    (@spec (((Ptr SExpr)) -> (List (Ptr SExpr))))
+    (@spec ((Arena (Ptr SExpr)) -> (List (Ptr SExpr))))
     (@pre (!= form nil))
-    (@pure)
+    (@alloc arena)
     ;; Skip name, params, and all @ annotations
     (match (deref form)
       ((list lst)

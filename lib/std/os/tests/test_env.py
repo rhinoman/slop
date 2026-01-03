@@ -53,12 +53,13 @@ class TestEnv:
             c_files = []
 
             for mod_name, (header, impl) in results.items():
-                # Write header
-                header_path = tmpdir_path / f"{mod_name}.h"
+                # Write header (prefixed with slop_ to match transpiler includes)
+                c_mod_name = mod_name.replace('-', '_')
+                header_path = tmpdir_path / f"slop_{c_mod_name}.h"
                 header_path.write_text(header)
 
                 # Write implementation
-                impl_path = tmpdir_path / f"{mod_name}.c"
+                impl_path = tmpdir_path / f"slop_{c_mod_name}.c"
                 impl_path.write_text(impl)
                 c_files.append(str(impl_path))
 

@@ -14,36 +14,14 @@
 
   (import context (TranspileContext ctx-get-module ctx-lookup-import
                    ctx-get-prefixing))
-  (import strlib (string-eq string-concat string-char-at string-len))
+  (import strlib (string-char-at))
 
   ;; ============================================================
-  ;; C Reserved Keywords
+  ;; Keyword and Builtin Checks
+  ;;
+  ;; NOTE: These use explicit cond chains because const (List String)
+  ;; with list literals cannot be transpiled to C compile-time constants.
   ;; ============================================================
-
-  ;; Keywords that must be prefixed with slop_ to avoid conflicts
-  (const C_KEYWORDS (List String)
-    (list "auto" "break" "case" "char" "const" "continue" "default"
-          "do" "double" "else" "enum" "extern" "float" "for" "goto"
-          "if" "int" "long" "register" "return" "short" "signed"
-          "sizeof" "static" "struct" "switch" "typedef" "union"
-          "unsigned" "void" "volatile" "while" "inline" "restrict"
-          "_Bool" "_Complex" "_Imaginary"))
-
-  ;; ============================================================
-  ;; Runtime Builtin Functions
-  ;; ============================================================
-
-  ;; Functions defined in slop_runtime.h - never prefixed
-  (const RUNTIME_BUILTINS (List String)
-    (list "print" "println" "string-len" "string-concat" "string-eq"
-          "string-slice" "int-to-string" "float-to-string"
-          "arena-alloc" "with-arena"
-          "list-new" "list-push" "list-pop" "list-get" "list-len" "list-set"
-          "map-new" "map-put" "map-get" "map-has" "map-del"
-          "is-ok" "is-err" "unwrap" "unwrap-err"
-          "is-some" "is-none"
-          "now-ms" "sleep-ms"
-          "assert" "panic"))
 
   ;; ============================================================
   ;; Basic Name Conversion
@@ -252,33 +230,87 @@
               ((string-eq result "char_ptr") "string")
               (else result)))))))
 
-  ;; ============================================================
-  ;; Keyword and Builtin Checks
-  ;; ============================================================
-
   (fn is-c-keyword ((name String))
     (@intent "Check if name is a C reserved keyword")
     (@spec ((String) -> Bool))
     (@pure)
-    (let ((mut i 0)
-          (len (cast Int (list-len C_KEYWORDS))))
-      (while (< i len)
-        (match (list-get C_KEYWORDS i)
-          ((some kw) (when (string-eq kw name) (return true)))
-          ((none) ()))
-        (set! i (+ i 1)))
-      false))
+    ;; Explicit checks for C keywords (no list iteration)
+    (cond
+      ((string-eq name "auto") true)
+      ((string-eq name "break") true)
+      ((string-eq name "case") true)
+      ((string-eq name "char") true)
+      ((string-eq name "const") true)
+      ((string-eq name "continue") true)
+      ((string-eq name "default") true)
+      ((string-eq name "do") true)
+      ((string-eq name "double") true)
+      ((string-eq name "else") true)
+      ((string-eq name "enum") true)
+      ((string-eq name "extern") true)
+      ((string-eq name "float") true)
+      ((string-eq name "for") true)
+      ((string-eq name "goto") true)
+      ((string-eq name "if") true)
+      ((string-eq name "int") true)
+      ((string-eq name "long") true)
+      ((string-eq name "register") true)
+      ((string-eq name "return") true)
+      ((string-eq name "short") true)
+      ((string-eq name "signed") true)
+      ((string-eq name "sizeof") true)
+      ((string-eq name "static") true)
+      ((string-eq name "struct") true)
+      ((string-eq name "switch") true)
+      ((string-eq name "typedef") true)
+      ((string-eq name "union") true)
+      ((string-eq name "unsigned") true)
+      ((string-eq name "void") true)
+      ((string-eq name "volatile") true)
+      ((string-eq name "while") true)
+      ((string-eq name "inline") true)
+      ((string-eq name "restrict") true)
+      ((string-eq name "_Bool") true)
+      ((string-eq name "_Complex") true)
+      ((string-eq name "_Imaginary") true)
+      (else false)))
 
   (fn is-runtime-builtin ((name String))
     (@intent "Check if name is a runtime builtin function")
     (@spec ((String) -> Bool))
     (@pure)
-    (let ((mut i 0)
-          (len (cast Int (list-len RUNTIME_BUILTINS))))
-      (while (< i len)
-        (match (list-get RUNTIME_BUILTINS i)
-          ((some builtin) (when (string-eq builtin name) (return true)))
-          ((none) ()))
-        (set! i (+ i 1)))
-      false))
+    ;; Explicit checks for runtime builtins (no list iteration)
+    (cond
+      ((string-eq name "print") true)
+      ((string-eq name "println") true)
+      ((string-eq name "string-len") true)
+      ((string-eq name "string-concat") true)
+      ((string-eq name "string-eq") true)
+      ((string-eq name "string-slice") true)
+      ((string-eq name "int-to-string") true)
+      ((string-eq name "float-to-string") true)
+      ((string-eq name "arena-alloc") true)
+      ((string-eq name "with-arena") true)
+      ((string-eq name "list-new") true)
+      ((string-eq name "list-push") true)
+      ((string-eq name "list-pop") true)
+      ((string-eq name "list-get") true)
+      ((string-eq name "list-len") true)
+      ((string-eq name "list-set") true)
+      ((string-eq name "map-new") true)
+      ((string-eq name "map-put") true)
+      ((string-eq name "map-get") true)
+      ((string-eq name "map-has") true)
+      ((string-eq name "map-del") true)
+      ((string-eq name "is-ok") true)
+      ((string-eq name "is-err") true)
+      ((string-eq name "unwrap") true)
+      ((string-eq name "unwrap-err") true)
+      ((string-eq name "is-some") true)
+      ((string-eq name "is-none") true)
+      ((string-eq name "now-ms") true)
+      ((string-eq name "sleep-ms") true)
+      ((string-eq name "assert") true)
+      ((string-eq name "panic") true)
+      (else false)))
 )

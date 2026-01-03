@@ -26,10 +26,9 @@
   (import defn (transpile-function transpile-type transpile-const
                 register-ffi register-ffi-struct emit-forward-decl
                 extract-return-type))
-  (import generic (emit-generated-types))
+  (import generic (emit-generated-types emit-all-types-sorted))
   (import ctype (to-c-type))
   (import names (to-c-name to-qualified-name))
-  (import strlib (string-eq string-concat))
 
   ;; ============================================================
   ;; Error Types
@@ -76,11 +75,11 @@
         (let ((holes (collect-all-holes arena ast)))
           (if (> (list-len holes) 0)
             ;; Report first unfilled hole
-            (hole (Result String TranspileError)
-              "Get first hole from list, return error with its location"
-              :complexity tier-1
-              :context (holes)
-              :required (sexpr-line sexpr-col))
+            (match (list-get holes 0)
+              ((some first-hole)
+                (error (TranspileError "Unfilled hole" (sexpr-line first-hole) (sexpr-col first-hole))))
+              ((none)
+                (error (TranspileError "No holes found" 0 0))))
             ;; 3. Transpile AST
             (transpile-ast arena ast))))))
 
@@ -147,21 +146,13 @@
           (scan-function-signature ctx fn-form))
 
         ;; ========================================
-        ;; Pass 6: Emit generated types (Option, Result, List, Map)
+        ;; Pass 6: Emit ALL types in topologically sorted order
+        ;; This handles mutual dependencies between records and generated types
         ;; ========================================
-        (emit-generated-types ctx em)
+        (emit-all-types-sorted ctx em (. forms types))
 
         ;; ========================================
-        ;; Pass 7: Emit type definitions
-        ;; ========================================
-        (when (> (list-len (. forms types)) 0)
-          (emit-comment em "Type definitions")
-          (for-each (type-form (. forms types))
-            (transpile-type ctx em type-form))
-          (emit-blank em))
-
-        ;; ========================================
-        ;; Pass 8: Emit forward declarations
+        ;; Pass 7: Emit forward declarations
         ;; ========================================
         (when (> (list-len (. forms functions)) 0)
           (emit-comment em "Forward declarations")
@@ -170,7 +161,7 @@
           (emit-blank em))
 
         ;; ========================================
-        ;; Pass 9: Emit function implementations
+        ;; Pass 8: Emit function implementations
         ;; ========================================
         (when (> (list-len (. forms functions)) 0)
           (emit-comment em "Function implementations")
@@ -241,11 +232,16 @@
     (@pre (!= form nil))
     ;; This traverses the type expression looking for Option, Result,
     ;; List, Map types and registers them for later emission
-    (hole Unit
-      "Traverse type expression, call to-c-type to trigger registration"
-      :complexity tier-2
-      :context (ctx form)
-      :required (to-c-type is-form)))
+    (when (is-form form "type")
+      (match (deref form)
+        ((list lst)
+          (match (list-get (. lst items) 2)
+            ((some type-expr)
+              (do
+                (to-c-type ctx type-expr)
+                (do)))
+            ((none) (do))))
+        (_ (do)))))
 
   ;; ============================================================
   ;; Function Signature Scanning
@@ -256,11 +252,24 @@
     (@spec (((Ptr TranspileContext) (Ptr SExpr)) -> Unit))
     (@pre (!= ctx nil))
     (@pre (!= form nil))
-    (hole Unit
-      "Extract name, params, return type; register FuncEntry"
-      :complexity tier-2
-      :context (ctx form)
-      :required (extract-return-type to-c-type to-qualified-name ctx-register-function)))
+    (match (deref form)
+      ((list lst)
+        (match (list-get (. lst items) 1)
+          ((some name-expr)
+            (match (deref name-expr)
+              ((symbol sym)
+                (let ((fn-name (. sym name))
+                      (return-type-opt (extract-return-type form)))
+                  (match return-type-opt
+                    ((some return-type-expr)
+                      (let ((c-return-type (to-c-type ctx return-type-expr))
+                            (c-name (to-qualified-name ctx fn-name)))
+                        (ctx-register-function ctx
+                          (FuncEntry fn-name c-name c-return-type false false false))))
+                    ((none) (do)))))
+              (_ (do))))
+          ((none) (do))))
+      (_ (do))))
 
   ;; ============================================================
   ;; Module Handling
@@ -276,8 +285,24 @@
     (@pre (is-form form "module"))
     ;; (module name (export ...) forms...)
     ;; Sets module context and enables prefixing
-    (hole Unit
-      "Set module name, enable prefixing, process module contents"
-      :complexity tier-3
-      :context (ctx em form)
-      :required (ctx-set-module ctx-set-prefixing categorize-forms))))
+    (match (deref form)
+      ((list lst)
+        (match (list-get (. lst items) 1)
+          ((some name-expr)
+            (match (deref name-expr)
+              ((symbol sym)
+                (do
+                  (ctx-set-module ctx (some (. sym name)))
+                  (ctx-set-prefixing ctx true)
+                  (let ((arena (. (deref ctx) arena))
+                        (items (. lst items))
+                        (body (list-new arena (Ptr SExpr))))
+                    (for (i 3 (list-len items))
+                      (match (list-get items i)
+                        ((some form-item) (list-push body form-item))
+                        ((none) (do))))
+                    (let ((_ (categorize-forms arena body)))
+                      (do)))))
+              (_ (do))))
+          ((none) (do))))
+      (_ (do)))))

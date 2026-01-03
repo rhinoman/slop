@@ -233,6 +233,36 @@ class TestExtractHole:
         assert hole.context == ['a', 'b', 'c']
         assert hole.required == ['a']
 
+    def test_extract_existing_code_refactoring(self):
+        """Test extracting existing code for refactoring holes."""
+        hole_expr = parse('(hole Bool "simplify" (if (> x 0) true false) :complexity tier-2)')[0]
+        hole = extract_hole(hole_expr)
+
+        assert hole.existing_code is not None
+        assert hole.prompt == "simplify"
+        assert hole.complexity == "tier-2"
+        # Verify existing code is an if expression
+        from slop.parser import is_form
+        assert is_form(hole.existing_code, 'if')
+
+    def test_extract_no_existing_code_generation(self):
+        """Test that generation holes have no existing code."""
+        hole_expr = parse('(hole Int "generate" :complexity tier-1)')[0]
+        hole = extract_hole(hole_expr)
+
+        assert hole.existing_code is None
+        assert hole.prompt == "generate"
+        assert hole.complexity == "tier-1"
+
+    def test_extract_existing_code_with_context(self):
+        """Test refactoring hole with :context and :required."""
+        hole_expr = parse('(hole Int "optimize" (+ x y) :context (x y) :required (x))')[0]
+        hole = extract_hole(hole_expr)
+
+        assert hole.existing_code is not None
+        assert hole.context == ['x', 'y']
+        assert hole.required == ['x']
+
 
 class TestContextValidation:
     """Test :context whitelist validation."""

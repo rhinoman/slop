@@ -292,7 +292,10 @@ identifier               ; Variable reference
 
 ### 3.7 Holes (Hybrid Generation)
 
+Holes support two modes: **generation** (create new code) and **refactoring** (improve existing code).
+
 ```
+;; Generation mode - no existing code
 (hole Type "prompt")
 
 (hole Type "prompt"
@@ -302,7 +305,37 @@ identifier               ; Variable reference
   :required (identifier...)     ; Identifiers that must appear in output
   :complexity tier)
 
-; Complexity tiers
+;; Refactoring mode - existing code provided
+(hole Type "prompt"
+  existing-code-expression
+  :complexity tier)
+```
+
+**Refactoring Example:**
+```lisp
+;; Wrap existing code in a hole to request improvements
+(hole Bool "simplify this nested conditional"
+  (if (> x 0)
+    (if (> y 0)
+      (do-thing)
+      (do-other))
+    (do-default))
+  :complexity tier-2)
+
+;; The hole-filler will refactor to something like:
+(cond
+  ((and (> x 0) (> y 0)) (do-thing))
+  ((> x 0) (do-other))
+  (else (do-default)))
+```
+
+When existing code is present, the hole-filler:
+1. Preserves the original semantics
+2. Applies the improvement described in the prompt
+3. Returns refactored code with the same type
+
+**Complexity Tiers:**
+```
 ; tier-1: 1-3B models (trivial expressions)
 ; tier-2: 7-8B models (simple conditionals)
 ; tier-3: 13-34B models (loops, multiple conditions)
@@ -544,6 +577,7 @@ Minimal runtime (~500 lines of C):
 (string-eq a b) -> Bool
 (string-slice s start end) -> (Slice U8)
 (string-split arena s delimiter) -> (List String)  ; delimiter must be single char
+(int-to-string arena n) -> String                  ; Convert integer to string
 
 ; Lists (homogeneous, type-safe)
 (list-new arena Type) -> (List Type)   ; Type parameter required for type safety
@@ -569,6 +603,13 @@ Minimal runtime (~500 lines of C):
 ; Time
 (now-ms) -> (Int 0 ..)
 (sleep-ms ms) -> Unit
+```
+
+**Note:** The functions above are BUILTINS - no import needed. For additional string
+operations (starts-with, contains, trim, parse-int, etc.), import from strlib:
+
+```
+(import strlib (starts-with ends-with contains trim parse-int float-to-string))
 ```
 
 ## 9. FFI

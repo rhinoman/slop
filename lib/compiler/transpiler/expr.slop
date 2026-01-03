@@ -22,7 +22,7 @@
                  is-option-type is-result-type))
   (import names (to-c-name to-qualified-name))
   (import emit (Emitter))
-  (import strlib (string-eq string-concat int-to-string float-to-string))
+  (import strlib (float-to-string))
 
   ;; ============================================================
   ;; Main Expression Transpilation

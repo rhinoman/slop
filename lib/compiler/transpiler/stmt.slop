@@ -19,7 +19,6 @@
   (import expr (transpile-expr is-pointer-expr))
   (import ctype (to-c-type is-pointer-type is-option-type is-result-type))
   (import names (to-c-name to-qualified-name))
-  (import strlib (string-eq string-concat))
 
   ;; ============================================================
   ;; Main Statement Transpilation
@@ -542,9 +541,9 @@
     ;; if (target.has_value) { some_binding = target.value; ... } else { ... }
     (let ((arena (. (deref em) arena))
           (len (list-len clauses))
-          (mut some-clause nil)
+          (mut some-clause (Ptr SExpr) nil)
           (mut some-binding "")
-          (mut none-clause nil)
+          (mut none-clause (Ptr SExpr) nil)
           (mut i 0))
       (do
         ;; Find some and none clauses
@@ -634,9 +633,9 @@
     ;; if (target.is_ok) { ok_binding = target.data.ok; ... } else { ... }
     (let ((arena (. (deref em) arena))
           (len (list-len clauses))
-          (mut ok-clause nil)
+          (mut ok-clause (Ptr SExpr) nil)
           (mut ok-binding "")
-          (mut err-clause nil)
+          (mut err-clause (Ptr SExpr) nil)
           (mut err-binding "")
           (mut i 0))
       (do

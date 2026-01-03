@@ -1,5 +1,8 @@
 (module math
-  (export add double Point make-point point-sum Direction direction-value safe-div list-size sum-first-n first-or-zero Score find-first-above count-map-entries Container make-container container-first Item make-item-list item-list-first test-map-ptr safe-sqrt make-pair sum-literal-list compute-double)
+  (export add double Point make-point point-sum Direction direction-value safe-div list-size sum-first-n first-or-zero Score find-first-above count-map-entries Container make-container container-first Item make-item-list item-list-first test-map-ptr safe-sqrt make-pair sum-literal-list compute-double test-bool-map ConfigEntry make-config get-config-limit
+          ;; Bug test exports
+          process-optional-name test-optional-none test-map-keys
+          Context make-context context-add-item sum-options)
 
   ;; Import from base module (tests deep imports: main -> math -> base)
   (import base (ComputeResult compute BaseError))
@@ -195,4 +198,94 @@
     (@spec ((Int) -> ComputeResult))
     (match (compute x)
       ((ok val) (ok (* val 2)))
-      ((error e) (error e)))))
+      ((error e) (error e))))
+
+  ;; Level 19: Map with Bool value (tests Option<Bool> emission before Map<String,Bool>)
+  (fn test-bool-map ((arena Arena))
+    (@intent "Test map with Bool value type")
+    (@spec ((Arena) -> Int))
+    (let ((flags (map-new arena String Bool)))
+      (map-put flags "enabled" true)
+      (map-put flags "debug" false)
+      (if (map-has flags "enabled") 1 0)))
+
+  ;; Level 20: Record with Option field (tests Option emission before record)
+  (type ConfigEntry (record
+    (name String)
+    (enabled Bool)
+    (limit (Option Int))))
+
+  (fn make-config ((arena Arena) (name String))
+    (@intent "Create a config entry with optional limit")
+    (@spec ((Arena String) -> (Ptr ConfigEntry)))
+    (let ((cfg (arena-alloc arena ConfigEntry)))
+      (set! (. cfg name) name)
+      (set! (. cfg enabled) true)
+      (set! (. cfg limit) (some 100))
+      cfg))
+
+  (fn get-config-limit ((cfg (Ptr ConfigEntry)))
+    (@intent "Get limit from config, defaulting to 0")
+    (@spec (((Ptr ConfigEntry)) -> Int))
+    (match (. cfg limit)
+      ((some v) v)
+      ((none) 0)))
+
+  ;; ============================================================
+  ;; Bug reproduction test cases
+  ;; ============================================================
+
+  ;; Bug 1: Cross-module function call with Option parameter
+  ;; Tests that (none) gets correct Option type when passed to function
+  (fn process-optional-name ((name (Option String)))
+    (@intent "Process an optional name, return length or 0")
+    (@spec (((Option String)) -> Int))
+    (match name
+      ((some s) (string-len s))
+      ((none) 0)))
+
+  (fn test-optional-none ()
+    (@intent "Call function with (none) - tests Option type inference")
+    (@spec (() -> Int))
+    (process-optional-name (none)))
+
+  ;; Bug 2: map-keys on string-keyed map
+  (fn test-map-keys ((arena Arena))
+    (@intent "Test map-keys operation")
+    (@spec ((Arena) -> Int))
+    (let ((m (map-new arena String Int)))
+      (map-put m "a" 1)
+      (map-put m "b" 2)
+      (let ((keys (map-keys m)))
+        (list-len keys))))
+
+  ;; Bug 3: Record with arena field and list-push
+  ;; Tests arena extraction from context for list-push
+  (type Context (record
+    (arena Arena)
+    (items (List String))))
+
+  (fn make-context ((arena Arena))
+    (@intent "Create a context with items list")
+    (@spec ((Arena) -> (Ptr Context)))
+    (let ((ctx (arena-alloc arena Context)))
+      (set! (. ctx arena) arena)
+      (set! (. ctx items) (list-new arena String))
+      ctx))
+
+  (fn context-add-item ((ctx (Ptr Context)) (item String))
+    (@intent "Add item to context - tests arena access from ctx->arena")
+    (@spec (((Ptr Context) String) -> Unit))
+    ;; This should access ctx->arena for list growth
+    (list-push (. ctx items) item))
+
+  ;; Bug 4: Match with bindings in for-each
+  (fn sum-options ((lst (List (Option Int))))
+    (@intent "Sum all Some values in list")
+    (@spec (((List (Option Int))) -> Int))
+    (let ((mut total 0))
+      (for-each (opt lst)
+        (match opt
+          ((some v) (set! total (+ total v)))
+          ((none) ())))
+      total)))

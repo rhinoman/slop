@@ -240,6 +240,29 @@ class Z3Translator:
                         return result
                     return None
 
+                # is-form - check if SExpr is a specific form type
+                if op == 'is-form':
+                    if len(expr) >= 3:
+                        form_expr = self.translate_expr(expr[1])
+                        # The second arg is a string literal for the form name
+                        # Model as uninterpreted function: form_type(expr) == form_name_hash
+                        if form_expr is None:
+                            return None
+                        func_name = "form_type"
+                        if func_name not in self.variables:
+                            func = z3.Function(func_name, z3.IntSort(), z3.IntSort())
+                            self.variables[func_name] = func
+                        else:
+                            func = self.variables[func_name]
+                        # Get form name and hash it for comparison
+                        form_name = expr[2]
+                        if isinstance(form_name, String):
+                            name_hash = hash(form_name.value) % (2**31)
+                        else:
+                            name_hash = 0
+                        return func(form_expr) == z3.IntVal(name_hash)
+                    return None
+
                 # Pointer dereference - pass through to inner expression
                 if op == 'deref':
                     if len(expr) >= 2:

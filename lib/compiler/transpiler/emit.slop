@@ -20,8 +20,6 @@
     emit-guard-start emit-guard-end
     emit-block-start emit-block-end)
 
-  (import strlib (string-concat string-len))
-
   ;; ============================================================
   ;; Emitter State
   ;; ============================================================

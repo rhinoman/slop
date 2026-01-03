@@ -239,8 +239,10 @@ def cmd_transpile(args):
                 os.makedirs(args.output, exist_ok=True)
                 results = transpile_multi_split(graph.modules, order)
                 for mod_name, (header, impl) in results.items():
-                    header_path = os.path.join(args.output, f"{mod_name}.h")
-                    impl_path = os.path.join(args.output, f"{mod_name}.c")
+                    # Prefix with slop_ to avoid C stdlib conflicts (e.g., ctype.h)
+                    c_mod_name = mod_name.replace('-', '_')
+                    header_path = os.path.join(args.output, f"slop_{c_mod_name}.h")
+                    impl_path = os.path.join(args.output, f"slop_{c_mod_name}.c")
                     with open(header_path, 'w') as f:
                         f.write(header)
                     with open(impl_path, 'w') as f:
@@ -473,8 +475,26 @@ def _extract_imported_specs(ast, search_paths=None, from_path=None) -> list:
     Returns list of dicts: {'name': str, 'params': str, 'return_type': str}
     """
     from slop.resolver import ModuleResolver
+    from slop.providers import load_project_config
+    from slop.type_checker import _find_project_config
 
-    resolver = ModuleResolver([Path(p) for p in (search_paths or [])])
+    # Build search paths similar to check_file in type_checker.py
+    all_search_paths = [Path(p) for p in (search_paths or [])]
+
+    # Try to find project-local slop.toml with include paths
+    if from_path:
+        project_config_path = _find_project_config(from_path.parent)
+        if project_config_path:
+            _, build_cfg = load_project_config(str(project_config_path))
+            if build_cfg and build_cfg.include:
+                config_dir = project_config_path.parent
+                for p in build_cfg.include:
+                    all_search_paths.append((config_dir / p).resolve())
+
+        # Add parent directories as fallback
+        all_search_paths.extend([from_path.parent, from_path.parent.parent])
+
+    resolver = ModuleResolver(all_search_paths)
     imported_specs = []
 
     # Collect all import info: [(module_name, [imported_names]), ...]
@@ -528,8 +548,26 @@ def _extract_imported_types(ast, search_paths=None, from_path=None) -> list:
     """
     from slop.resolver import ModuleResolver
     from slop.parser import Symbol
+    from slop.providers import load_project_config
+    from slop.type_checker import _find_project_config
 
-    resolver = ModuleResolver([Path(p) for p in (search_paths or [])])
+    # Build search paths similar to check_file in type_checker.py
+    all_search_paths = [Path(p) for p in (search_paths or [])]
+
+    # Try to find project-local slop.toml with include paths
+    if from_path:
+        project_config_path = _find_project_config(from_path.parent)
+        if project_config_path:
+            _, build_cfg = load_project_config(str(project_config_path))
+            if build_cfg and build_cfg.include:
+                config_dir = project_config_path.parent
+                for p in build_cfg.include:
+                    all_search_paths.append((config_dir / p).resolve())
+
+        # Add parent directories as fallback
+        all_search_paths.extend([from_path.parent, from_path.parent.parent])
+
+    resolver = ModuleResolver(all_search_paths)
     imported_types = []
 
     # Collect all import info: [(module_name, [imported_names]), ...]
@@ -1726,8 +1764,10 @@ def cmd_build(args):
             with tempfile.TemporaryDirectory() as tmpdir:
                 c_files = []
                 for mod_name, (header, impl) in results.items():
-                    header_path = os.path.join(tmpdir, f"{mod_name}.h")
-                    impl_path = os.path.join(tmpdir, f"{mod_name}.c")
+                    # Prefix with slop_ to avoid C stdlib conflicts (e.g., ctype.h)
+                    c_mod_name = mod_name.replace('-', '_')
+                    header_path = os.path.join(tmpdir, f"slop_{c_mod_name}.h")
+                    impl_path = os.path.join(tmpdir, f"slop_{c_mod_name}.c")
                     with open(header_path, 'w') as f:
                         f.write(header)
                     with open(impl_path, 'w') as f:

@@ -431,6 +431,10 @@ static inline slop_list_string slop_map_keys(slop_arena* arena, slop_map* map) {
         V* stored = (V*)slop_arena_alloc(arena, sizeof(V)); \
         *stored = value; \
         slop_map_put(arena, map, key, stored); \
+    } \
+    \
+    static inline bool Name##_has(Name* map, slop_string key) { \
+        return slop_map_get(map, key) != NULL; \
     }
 
 /* ============================================================

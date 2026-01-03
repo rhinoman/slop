@@ -17,7 +17,6 @@
   (import context
     (TranspileContext ctx-lookup-type ctx-register-option ctx-register-result ctx-register-list ctx-register-map))
   (import names (to-c-type-name type-to-identifier))
-  (import strlib (string-eq string-concat))
 
   (type ResultTypePair (record (ok (Ptr SExpr)) (err (Ptr SExpr))))
 
@@ -29,7 +28,34 @@
       (has-max Bool)
       (max-val I64)))
 
-  (const BUILTIN_TYPES (Map String String) (map-from-pairs String String (list (pair "Int" "int64_t") (pair "I8" "int8_t") (pair "I16" "int16_t") (pair "I32" "int32_t") (pair "I64" "int64_t") (pair "U8" "uint8_t") (pair "U16" "uint16_t") (pair "U32" "uint32_t") (pair "U64" "uint64_t") (pair "Char" "char") (pair "Float" "double") (pair "F32" "float") (pair "F64" "double") (pair "Bool" "bool") (pair "String" "slop_string") (pair "Bytes" "slop_bytes") (pair "Unit" "void") (pair "Void" "void") (pair "Arena" "slop_arena*") (pair "Milliseconds" "int64_t"))))
+  ;; Helper function to look up builtin type mappings
+  ;; Uses cond chain because const map literals can't be transpiled to C
+  (fn lookup-builtin-type ((name String))
+    (@intent "Look up C type for a builtin SLOP type")
+    (@spec ((String) -> (Option String)))
+    (@pure)
+    (cond
+      ((string-eq name "Int") (some "int64_t"))
+      ((string-eq name "I8") (some "int8_t"))
+      ((string-eq name "I16") (some "int16_t"))
+      ((string-eq name "I32") (some "int32_t"))
+      ((string-eq name "I64") (some "int64_t"))
+      ((string-eq name "U8") (some "uint8_t"))
+      ((string-eq name "U16") (some "uint16_t"))
+      ((string-eq name "U32") (some "uint32_t"))
+      ((string-eq name "U64") (some "uint64_t"))
+      ((string-eq name "Char") (some "char"))
+      ((string-eq name "Float") (some "double"))
+      ((string-eq name "F32") (some "float"))
+      ((string-eq name "F64") (some "double"))
+      ((string-eq name "Bool") (some "bool"))
+      ((string-eq name "String") (some "slop_string"))
+      ((string-eq name "Bytes") (some "slop_bytes"))
+      ((string-eq name "Unit") (some "void"))
+      ((string-eq name "Void") (some "void"))
+      ((string-eq name "Arena") (some "slop_arena*"))
+      ((string-eq name "Milliseconds") (some "int64_t"))
+      (else (none))))
 
   (fn to-c-type ((ctx (Ptr TranspileContext)) (type-expr (Ptr SExpr)))
     (@intent "Convert SLOP type expression to C type string")
@@ -40,7 +66,7 @@
       (match (deref type-expr)
         ((symbol sym)
           (let ((name (. sym name)))
-            (match (map-get BUILTIN_TYPES name)
+            (match (lookup-builtin-type name)
               ((some c-type) c-type)
               ((none)
                 (match (ctx-lookup-type ctx name)
