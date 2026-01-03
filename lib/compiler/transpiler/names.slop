@@ -27,9 +27,9 @@
   ;; Basic Name Conversion
   ;; ============================================================
 
-  (fn to-c-name ((name String))
+  (fn to-c-name ((arena Arena) (name String))
     (@intent "Convert SLOP identifier to valid C identifier")
-    (@spec ((String) -> String))
+    (@spec ((Arena String) -> String))
     (@pure)
     (@pre (> (string-len name) 0))
     (@post (> (string-len $result) 0))
@@ -40,11 +40,10 @@
     ;; - Replace '$' with '_'
     ;; - Replace '@' with '_at_'
     ;; - Prepend 'slop_' if result is a C keyword
-    (with-arena 512
-      (let ((len (cast Int (string-len name)))
-            (mut i 0)
-            (buf (arena-alloc arena (* len 5)))
-            (mut out-idx 0))
+    (let ((len (cast Int (string-len name)))
+          (mut i 0)
+          (buf (arena-alloc arena (* len 5)))
+          (mut out-idx 0))
         (while (< i len)
           (let ((c (cast Int (@ (. name data) i))))
             (cond
@@ -81,23 +80,23 @@
         (let ((mangled (String (cast (Ptr U8) buf) (cast U64 out-idx))))
           (if (is-c-keyword mangled)
             (string-concat arena "slop_" mangled)
-            mangled)))))
+            mangled))))
 
-  (fn to-c-type-name ((name String))
+  (fn to-c-type-name ((arena Arena) (name String))
     (@intent "Convert SLOP type name to C type name")
-    (@spec ((String) -> String))
+    (@spec ((Arena String) -> String))
     (@pure)
     (@pre (> (string-len name) 0))
     ;; Same rules as to-c-name but for types
-    (to-c-name name))
+    (to-c-name arena name))
 
   ;; ============================================================
   ;; Qualified Name Conversion
   ;; ============================================================
 
-  (fn to-qualified-name ((ctx (Ptr TranspileContext)) (name String))
+  (fn to-qualified-name ((arena Arena) (ctx (Ptr TranspileContext)) (name String))
     (@intent "Convert function name to qualified C name with module prefix")
-    (@spec (((Ptr TranspileContext) String) -> String))
+    (@spec ((Arena (Ptr TranspileContext) String) -> String))
     (@pre (!= ctx nil))
     (@pre (> (string-len name) 0))
     (@pure)
@@ -107,85 +106,87 @@
     ;; 3. Check import map for explicit qualification
     ;; 4. If prefixing enabled and in module, prefix with module_
     ;; 5. Otherwise use base name
-    (with-arena 256
-      (let ((base-name (to-c-name name)))
-        (cond
-          ;; 1. main is never prefixed
-          ((string-eq name "main") base-name)
-          ;; 2. Runtime builtins are never prefixed
-          ((is-runtime-builtin name) base-name)
-          ;; 3. Check import map for explicit qualification
-          (else
-           (match (ctx-lookup-import ctx name)
-             ((some qualified) qualified)
-             ((none)
-              ;; 4. If prefixing enabled and in module, prefix with module_
-              (if (ctx-get-prefixing ctx)
-                (match (ctx-get-module ctx)
-                  ((some mod-name)
-                   (string-concat arena (string-concat arena (to-c-name mod-name) "_") base-name))
-                  ((none) base-name))
-                ;; 5. Otherwise use base name
-                base-name))))))))
+    (let ((base-name (to-c-name arena name)))
+      (cond
+        ;; 1. main is never prefixed
+        ((string-eq name "main") base-name)
+        ;; 2. Runtime builtins are never prefixed
+        ((is-runtime-builtin name) base-name)
+        ;; 3. Check import map for explicit qualification
+        (else
+         (match (ctx-lookup-import ctx name)
+           ((some qualified) qualified)
+           ((none)
+            ;; 4. If prefixing enabled and in module, prefix with module_
+            (if (ctx-get-prefixing ctx)
+              (match (ctx-get-module ctx)
+                ((some mod-name)
+                 (string-concat arena (string-concat arena (to-c-name arena mod-name) "_") base-name))
+                ((none) base-name))
+              ;; 5. Otherwise use base name
+              base-name)))))))
 
-  (fn to-qualified-type-name ((ctx (Ptr TranspileContext)) (name String))
+  (fn to-qualified-type-name ((arena Arena) (ctx (Ptr TranspileContext)) (name String))
     (@intent "Convert type name to qualified C type name with module prefix")
-    (@spec (((Ptr TranspileContext) String) -> String))
+    (@spec ((Arena (Ptr TranspileContext) String) -> String))
     (@pre (!= ctx nil))
     (@pre (> (string-len name) 0))
     (@pure)
     ;; Similar to to-qualified-name but for types
     ;; Built-in types (Int, Bool, String, etc.) are never prefixed
-    (with-arena 256
-      (let ((base-name (to-c-type-name name)))
-        ;; Built-in types are never prefixed
-        (cond
-          ((string-eq name "Int") base-name)
-          ((string-eq name "Bool") base-name)
-          ((string-eq name "String") base-name)
-          ((string-eq name "Float") base-name)
-          ((string-eq name "Char") base-name)
-          ((string-eq name "Unit") base-name)
-          ((string-eq name "U8") base-name)
-          ((string-eq name "U16") base-name)
-          ((string-eq name "U32") base-name)
-          ((string-eq name "U64") base-name)
-          ((string-eq name "I8") base-name)
-          ((string-eq name "I16") base-name)
-          ((string-eq name "I32") base-name)
-          ((string-eq name "I64") base-name)
-          ((string-eq name "Arena") base-name)
-          ((string-eq name "Ptr") base-name)
-          ((string-eq name "Void") base-name)
-          (else
-           ;; If prefixing enabled and in module, prefix with module_
-           (if (ctx-get-prefixing ctx)
-             (match (ctx-get-module ctx)
-               ((some mod-name)
-                (string-concat arena (string-concat arena (to-c-type-name mod-name) "_") base-name))
-               ((none) base-name))
-             base-name))))))
+    (let ((base-name (to-c-type-name arena name)))
+      ;; Built-in types are never prefixed
+      (cond
+        ((string-eq name "Int") base-name)
+        ((string-eq name "Bool") base-name)
+        ((string-eq name "String") base-name)
+        ((string-eq name "Float") base-name)
+        ((string-eq name "Char") base-name)
+        ((string-eq name "Unit") base-name)
+        ((string-eq name "U8") base-name)
+        ((string-eq name "U16") base-name)
+        ((string-eq name "U32") base-name)
+        ((string-eq name "U64") base-name)
+        ((string-eq name "I8") base-name)
+        ((string-eq name "I16") base-name)
+        ((string-eq name "I32") base-name)
+        ((string-eq name "I64") base-name)
+        ((string-eq name "Arena") base-name)
+        ((string-eq name "Ptr") base-name)
+        ((string-eq name "Void") base-name)
+        (else
+         ;; If prefixing enabled and in module, prefix with module_
+         (if (ctx-get-prefixing ctx)
+           (match (ctx-get-module ctx)
+             ((some mod-name)
+              (string-concat arena (string-concat arena (to-c-type-name arena mod-name) "_") base-name))
+             ((none) base-name))
+           base-name)))))
 
   ;; ============================================================
   ;; Type to Identifier Conversion
   ;; ============================================================
 
-  (fn type-to-identifier ((c-type String))
+  (fn type-to-identifier ((arena Arena) (c-type String))
     (@intent "Convert C type to valid identifier component for generated types")
-    (@spec ((String) -> String))
+    (@spec ((Arena String) -> String))
     (@pure)
     (@pre (> (string-len c-type) 0))
+    ;; Examples that return string literals (normalized types):
+    (@example "int64_t" -> "int")
+    (@example "uint8_t" -> "u8")
+    (@example "slop_string" -> "string")
+    (@example "char*" -> "string")
     ;; Used for generating names like slop_option_string, slop_list_int
     ;; Rules:
     ;; - Replace '*' with '_ptr'
     ;; - Strip 'slop_' prefix if present
     ;; - Normalize: int64_t -> int, uint8_t -> u8, etc.
     ;; - Replace spaces with '_'
-    (with-arena 256
-      (let ((len (cast Int (string-len c-type)))
-            (buf (arena-alloc arena (* len 4)))
-            (mut i 0)
-            (mut out-idx 0))
+    (let ((len (cast Int (string-len c-type)))
+          (buf (arena-alloc arena (* len 4)))
+          (mut i 0)
+          (mut out-idx 0))
         ;; First pass: character replacements
         (while (< i len)
           (let ((c (cast Int (@ (. c-type data) i))))
@@ -228,12 +229,17 @@
               ((string-eq result "int8_t") "i8")
               ((string-eq result "int16_t") "i16")
               ((string-eq result "char_ptr") "string")
-              (else result)))))))
+              (else result))))))
 
   (fn is-c-keyword ((name String))
     (@intent "Check if name is a C reserved keyword")
     (@spec ((String) -> Bool))
     (@pure)
+    (@example "int" -> true)
+    (@example "double" -> true)
+    (@example "void" -> true)
+    (@example "foo" -> false)
+    (@example "my_var" -> false)
     ;; Explicit checks for C keywords (no list iteration)
     (cond
       ((string-eq name "auto") true)
@@ -279,6 +285,12 @@
     (@intent "Check if name is a runtime builtin function")
     (@spec ((String) -> Bool))
     (@pure)
+    (@example "print" -> true)
+    (@example "println" -> true)
+    (@example "string-len" -> true)
+    (@example "list-push" -> true)
+    (@example "my-func" -> false)
+    (@example "foo" -> false)
     ;; Explicit checks for runtime builtins (no list iteration)
     (cond
       ((string-eq name "print") true)

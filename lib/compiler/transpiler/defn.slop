@@ -153,7 +153,7 @@
                     (match (list-get items 1)
                       ((some type-expr)
                         (let ((c-type (to-c-type ctx type-expr))
-                              (c-name (to-c-name (. sym name))))
+                              (c-name (to-c-name arena (. sym name))))
                           (emit em (string-concat arena c-type (string-concat arena " " c-name)))))
                       ((none) (do))))
                   (_ (do))))
@@ -236,7 +236,7 @@
           (ret-str (match return-type
                      ((some rt) (to-c-type ctx rt))
                      ((none) "void")))
-          (c-name (to-qualified-name ctx name))
+          (c-name (to-qualified-name arena ctx name))
           (params-str (build-params-string ctx params)))
       (emit-line em (string-concat arena ret-str
                       (string-concat arena " "
@@ -281,7 +281,7 @@
                     (match (list-get items 1)
                       ((some type-expr)
                         (let ((c-type (to-c-type ctx type-expr))
-                              (c-name (to-c-name (. sym name))))
+                              (c-name (to-c-name arena (. sym name))))
                           (string-concat arena c-type (string-concat arena " " c-name))))
                       ((none) "")))
                   (_ "")))
@@ -370,8 +370,9 @@
                         ((symbol sym)
                           (match (list-get items 1)
                             ((some type-expr)
-                              (let ((name (. sym name))
-                                    (c-name (to-c-name name))
+                              (let ((arena (. (deref ctx) arena))
+                                    (name (. sym name))
+                                    (c-name (to-c-name arena name))
                                     (c-type (to-c-type ctx type-expr))
                                     (is-ptr (is-pointer-type type-expr)))
                                 ;; Parameters are immutable by default
@@ -575,7 +576,7 @@
     (@pre (!= em nil))
     (@pre (!= type-expr nil))
     (let ((arena (. (deref ctx) arena))
-          (c-name (to-qualified-type-name ctx name)))
+          (c-name (to-qualified-type-name arena ctx name)))
       ;; struct name { fields }; typedef struct name name;
       (do
         (emit-line em (string-concat arena "typedef struct "
@@ -599,7 +600,7 @@
                                   (match (list-get field-items 1)
                                     ((some field-type-expr)
                                       (let ((field-c-type (to-c-type ctx field-type-expr))
-                                            (field-c-name (to-c-name (. sym name))))
+                                            (field-c-name (to-c-name arena (. sym name))))
                                         (emit-line em (string-concat arena field-c-type
                                                         (string-concat arena " "
                                                           (string-concat arena field-c-name ";"))))))
@@ -621,7 +622,7 @@
     (@pre (!= em nil))
     (@pre (!= type-expr nil))
     (let ((arena (. (deref ctx) arena))
-          (c-name (to-qualified-type-name ctx name)))
+          (c-name (to-qualified-type-name arena ctx name)))
       ;; typedef enum { NAME_val1, NAME_val2, ... } Name;
       (do
         (emit-line em (string-concat arena "typedef enum " (string-concat arena c-name " {")))
@@ -638,7 +639,7 @@
                         (let ((variant-name (. sym name))
                               (qualified (string-concat arena c-name
                                             (string-concat arena "_"
-                                              (to-c-name variant-name)))))
+                                              (to-c-name arena variant-name)))))
                           (do
                             (ctx-register-enum-value ctx variant-name qualified)
                             (emit-line em (string-concat arena qualified
@@ -658,7 +659,7 @@
     (@pre (!= em nil))
     (@pre (!= type-expr nil))
     (let ((arena (. (deref ctx) arena))
-          (c-name (to-qualified-type-name ctx name)))
+          (c-name (to-qualified-type-name arena ctx name)))
       ;; struct Name { enum { TAG_v1, TAG_v2 } tag; union { T1 v1; T2 v2; } data; };
       (do
         (emit-line em (string-concat arena "typedef struct " (string-concat arena c-name " {")))
@@ -681,7 +682,7 @@
                               ((symbol vsym)
                                 (let ((vname (. vsym name))
                                       (tag (string-concat arena c-name
-                                              (string-concat arena "_TAG_" (to-c-name vname)))))
+                                              (string-concat arena "_TAG_" (to-c-name arena vname)))))
                                   (emit-line em (string-concat arena tag
                                                   (if (< i (- len 1)) "," "")))))
                               (_ (do))))
@@ -711,7 +712,7 @@
                                   (match (list-get vitems 1)
                                     ((some vtype-expr)
                                       (let ((vc-type (to-c-type ctx vtype-expr))
-                                            (vc-name (to-c-name (. vsym name))))
+                                            (vc-name (to-c-name arena (. vsym name))))
                                         (emit-line em (string-concat arena vc-type
                                                         (string-concat arena " "
                                                           (string-concat arena vc-name ";"))))))
@@ -738,7 +739,7 @@
           (bounds (get-range-bounds type-expr))
           (c-base (select-int-type (. bounds has-min) (. bounds min-val)
                                    (. bounds has-max) (. bounds max-val)))
-          (c-name (to-qualified-type-name ctx name)))
+          (c-name (to-qualified-type-name arena ctx name)))
       ;; typedef base_type Name;
       (do
         (emit-line em (string-concat arena "typedef " (string-concat arena c-base
@@ -753,7 +754,7 @@
     (@pre (!= em nil))
     (@pre (!= type-expr nil))
     (let ((arena (. (deref ctx) arena))
-          (c-name (to-qualified-type-name ctx name))
+          (c-name (to-qualified-type-name arena ctx name))
           (c-type (to-c-type ctx type-expr)))
       ;; Emit typedef and register
       (do
@@ -807,7 +808,7 @@
           (name (get-const-name form))
           (type-expr (get-const-type form))
           (value-expr (get-const-value form))
-          (c-name (to-c-name name))
+          (c-name (to-c-name arena name))
           (c-type (to-c-type ctx type-expr))
           (c-value (transpile-expr ctx value-expr (none))))
       ;; Use #define for integer constants, static const for others

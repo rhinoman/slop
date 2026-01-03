@@ -337,11 +337,12 @@
             (match (deref name-expr)
               ((symbol sym)
                 (let ((fn-name (. sym name))
-                      (return-type-opt (extract-return-type form)))
+                      (return-type-opt (extract-return-type form))
+                      (arena (. (deref ctx) arena)))
                   (match return-type-opt
                     ((some return-type-expr)
                       (let ((c-return-type (to-c-type ctx return-type-expr))
-                            (c-name (to-qualified-name ctx fn-name)))
+                            (c-name (to-qualified-name arena ctx fn-name)))
                         (ctx-register-function ctx
                           (FuncEntry fn-name c-name c-return-type false false false))))
                     ((none) (do)))))

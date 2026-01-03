@@ -87,43 +87,39 @@
   ;; Type Name Generation
   ;; ============================================================
 
-  (fn make-option-name ((inner-type String))
+  (fn make-option-name ((arena Arena) (inner-type String))
     (@intent "Generate Option type name from inner type")
-    (@spec ((String) -> String))
+    (@spec ((Arena String) -> String))
     (@pure)
     ;; slop_option_<normalized_inner>
-    (with-arena 256
-      (string-concat arena "slop_option_" (type-to-identifier inner-type))))
+    (string-concat arena "slop_option_" (type-to-identifier arena inner-type)))
 
-  (fn make-result-name ((ok-type String) (err-type String))
+  (fn make-result-name ((arena Arena) (ok-type String) (err-type String))
     (@intent "Generate Result type name from ok and error types")
-    (@spec ((String String) -> String))
+    (@spec ((Arena String String) -> String))
     (@pure)
     ;; slop_result_<ok>_<err>
-    (with-arena 256
-      (let ((ok-id (type-to-identifier ok-type))
-            (err-id (type-to-identifier err-type))
-            (prefix (string-concat arena "slop_result_" ok-id)))
-        (string-concat arena prefix (string-concat arena "_" err-id)))))
+    (let ((ok-id (type-to-identifier arena ok-type))
+          (err-id (type-to-identifier arena err-type))
+          (prefix (string-concat arena "slop_result_" ok-id)))
+      (string-concat arena prefix (string-concat arena "_" err-id))))
 
-  (fn make-list-name ((elem-type String))
+  (fn make-list-name ((arena Arena) (elem-type String))
     (@intent "Generate List type name from element type")
-    (@spec ((String) -> String))
+    (@spec ((Arena String) -> String))
     (@pure)
     ;; slop_list_<normalized_elem>
-    (with-arena 256
-      (string-concat arena "slop_list_" (type-to-identifier elem-type))))
+    (string-concat arena "slop_list_" (type-to-identifier arena elem-type)))
 
-  (fn make-map-name ((key-type String) (val-type String))
+  (fn make-map-name ((arena Arena) (key-type String) (val-type String))
     (@intent "Generate Map type name from key and value types")
-    (@spec ((String String) -> String))
+    (@spec ((Arena String String) -> String))
     (@pure)
     ;; slop_map_<key>_<val>
-    (with-arena 256
-      (let ((key-id (type-to-identifier key-type))
-            (val-id (type-to-identifier val-type))
-            (prefix (string-concat arena "slop_map_" key-id)))
-        (string-concat arena prefix (string-concat arena "_" val-id)))))
+    (let ((key-id (type-to-identifier arena key-type))
+          (val-id (type-to-identifier arena val-type))
+          (prefix (string-concat arena "slop_map_" key-id)))
+      (string-concat arena prefix (string-concat arena "_" val-id))))
 
   ;; ============================================================
   ;; Main Emission
@@ -427,7 +423,7 @@
     (let ((deps (list-new arena String)))
       ;; String-keyed maps need Option[V] for SLOP_STRING_MAP_DEFINE
       (when (string-eq key-type "slop_string")
-        (let ((val-id (type-to-identifier val-type))
+        (let ((val-id (type-to-identifier arena val-type))
               (opt-name (string-concat arena "slop_option_" val-id)))
           (list-push deps opt-name)))
       ;; Also depend on value type if non-primitive non-pointer
@@ -488,7 +484,7 @@
                     ((symbol sym)
                       (match (list-get items 2)
                         ((some type-expr)
-                          (let ((c-name (to-qualified-type-name ctx (. sym name)))
+                          (let ((c-name (to-qualified-type-name arena ctx (. sym name)))
                                 (is-record (is-form type-expr "record"))
                                 (is-union (is-form type-expr "union")))
                             (when (or is-record is-union)
@@ -776,7 +772,7 @@
               ((some name-expr)
                 (match (deref name-expr)
                   ((symbol sym)
-                    (let ((c-name (to-qualified-type-name ctx (. sym name))))
+                    (let ((c-name (to-qualified-type-name arena ctx (. sym name))))
                       (match (list-get items 2)
                         ((some type-expr)
                           (emit-line em (string-concat arena "typedef struct "
@@ -800,7 +796,7 @@
                                                     (match (list-get field-items 1)
                                                       ((some ftype-expr)
                                                         (let ((field-c-type (to-c-type ctx ftype-expr))
-                                                              (field-c-name (type-to-identifier (. fsym name))))
+                                                              (field-c-name (type-to-identifier arena (. fsym name))))
                                                           (emit-line em (string-concat arena "    "
                                                                           (string-concat arena field-c-type
                                                                             (string-concat arena " "
@@ -830,7 +826,7 @@
               ((some name-expr)
                 (match (deref name-expr)
                   ((symbol sym)
-                    (let ((c-name (to-qualified-type-name ctx (. sym name))))
+                    (let ((c-name (to-qualified-type-name arena ctx (. sym name))))
                       (match (list-get items 2)
                         ((some type-expr)
                           (emit-line em (string-concat arena "typedef struct " (string-concat arena c-name " {")))
@@ -856,7 +852,7 @@
                                                     (match (list-get variant-items 1)
                                                       ((some vtype-expr)
                                                         (let ((variant-c-type (to-c-type ctx vtype-expr))
-                                                              (variant-c-name (type-to-identifier (. vsym name))))
+                                                              (variant-c-name (type-to-identifier arena (. vsym name))))
                                                           (emit-line em (string-concat arena "        "
                                                                           (string-concat arena variant-c-type
                                                                             (string-concat arena " "

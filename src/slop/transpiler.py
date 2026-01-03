@@ -623,6 +623,42 @@ class Transpiler:
 
         return None
 
+    def _identifier_to_c_type(self, elem_id: str) -> str:
+        """Convert an element identifier back to a proper C type.
+
+        This is the reverse of _type_to_identifier for generated types.
+        When we extract elem_id from slop_list_X, we need to convert X
+        back to a valid C type for use in typedefs.
+
+        Examples:
+            "map_string_Foo" -> "slop_map_string_Foo"
+            "list_int" -> "slop_list_int"
+            "option_ptr" -> "slop_option_ptr"
+            "string" -> "slop_string"
+            "int" -> "int64_t"
+            "Foo" -> "Foo" (user-defined type, unchanged)
+        """
+        # Check for generated type prefixes that need slop_ added back
+        if elem_id.startswith('map_'):
+            return f"slop_{elem_id}"
+        if elem_id.startswith('list_'):
+            return f"slop_{elem_id}"
+        if elem_id.startswith('option_'):
+            return f"slop_{elem_id}"
+        if elem_id.startswith('result_'):
+            return f"slop_{elem_id}"
+        # Check for runtime primitive types
+        if elem_id == 'string':
+            return 'slop_string'
+        if elem_id == 'int':
+            return 'int64_t'
+        if elem_id == 'float':
+            return 'double'
+        if elem_id == 'ptr':
+            return 'void*'
+        # For other identifiers (user-defined types), return as-is
+        return elem_id
+
     def _type_to_identifier(self, c_type: str) -> str:
         """Convert C type to valid identifier component.
 
@@ -1833,11 +1869,16 @@ class Transpiler:
         for t in simple_records:
             self.transpile_type(t)
 
+        # Pre-populate record_fields for ALL record types (needed for function body scanning)
+        for t in record_types + complex_records:
+            self._prescan_record_fields(t)
+
         # Pre-scan types and functions to discover needed generic types
         for t in types:
             self._scan_type_definition(t)
         for fn in functions:
             self._scan_function_types(fn)
+            self._scan_function_body_types(fn)  # Also scan function bodies for list-pop/list-get/map-new
 
         # Emit generated Option/List/Result types AFTER simple records
         self._emit_generated_types()
@@ -3892,9 +3933,10 @@ class Transpiler:
                         option_type = f"slop_option_{elem_id}"
                         self.generated_option_types.add((option_type, elem_c_type))
                     elif list_type and list_type.startswith('slop_list_'):
-                        elem_id = list_type[10:]
+                        elem_id = list_type[10:]  # Remove "slop_list_"
+                        elem_c_type = self._identifier_to_c_type(elem_id)  # Convert back to C type
                         option_type = f"slop_option_{elem_id}"
-                        self.generated_option_types.add((option_type, elem_id))
+                        self.generated_option_types.add((option_type, elem_c_type))
 
                     if not option_type:
                         option_type = self._get_option_c_type(expected_type)
@@ -3943,9 +3985,10 @@ class Transpiler:
                     elif list_type and list_type.startswith('slop_list_'):
                         # Handle slop_list_X format from function parameters
                         elem_id = list_type[10:]  # Remove "slop_list_"
+                        elem_c_type = self._identifier_to_c_type(elem_id)  # Convert back to C type
                         option_type = f"slop_option_{elem_id}"
-                        # Register option type (elem_c_type may be derived from elem_id)
-                        self.generated_option_types.add((option_type, elem_id))
+                        # Register option type with proper C type
+                        self.generated_option_types.add((option_type, elem_c_type))
 
                     # Fallback to expected_type if still no option_type
                     if not option_type:
@@ -4558,6 +4601,25 @@ class Transpiler:
         that need to be emitted to the header file, but the body is only
         transpiled when generating the implementation file.
         """
+        # First, collect parameter types for this function so we can infer types
+        # for expressions like (deref ctx)
+        param_types = {}
+        params = form[2] if len(form) > 2 else SList([])
+        for p in params:
+            if isinstance(p, SList) and len(p) >= 2:
+                # Handle (name Type) or (mode name Type)
+                if len(p) == 2:
+                    pname = p[0].name if isinstance(p[0], Symbol) else None
+                    ptype = p[1]
+                elif len(p) == 3:
+                    pname = p[1].name if isinstance(p[1], Symbol) else None
+                    ptype = p[2]
+                else:
+                    pname = None
+                    ptype = None
+                if pname:
+                    param_types[pname] = ptype
+
         def scan_expr(expr):
             """Recursively scan expression for type-creating forms."""
             if isinstance(expr, SList) and len(expr) >= 1:
@@ -4586,6 +4648,46 @@ class Transpiler:
                         # Also ensure Option type for element exists (for list-get)
                         option_type = f"slop_option_{elem_id}"
                         self.generated_option_types.add((option_type, elem_type))
+                    # Check for list-pop/list-get on fields: (list-pop (. obj field))
+                    # These return Option<T> where T is the list element type
+                    elif head.name in ('list-pop', 'list-get') and len(expr) >= 2:
+                        list_expr = expr[1]
+                        # Try to infer the list type from field access
+                        if isinstance(list_expr, SList) and len(list_expr) >= 3:
+                            if isinstance(list_expr[0], Symbol) and list_expr[0].name == '.':
+                                # (. obj field) - try to look up field type from record
+                                obj_expr = list_expr[1]
+                                field_name = list_expr[2].name if isinstance(list_expr[2], Symbol) else None
+                                if field_name:
+                                    # Try to find the object's type
+                                    obj_type = None
+                                    # Handle (deref param) case
+                                    if isinstance(obj_expr, SList) and len(obj_expr) >= 2:
+                                        if isinstance(obj_expr[0], Symbol) and obj_expr[0].name == 'deref':
+                                            inner = obj_expr[1]
+                                            if isinstance(inner, Symbol) and inner.name in param_types:
+                                                ptr_type = param_types[inner.name]
+                                                # Extract inner type from (Ptr T)
+                                                if is_form(ptr_type, 'Ptr') and len(ptr_type) >= 2:
+                                                    obj_type = ptr_type[1]
+                                    # Look up field in record definitions
+                                    if obj_type and isinstance(obj_type, Symbol):
+                                        type_name = obj_type.name
+                                        # Try to find in record_fields
+                                        field_type = None
+                                        for full_name, fields in self.record_fields.items():
+                                            if full_name.endswith(type_name) or full_name == type_name:
+                                                if field_name in fields:
+                                                    field_info = fields[field_name]
+                                                    # Handle both dict format {'type': expr} and direct expr
+                                                    field_type = field_info['type'] if isinstance(field_info, dict) else field_info
+                                                    break
+                                        if field_type and is_form(field_type, 'List') and len(field_type) >= 2:
+                                            elem_type_expr = field_type[1]
+                                            elem_type = self.to_c_type(elem_type_expr)
+                                            elem_id = self._type_to_identifier(elem_type)
+                                            option_type = f"slop_option_{elem_id}"
+                                            self.generated_option_types.add((option_type, elem_type))
                 # Recurse into all sub-expressions
                 for item in expr.items:
                     scan_expr(item)
@@ -4596,6 +4698,69 @@ class Transpiler:
                not is_form(item, '@pre') and not is_form(item, '@post') and \
                not is_form(item, '@pure') and not is_form(item, '@alloc'):
                 scan_expr(item)
+
+    def _prescan_record_fields(self, form: SList):
+        """Pre-populate record_fields for a record type without emitting anything.
+
+        This allows function body scanning to look up field types.
+        """
+        if len(form) < 3:
+            return
+
+        raw_name = form[1].name if isinstance(form[1], Symbol) else None
+        if not raw_name:
+            return
+
+        type_expr = form[2]
+        if not is_form(type_expr, 'record'):
+            return
+
+        # Initialize record_fields entry if not present
+        if raw_name not in self.record_fields:
+            self.record_fields[raw_name] = {}
+
+        # Collect field info
+        for item in type_expr.items[1:]:
+            if isinstance(item, SList) and len(item) >= 2:
+                raw_field_name = item[0].name if isinstance(item[0], Symbol) else None
+                field_type_expr = item[1]
+                if raw_field_name:
+                    self.record_fields[raw_name][raw_field_name] = {
+                        'is_pointer': self._is_pointer_type(field_type_expr),
+                        'type': field_type_expr
+                    }
+
+    def _lookup_field_type(self, obj_expr: SExpr, field_name: str) -> Optional[SExpr]:
+        """Look up the type of a field from record definitions.
+
+        Used during pre-scanning to discover types for list-pop/list-get on fields.
+        """
+        # Try to determine the type of obj_expr
+        obj_type_name = None
+
+        if isinstance(obj_expr, SList):
+            # Could be (deref ptr) - extract pointer type
+            if is_form(obj_expr, 'deref') and len(obj_expr) >= 2:
+                inner = obj_expr[1]
+                if isinstance(inner, Symbol):
+                    # Look up in var_types or assume from parameter
+                    obj_type_name = self.var_types.get(inner.name)
+                    if obj_type_name and obj_type_name.endswith('*'):
+                        obj_type_name = obj_type_name[:-1].strip()
+
+        # Look up field in record_fields
+        if obj_type_name and obj_type_name in self.record_fields:
+            fields = self.record_fields[obj_type_name]
+            if field_name in fields:
+                return fields[field_name]
+
+        # Also check with module prefix stripped
+        for full_name, fields in self.record_fields.items():
+            if full_name.endswith(f'_{obj_type_name}') or full_name == obj_type_name:
+                if field_name in fields:
+                    return fields[field_name]
+
+        return None
 
     def _scan_function_types(self, form: SList):
         """Pre-scan function to discover needed generic types.
@@ -5448,6 +5613,16 @@ def transpile_multi(modules: dict, order: list) -> str:
         # Pre-scan function signatures to discover Result/Option/List types in return types and params
         for fn in functions:
             transpiler._scan_function_types(fn)
+
+        # Pre-populate record_fields for ALL record types (needed for function body scanning)
+        for t in types:
+            type_expr = t[2] if len(t) > 2 else None
+            if type_expr and is_form(type_expr, 'record'):
+                transpiler._prescan_record_fields(t)
+
+        # Pre-scan function bodies to discover types from list-pop/list-get/map-new
+        for fn in functions:
+            transpiler._scan_function_body_types(fn)
 
         # Emit types in order to resolve dependencies:
         # 1. Enums and range types first

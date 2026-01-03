@@ -2129,6 +2129,25 @@ def cmd_test(args):
 
     try:
         input_path = Path(args.input)
+
+        # Load project config relative to input file (search up parent directories)
+        config_dir = None
+        for parent in input_path.resolve().parents:
+            if (parent / 'slop.toml').exists():
+                config_dir = parent
+                break
+
+        if config_dir:
+            import tomllib
+            with open(config_dir / 'slop.toml', 'rb') as f:
+                toml_cfg = tomllib.load(f)
+            build_section = toml_cfg.get('build', {})
+            include_paths = build_section.get('include', [])
+            for p in include_paths:
+                inc_path = (config_dir / p).resolve()
+                if inc_path.exists() and str(inc_path) not in [str(Path(x).resolve()) for x in args.include]:
+                    args.include.append(str(inc_path))
+
         ast = parse_file(str(input_path))
 
         # Extract functions with @example annotations
@@ -2140,6 +2159,18 @@ def cmd_test(args):
                 return
 
             fn_name = fn_form[1].name if isinstance(fn_form[1], Symbol) else str(fn_form[1])
+
+            # Check if first parameter is (arena Arena) - needs arena allocation in test
+            needs_arena = False
+            params = fn_form[2] if len(fn_form) > 2 and hasattr(fn_form[2], 'items') else None
+            if params and len(params.items) > 0:
+                first_param = params[0]
+                if hasattr(first_param, 'items') and len(first_param.items) >= 2:
+                    param_name = first_param[0]
+                    param_type = first_param[1]
+                    if isinstance(param_name, Symbol) and param_name.name == 'arena':
+                        if isinstance(param_type, Symbol) and param_type.name == 'Arena':
+                            needs_arena = True
 
             # Get return type from @spec if available
             return_type = None
@@ -2174,6 +2205,7 @@ def cmd_test(args):
                             'args': args_part,
                             'expected': expected,
                             'return_type': return_type,
+                            'needs_arena': needs_arena,
                         })
 
         # Process top-level and module forms
@@ -2192,12 +2224,42 @@ def cmd_test(args):
 
         print(f"Found {len(test_cases)} test case(s)")
 
+        # Check if this is a multi-module file (has imports)
+        is_multi_module = _has_imports(ast)
+
         # Transpile the source
         print("  Transpiling...")
-        from slop.transpiler import transpile
-        with open(input_path) as f:
-            source = f.read()
-        c_code = transpile(source)
+        if is_multi_module:
+            # Multi-module: resolve dependencies and transpile all
+            from slop.transpiler import transpile_multi
+            search_paths = [Path(p) for p in args.include] + [input_path.parent, input_path.parent.parent]
+            # Also include sibling directories (e.g., common/ for shared types)
+            if input_path.parent.parent.exists():
+                for sibling in input_path.parent.parent.iterdir():
+                    if sibling.is_dir() and sibling != input_path.parent:
+                        search_paths.append(sibling)
+            # Find project root (where slop.toml is) and add lib/std
+            for parent in input_path.resolve().parents:
+                if (parent / 'slop.toml').exists():
+                    lib_std = parent / 'lib' / 'std'
+                    if lib_std.exists():
+                        for subdir in lib_std.iterdir():
+                            if subdir.is_dir():
+                                search_paths.append(subdir)
+                    break
+            resolver = ModuleResolver(search_paths)
+            try:
+                graph = resolver.build_dependency_graph(input_path)
+                order = resolver.topological_sort(graph)
+                c_code = transpile_multi(graph.modules, order)
+            except ResolverError as e:
+                print(f"Module resolution error: {e}", file=sys.stderr)
+                return 1
+        else:
+            from slop.transpiler import transpile
+            with open(input_path) as f:
+                source = f.read()
+            c_code = transpile(source)
 
         # Generate test harness
         print("  Generating test harness...")
@@ -2231,10 +2293,13 @@ def cmd_test(args):
 
             # Run tests
             print("  Running tests...")
-            result = subprocess.run([test_bin_path], capture_output=True, text=True)
-            print(result.stdout, end='')
-            if result.stderr:
-                print(result.stderr, end='', file=sys.stderr)
+            result = subprocess.run([test_bin_path], capture_output=True)
+            # Decode with error handling for non-UTF-8 output from string tests
+            stdout = result.stdout.decode('utf-8', errors='replace')
+            stderr = result.stderr.decode('utf-8', errors='replace')
+            print(stdout, end='')
+            if stderr:
+                print(stderr, end='', file=sys.stderr)
 
             return result.returncode
 
@@ -2266,6 +2331,14 @@ def generate_test_harness(test_cases, c_code):
     lines.append("static int tests_failed = 0;")
     lines.append("")
 
+    # Check if any tests need arena
+    any_needs_arena = any(tc.get('needs_arena', False) for tc in test_cases)
+    if any_needs_arena:
+        lines.append("// Global test arena for functions that need one")
+        lines.append("static slop_arena test_arena_storage;")
+        lines.append("static slop_arena* test_arena = NULL;")
+        lines.append("")
+
     # Generate test functions
     for i, tc in enumerate(test_cases):
         fn_name = tc['fn_name']
@@ -2275,6 +2348,9 @@ def generate_test_harness(test_cases, c_code):
 
         # Convert args to C expressions
         c_args = []
+        needs_arena = tc.get('needs_arena', False)
+        if needs_arena:
+            c_args.append('test_arena')
         for arg in tc['args']:
             c_args.append(sexpr_to_c(arg))
 
@@ -2285,9 +2361,9 @@ def generate_test_harness(test_cases, c_code):
         return_type = tc.get('return_type', 'Int')
         if return_type and 'String' in return_type:
             compare_expr = f'slop_string_eq(result, {c_expected})'
-            result_fmt = '"%.*s"'
+            result_fmt = '\\\"%.*s\\\"'  # Escaped quotes for printf inside C string
             result_args = '(int)result.len, result.data'
-            expected_fmt = '"%.*s"'
+            expected_fmt = '\\\"%.*s\\\"'
             expected_args = f'(int)({c_expected}).len, ({c_expected}).data'
         elif return_type and 'Bool' in return_type:
             compare_expr = f'result == {c_expected}'
@@ -2305,8 +2381,12 @@ def generate_test_harness(test_cases, c_code):
 
         args_str = ', '.join(c_args) if c_args else ''
 
+        # Build args display string with escaped quotes (only show user-provided args)
+        args_display = ", ".join(pretty_print(a) for a in tc["args"])
+        args_display = args_display.replace('\\', '\\\\').replace('"', '\\"')
+
         lines.append(f"void test_{i}(void) {{")
-        lines.append(f'    printf("  {fn_name}({", ".join(pretty_print(a) for a in tc["args"])}) -> ");')
+        lines.append(f'    printf("  {fn_name}({args_display}) -> ");')
         lines.append(f"    typeof({c_fn_name}({args_str})) result = {c_fn_name}({args_str});")
         lines.append(f"    if ({compare_expr}) {{")
         lines.append(f'        printf("PASS\\n");')
@@ -2320,10 +2400,16 @@ def generate_test_harness(test_cases, c_code):
 
     # Main function
     lines.append("int main(void) {")
+    if any_needs_arena:
+        lines.append("    // Create test arena (1MB)")
+        lines.append("    test_arena_storage = slop_arena_new(1024 * 1024);")
+        lines.append("    test_arena = &test_arena_storage;")
     lines.append('    printf("Running %d test(s)...\\n", ' + str(len(test_cases)) + ');')
     for i in range(len(test_cases)):
         lines.append(f"    test_{i}();")
     lines.append('    printf("\\n%d passed, %d failed\\n", tests_passed, tests_failed);')
+    if any_needs_arena:
+        lines.append("    slop_arena_free(test_arena);")
     lines.append("    return tests_failed > 0 ? 1 : 0;")
     lines.append("}")
 
@@ -2595,6 +2681,8 @@ def main():
     # test
     p = subparsers.add_parser('test', help='Run tests from @example annotations')
     p.add_argument('input', help='Input SLOP file')
+    p.add_argument('-I', '--include', action='append', default=[],
+        help='Add search path for module imports')
     p.add_argument('-v', '--verbose', action='store_true',
         help='Show generated C code on failure')
 

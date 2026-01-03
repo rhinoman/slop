@@ -89,7 +89,7 @@
       (else
         (match (ctx-lookup-enum ctx name)
           ((some qualified) qualified)
-          ((none) (to-c-name name))))))
+          ((none) (to-c-name (. (deref ctx) arena) name))))))
 
   ;; ============================================================
   ;; List Expression Transpilation
@@ -271,7 +271,7 @@
                   (arena (. (deref ctx) arena)))
               (match (deref field-expr)
                 ((symbol s)
-                  (let ((field-name (to-c-name (. s name)))
+                  (let ((field-name (to-c-name arena (. s name)))
                         (op (if is-ptr "->" ".")))
                     (string-concat arena base-str (string-concat arena op field-name))))
                 (_ ""))))
@@ -579,7 +579,7 @@
         ((some type-expr)
           (match (deref type-expr)
             ((symbol s)
-              (let ((type-name (to-c-name (. s name)))
+              (let ((type-name (to-c-name arena (. s name)))
                     (mut fields-str ""))
                 (do
                   ;; Iterate over field pairs starting at index 2
@@ -594,7 +594,7 @@
                                   ((symbol fname-sym)
                                     (match (list-get (. pair-lst items) 1)
                                       ((some fval-expr)
-                                        (let ((fname (to-c-name (. fname-sym name)))
+                                        (let ((fname (to-c-name arena (. fname-sym name)))
                                               (fval (transpile-expr ctx fval-expr (none)))
                                               (init (string-concat arena "."
                                                       (string-concat arena fname
@@ -630,12 +630,12 @@
         ((some type-expr)
           (match (deref type-expr)
             ((symbol type-sym)
-              (let ((type-name (to-c-name (. type-sym name))))
+              (let ((type-name (to-c-name arena (. type-sym name))))
                 (match (list-get items 2)
                   ((some tag-expr)
                     (match (deref tag-expr)
                       ((symbol tag-sym)
-                        (let ((tag (to-c-name (. tag-sym name)))
+                        (let ((tag (to-c-name arena (. tag-sym name)))
                               ;; Build tag constant: TypeName_tag_TAG
                               (tag-const (string-concat arena type-name
                                            (string-concat arena "_"
@@ -678,10 +678,11 @@
       ((some sym-expr)
         (match (deref sym-expr)
           ((symbol s)
-            (let ((name (. s name)))
+            (let ((name (. s name))
+                  (arena (. (deref ctx) arena)))
               (match (ctx-lookup-enum ctx name)
                 ((some qualified) qualified)
-                ((none) (to-c-name name)))))
+                ((none) (to-c-name arena name)))))
           (_ "/* quote requires symbol */")))
       ((none) "")))
 
@@ -742,8 +743,8 @@
     (@intent "Transpile function call")
     (@spec (((Ptr TranspileContext) String SExprList) -> String))
     (@pre (!= ctx nil))
-    (let ((c-name (to-qualified-name ctx fn-name))
-          (arena (. (deref ctx) arena))
+    (let ((arena (. (deref ctx) arena))
+          (c-name (to-qualified-name arena ctx fn-name))
           (items (. lst items))
           (len (list-len items))
           (mut result ""))

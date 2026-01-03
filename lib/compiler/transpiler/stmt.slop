@@ -147,7 +147,7 @@
                                           (match (deref real-name-expr)
                                             ((symbol real-name-sym)
                                               (let ((real-name (. real-name-sym name))
-                                                    (c-name (to-c-name real-name)))
+                                                    (c-name (to-c-name arena real-name)))
                                                 (match (list-get (. binding-lst items) 2)
                                                   ((some init-expr)
                                                     (let ((init-code (transpile-expr ctx init-expr (none)))
@@ -163,7 +163,7 @@
                                             (_ (do))))
                                         ((none) (do)))
                                       ;; (name init) - immutable binding
-                                      (let ((c-name (to-c-name var-name)))
+                                      (let ((c-name (to-c-name arena var-name)))
                                         (match (list-get (. binding-lst items) 1)
                                           ((some init-expr)
                                             (let ((init-code (transpile-expr ctx init-expr (none)))
@@ -384,7 +384,7 @@
                   (match (deref var-expr)
                     ((symbol var-sym)
                       (let ((var-name (. var-sym name))
-                            (c-var (to-c-name var-name)))
+                            (c-var (to-c-name arena var-name)))
                         (match (list-get range-items 1)
                           ((some start-expr)
                             (match (list-get range-items 2)
@@ -439,8 +439,8 @@
                 (match (deref var-expr)
                   ((symbol var-sym)
                     (let ((var-name (. var-sym name))
-                          (c-var (to-c-name var-name))
-                          (arena (. (deref em) arena)))
+                          (arena (. (deref em) arena))
+                          (c-var (to-c-name arena var-name)))
                       (match (list-get (. binding-lst items) 1)
                         ((some coll-expr)
                           (let ((coll-code (transpile-expr ctx coll-expr (none))))
@@ -593,7 +593,7 @@
             (do
               (ctx-push-scope ctx)
               (when (> (string-len some-binding) 0)
-                (let ((binding-c-name (to-c-name some-binding)))
+                (let ((binding-c-name (to-c-name arena some-binding)))
                   (do
                     (emit-line em (string-concat arena "auto "
                       (string-concat arena binding-c-name
@@ -694,7 +694,7 @@
             (do
               (ctx-push-scope ctx)
               (when (> (string-len ok-binding) 0)
-                (let ((binding-c-name (to-c-name ok-binding)))
+                (let ((binding-c-name (to-c-name arena ok-binding)))
                   (do
                     (emit-line em (string-concat arena "auto "
                       (string-concat arena binding-c-name
@@ -717,7 +717,7 @@
             (do
               (ctx-push-scope ctx)
               (when (> (string-len err-binding) 0)
-                (let ((binding-c-name (to-c-name err-binding)))
+                (let ((binding-c-name (to-c-name arena err-binding)))
                   (do
                     (emit-line em (string-concat arena "auto "
                       (string-concat arena binding-c-name
@@ -770,7 +770,7 @@
                               (when (not is-return) (emit-line em "break;"))
                               (dedent em)
                               (emit-line em "}"))
-                            (let ((case-name (to-c-name (. pat-sym name))))
+                            (let ((case-name (to-c-name arena (. pat-sym name))))
                               (emit-line em (string-concat arena "case " (string-concat arena case-name ": {")))
                               (indent em)
                               (ctx-push-scope ctx)
@@ -824,7 +824,7 @@
                               (when (not is-return) (emit-line em "break;"))
                               (dedent em)
                               (emit-line em "}"))
-                            (let ((tag-name (to-c-name (. pat-sym name))))
+                            (let ((tag-name (to-c-name arena (. pat-sym name))))
                               (emit-line em (string-concat arena "case " (string-concat arena tag-name "_TAG: {")))
                               (indent em)
                               (ctx-push-scope ctx)
@@ -840,7 +840,7 @@
                             ((some variant-expr)
                               (match (deref variant-expr)
                                 ((symbol variant-sym)
-                                  (let ((tag-name (to-c-name (. variant-sym name))))
+                                  (let ((tag-name (to-c-name arena (. variant-sym name))))
                                     (emit-line em (string-concat arena "case " (string-concat arena tag-name "_TAG: {")))
                                     (indent em)
                                     (ctx-push-scope ctx)
@@ -849,7 +849,7 @@
                                       ((some var-expr)
                                         (match (deref var-expr)
                                           ((symbol var-sym)
-                                            (let ((var-name (to-c-name (. var-sym name)))
+                                            (let ((var-name (to-c-name arena (. var-sym name)))
                                                   (payload-access (string-concat arena target-code (string-concat arena ".data." tag-name))))
                                               (do
                                                 (emit-line em (string-concat arena "auto "
