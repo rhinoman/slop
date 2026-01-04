@@ -39,7 +39,7 @@
     replace-all
     compare
     compare-ignore-case
-    string-char-at
+    char-at
     char-is-symbol-start
     char-is-symbol-char
     char-is-operator)
@@ -811,7 +811,7 @@
           ((> alen blen) 1)
           (else 0)))))
 
-  (fn string-char-at ((s String) (index (Int 0 ..)))
+  (fn char-at ((s String) (index (Int 0 ..)))
     (@intent "Get character at index, or 0 if out of bounds")
     (@spec ((String (Int 0 ..)) -> AsciiChar))
     (@pure)

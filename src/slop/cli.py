@@ -2199,6 +2199,19 @@ def cmd_test(args):
                         args_part = example_items[:arrow_idx]
                         expected = example_items[arrow_idx + 1]
 
+                        # Handle grouped arguments: (@example (arg1 arg2) -> expected)
+                        # If args_part is a single list containing non-symbol items, unpack it
+                        if len(args_part) == 1 and hasattr(args_part[0], 'items'):
+                            inner = args_part[0]
+                            first_item = inner.items[0] if len(inner.items) > 0 else None
+                            # Special case: (arena arg1 arg2 ...) - arena is a marker for test arena
+                            # Skip the 'arena' symbol and use remaining args
+                            if isinstance(first_item, Symbol) and first_item.name == 'arena':
+                                args_part = list(inner.items[1:])  # Skip the arena marker
+                            # Check if first item is not a symbol (i.e., not a function call)
+                            elif len(inner.items) > 0 and not isinstance(first_item, Symbol):
+                                args_part = list(inner.items)
+
                         test_cases.append({
                             'fn_name': fn_name,
                             'module': module_name,
@@ -2220,6 +2233,27 @@ def cmd_test(args):
 
         if not test_cases:
             print("No @example annotations found")
+            return 0
+
+        # Filter out test cases with unsupported syntax (e.g., list literals)
+        def has_unsupported_syntax(tc):
+            """Check if test case uses syntax we can't compile."""
+            for arg in tc['args']:
+                # Check for list literals: (list ...)
+                if hasattr(arg, 'items') and len(arg.items) > 0:
+                    if hasattr(arg[0], 'name') and arg[0].name == 'list':
+                        return True
+            return False
+
+        supported_cases = [tc for tc in test_cases if not has_unsupported_syntax(tc)]
+        skipped = len(test_cases) - len(supported_cases)
+        test_cases = supported_cases
+
+        if skipped > 0:
+            print(f"  Skipping {skipped} test(s) with unsupported syntax (list literals)")
+
+        if not test_cases:
+            print("No testable @example annotations found")
             return 0
 
         print(f"Found {len(test_cases)} test case(s)")
@@ -2263,7 +2297,7 @@ def cmd_test(args):
 
         # Generate test harness
         print("  Generating test harness...")
-        test_code = generate_test_harness(test_cases, c_code)
+        test_code = generate_test_harness(test_cases, c_code, enable_prefixing=is_multi_module)
 
         # Write to temp file and compile
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2311,8 +2345,15 @@ def cmd_test(args):
         return 1
 
 
-def generate_test_harness(test_cases, c_code):
-    """Generate C test harness code from test cases."""
+def generate_test_harness(test_cases, c_code, enable_prefixing=True):
+    """Generate C test harness code from test cases.
+
+    Args:
+        test_cases: List of test case dictionaries
+        c_code: The transpiled C code
+        enable_prefixing: Whether to add module prefixes to function names
+                         (should match the transpiler's prefixing setting)
+    """
     from slop.parser import Symbol, Number, String as SlopString
 
     lines = []
@@ -2343,7 +2384,10 @@ def generate_test_harness(test_cases, c_code):
     for i, tc in enumerate(test_cases):
         fn_name = tc['fn_name']
         c_fn_name = fn_name.replace('-', '_')
-        if tc['module']:
+        # Add module prefix only if prefixing is enabled (matches transpiler behavior)
+        # Single-file builds: enable_prefixing=False (no module prefix)
+        # Multi-file builds: enable_prefixing=True (add module prefix)
+        if enable_prefixing and tc['module']:
             c_fn_name = f"{tc['module'].replace('-', '_')}_{c_fn_name}"
 
         # Convert args to C expressions
@@ -2359,7 +2403,76 @@ def generate_test_harness(test_cases, c_code):
 
         # Determine comparison based on return type
         return_type = tc.get('return_type', 'Int')
-        if return_type and 'String' in return_type:
+        expected = tc['expected']
+
+        # Check if this is an Option type
+        is_option_type = return_type and 'Option' in return_type
+        is_some = hasattr(expected, 'items') and len(expected) > 0 and hasattr(expected[0], 'name') and expected[0].name == 'some'
+        # (none) parses as a list with single symbol 'none', or as symbol 'none' directly
+        is_none = (hasattr(expected, 'name') and expected.name == 'none') or \
+                  (hasattr(expected, 'items') and len(expected) == 1 and hasattr(expected[0], 'name') and expected[0].name == 'none')
+
+        # Check if this is a Result type
+        is_result_type = return_type and 'Result' in return_type
+        is_ok = hasattr(expected, 'items') and len(expected) > 0 and hasattr(expected[0], 'name') and expected[0].name == 'ok'
+        is_error = hasattr(expected, 'items') and len(expected) > 0 and hasattr(expected[0], 'name') and expected[0].name == 'error'
+
+        if is_result_type and is_ok:
+            # (ok value) -> check result.is_ok && compare value
+            inner_expected = sexpr_to_c(expected[1]) if len(expected) > 1 else '0'
+            compare_expr = f'result.is_ok && result.data.ok == {inner_expected}'
+            result_fmt = '%s'
+            result_args = 'result.is_ok ? "ok(...)" : "error(...)"'
+            expected_fmt = '%s'
+            expected_args = '"ok(...)"'
+        elif is_result_type and is_error:
+            # (error value) -> check !result.is_ok && compare error value
+            # Handle quoted symbols like 'invalid-format
+            # Extract the error type from Result return type: "(Result I64 ParseError)" -> "ParseError"
+            error_type_prefix = ''
+            if return_type:
+                # Parse "(Result OkType ErrType)" to get ErrType
+                parts = return_type.replace('(', '').replace(')', '').split()
+                if len(parts) >= 3:
+                    error_type_prefix = parts[2].replace('-', '_') + '_'
+            if len(expected) > 1:
+                err_val = expected[1]
+                if isinstance(err_val, Symbol) and err_val.name.startswith("'"):
+                    # Quoted symbol like 'invalid-format -> strip quote and convert to enum variant
+                    variant_name = err_val.name[1:].replace('-', '_')
+                    inner_expected = error_type_prefix + variant_name
+                else:
+                    inner_expected = sexpr_to_c(err_val)
+            else:
+                inner_expected = '0'
+            compare_expr = f'!result.is_ok && result.data.err == {inner_expected}'
+            result_fmt = '%s'
+            result_args = 'result.is_ok ? "ok(...)" : "error(...)"'
+            expected_fmt = '%s'
+            expected_args = '"error(...)"'
+        elif is_option_type and is_none:
+            # (none) -> check !result.has_value
+            compare_expr = '!result.has_value'
+            result_fmt = '%s'
+            result_args = 'result.has_value ? "some(...)" : "none"'
+            expected_fmt = '%s'
+            expected_args = '"none"'
+        elif is_option_type and is_some:
+            # (some value) -> check result.has_value && compare value
+            inner_expected = sexpr_to_c(expected[1]) if len(expected) > 1 else '0'
+            if 'String' in return_type:
+                compare_expr = f'result.has_value && slop_string_eq(result.value, {inner_expected})'
+                result_fmt = '%s'
+                result_args = f'result.has_value ? "some(...)" : "none"'
+                expected_fmt = '%s'
+                expected_args = '"some(...)"'
+            else:
+                compare_expr = f'result.has_value && result.value == {inner_expected}'
+                result_fmt = '%s'
+                result_args = 'result.has_value ? "some(...)" : "none"'
+                expected_fmt = '%s'
+                expected_args = '"some(...)"'
+        elif return_type and 'String' in return_type:
             compare_expr = f'slop_string_eq(result, {c_expected})'
             result_fmt = '\\\"%.*s\\\"'  # Escaped quotes for printf inside C string
             result_args = '(int)result.len, result.data'

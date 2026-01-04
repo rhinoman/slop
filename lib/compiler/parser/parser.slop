@@ -26,7 +26,7 @@
 
   ;; Import string utilities from strlib
   (import strlib (is-alpha is-digit is-alnum is-space
-                  string-char-at AsciiChar
+                  char-at AsciiChar
                   char-is-symbol-start char-is-symbol-char char-is-operator))
 
   ;; ============================================================
@@ -52,7 +52,7 @@
           (slen (cast Int (. s len)))
           (mut found false))
       (while (and (< i slen) (not found))
-        (if (== (string-char-at s (cast (Int 0 ..) i)) (cast AsciiChar 46))  ;; '.'
+        (if (== (char-at s (cast (Int 0 ..) i)) (cast AsciiChar 46))  ;; '.'
           (set! found true)
           (set! i (+ i 1))))
       found))
@@ -179,7 +179,7 @@
     (@pure)
     (if (lexer-at-end state)
       (cast AsciiChar 0)  ;; EOF represented as NUL
-      (string-char-at (. (deref state) source) (. (deref state) pos))))
+      (char-at (. (deref state) source) (. (deref state) pos))))
 
   (fn lexer-peek-next ((state (Ptr LexerState)))
     (@intent "Peek at next character (one ahead)")
@@ -188,7 +188,7 @@
     (let ((next-pos (+ (. (deref state) pos) 1)))
       (if (>= next-pos (cast Int (. (. (deref state) source) len)))
         (cast AsciiChar 0)
-        (string-char-at (. (deref state) source) next-pos))))
+        (char-at (. (deref state) source) next-pos))))
 
   (fn lexer-advance ((state (Ptr LexerState)))
     (@intent "Advance to next character, updating line/col")

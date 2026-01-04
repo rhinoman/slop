@@ -14,7 +14,7 @@
 
   (import context (TranspileContext ctx-get-module ctx-lookup-import
                    ctx-get-prefixing))
-  (import strlib (string-char-at))
+  (import strlib (char-at))
 
   ;; ============================================================
   ;; Keyword and Builtin Checks

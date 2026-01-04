@@ -34,6 +34,11 @@
     (@intent "Look up C type for a builtin SLOP type")
     (@spec ((String) -> (Option String)))
     (@pure)
+    (@example "Int" -> (some "int64_t"))
+    (@example "Bool" -> (some "bool"))
+    (@example "String" -> (some "slop_string"))
+    (@example "U8" -> (some "uint8_t"))
+    (@example "Unknown" -> (none))
     (cond
       ((string-eq name "Int") (some "int64_t"))
       ((string-eq name "I8") (some "int8_t"))
@@ -305,6 +310,10 @@
     (@intent "Select smallest C integer type that fits the range")
     (@spec ((Bool I64 Bool I64) -> String))
     (@pure)
+    (@example true 0 true 255 -> "uint8_t")
+    (@example true 0 true 65535 -> "uint16_t")
+    (@example true -128 true 127 -> "int8_t")
+    (@example false 0 false 0 -> "int64_t")
     (cond
       ((and has-min (>= min-val 0))
         (cond
