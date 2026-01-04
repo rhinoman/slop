@@ -16,7 +16,37 @@
   (import env (TypeEnv env-arena env-push-scope env-pop-scope
                env-bind-var env-lookup-var env-lookup-type
                env-lookup-function env-get-int-type env-get-bool-type
-               env-get-string-type env-get-unit-type))
+               env-get-string-type env-get-unit-type env-add-warning))
+
+  ;; ============================================================
+  ;; Type Comparison
+  ;; ============================================================
+
+  (fn types-equal ((a (Ptr ResolvedType)) (b (Ptr ResolvedType)))
+    (@intent "Check if two types are equal by comparing names")
+    (@spec (((Ptr ResolvedType) (Ptr ResolvedType)) -> Bool))
+    (@pure)
+    (@pre (!= a nil))
+    (@pre (!= b nil))
+    (string-eq (. (deref a) name) (. (deref b) name)))
+
+  (fn unify-branch-types ((env (Ptr TypeEnv)) (a (Ptr ResolvedType)) (b (Ptr ResolvedType))
+                          (line Int) (col Int))
+    (@intent "Unify two branch types, emitting warning if they differ")
+    (@spec (((Ptr TypeEnv) (Ptr ResolvedType) (Ptr ResolvedType) Int Int) -> (Ptr ResolvedType)))
+    (@pre (!= env nil))
+    (@pre (!= a nil))
+    (@pre (!= b nil))
+    ;; If types are equal, return either
+    (if (types-equal a b)
+      a
+      ;; Types differ - emit warning and return first type
+      (let ((arena (env-arena env))
+            (msg (string-concat arena "Branch types differ: "
+                   (string-concat arena (. (deref a) name)
+                     (string-concat arena " vs " (. (deref b) name))))))
+        (env-add-warning env msg line col)
+        a)))
 
   ;; ============================================================
   ;; Expression Type Inference
@@ -29,21 +59,204 @@
     (@pre (!= expr nil))
     (match (deref expr)
       ((symbol sym)
-        (match (env-lookup-var env (. sym name))
-          ((some t) t)
-          ((none)
-            ;; Try looking up as a function
-            (match (env-lookup-function env (. sym name))
-              ((some sig) (. (deref sig) return-type))
-              ((none) (env-get-int-type env))))))
+        (let ((name (. sym name)))
+          (cond
+            ;; Boolean literals
+            ((or (string-eq name "true") (string-eq name "false"))
+              (env-get-bool-type env))
+            ;; nil
+            ((string-eq name "nil")
+              (env-get-unit-type env))
+            ;; Variable lookup
+            (else
+              (match (env-lookup-var env name)
+                ((some t) t)
+                ((none)
+                  ;; Try looking up as a function
+                  (match (env-lookup-function env name)
+                    ((some sig) (. (deref sig) return-type))
+                    ((none) (env-get-int-type env)))))))))
       ((number num)
         (env-get-int-type env))
       ((string str)
         (env-get-string-type env))
       ((list lst)
-        ;; For list expressions, return placeholder type
-        ;; Full implementation would handle function calls and special forms
-        (env-get-unit-type env))))
+        (infer-list-expr env expr lst))))
+
+  (fn infer-list-expr ((env (Ptr TypeEnv)) (expr (Ptr SExpr)) (lst SExprList))
+    (@intent "Infer type of a list expression (call or special form)")
+    (@spec (((Ptr TypeEnv) (Ptr SExpr) SExprList) -> (Ptr ResolvedType)))
+    (@pre (!= env nil))
+    (@pre (!= expr nil))
+    (let ((items (. lst items))
+          (len (list-len items)))
+      (if (== len 0)
+        (env-get-unit-type env)
+        (match (list-get items 0)
+          ((none) (env-get-unit-type env))
+          ((some head)
+            (match (deref head)
+              ((symbol sym)
+                (let ((op (. sym name)))
+                  (infer-special-form env expr lst op)))
+              ;; Non-symbol head - just return unit
+              (_ (env-get-unit-type env))))))))
+
+  (fn infer-special-form ((env (Ptr TypeEnv)) (expr (Ptr SExpr))
+                          (lst SExprList) (op String))
+    (@intent "Infer type of a special form or function call")
+    (@spec (((Ptr TypeEnv) (Ptr SExpr) SExprList String) -> (Ptr ResolvedType)))
+    (@pre (!= env nil))
+    (let ((items (. lst items))
+          (len (list-len items))
+          (line (sexpr-line expr))
+          (col (sexpr-col expr)))
+      (cond
+        ;; (if cond then else) - check branch types
+        ((string-eq op "if")
+          (if (>= len 4)
+            (match (list-get items 2)
+              ((some then-expr)
+                (let ((then-type (infer-expr env then-expr)))
+                  (match (list-get items 3)
+                    ((some else-expr)
+                      (let ((else-type (infer-expr env else-expr)))
+                        (unify-branch-types env then-type else-type line col)))
+                    ((none) then-type))))
+              ((none) (env-get-unit-type env)))
+            (env-get-unit-type env)))
+
+        ;; (cond (test1 body1) (test2 body2) ... (else bodyN))
+        ((string-eq op "cond")
+          (infer-cond-expr env expr lst))
+
+        ;; (match scrutinee clauses...)
+        ((string-eq op "match")
+          (infer-match-expr env expr lst))
+
+        ;; (do exprs...) - type is last expr
+        ((string-eq op "do")
+          (if (> len 1)
+            (match (list-get items (- len 1))
+              ((some last) (infer-expr env last))
+              ((none) (env-get-unit-type env)))
+            (env-get-unit-type env)))
+
+        ;; (let ((bindings)) body...) - type is last body expr
+        ((string-eq op "let")
+          (if (> len 2)
+            (match (list-get items (- len 1))
+              ((some last) (infer-expr env last))
+              ((none) (env-get-unit-type env)))
+            (env-get-unit-type env)))
+
+        ;; (when cond body...) - returns Unit
+        ((string-eq op "when")
+          (env-get-unit-type env))
+
+        ;; (for ...) - returns Unit
+        ((string-eq op "for")
+          (env-get-unit-type env))
+
+        ;; (while ...) - returns Unit
+        ((string-eq op "while")
+          (env-get-unit-type env))
+
+        ;; (set! ...) - returns Unit
+        ((string-eq op "set!")
+          (env-get-unit-type env))
+
+        ;; (return expr) - type of expr
+        ((string-eq op "return")
+          (if (>= len 2)
+            (match (list-get items 1)
+              ((some ret-expr) (infer-expr env ret-expr))
+              ((none) (env-get-unit-type env)))
+            (env-get-unit-type env)))
+
+        ;; Comparison operators return Bool
+        ((or (string-eq op "==") (string-eq op "!=")
+             (string-eq op "<") (string-eq op "<=")
+             (string-eq op ">") (string-eq op ">=")
+             (string-eq op "and") (string-eq op "or") (string-eq op "not"))
+          (env-get-bool-type env))
+
+        ;; Arithmetic operators return Int
+        ((or (string-eq op "+") (string-eq op "-")
+             (string-eq op "*") (string-eq op "/") (string-eq op "%"))
+          (env-get-int-type env))
+
+        ;; Function call - look up return type
+        (else
+          (match (env-lookup-function env op)
+            ((some sig) (. (deref sig) return-type))
+            ((none) (env-get-unit-type env)))))))
+
+  (fn infer-cond-expr ((env (Ptr TypeEnv)) (expr (Ptr SExpr)) (lst SExprList))
+    (@intent "Infer type of cond expression, checking branch types")
+    (@spec (((Ptr TypeEnv) (Ptr SExpr) SExprList) -> (Ptr ResolvedType)))
+    (@pre (!= env nil))
+    (let ((items (. lst items))
+          (len (list-len items))
+          (line (sexpr-line expr))
+          (col (sexpr-col expr))
+          (mut result-type (Ptr ResolvedType) nil)
+          (mut i 1))
+      ;; Process each clause
+      (while (< i len)
+        (match (list-get items i)
+          ((some clause)
+            (match (deref clause)
+              ((list clause-lst)
+                (let ((clause-items (. clause-lst items))
+                      (clause-len (list-len clause-items)))
+                  (when (> clause-len 1)
+                    (match (list-get clause-items (- clause-len 1))
+                      ((some body)
+                        (let ((body-type (infer-expr env body)))
+                          (if (== result-type nil)
+                            (set! result-type body-type)
+                            (set! result-type (unify-branch-types env result-type body-type line col)))))
+                      ((none) (do))))))
+              (_ (do))))
+          ((none) (do)))
+        (set! i (+ i 1)))
+      (if (== result-type nil)
+        (env-get-unit-type env)
+        result-type)))
+
+  (fn infer-match-expr ((env (Ptr TypeEnv)) (expr (Ptr SExpr)) (lst SExprList))
+    (@intent "Infer type of match expression, checking branch types")
+    (@spec (((Ptr TypeEnv) (Ptr SExpr) SExprList) -> (Ptr ResolvedType)))
+    (@pre (!= env nil))
+    (let ((items (. lst items))
+          (len (list-len items))
+          (line (sexpr-line expr))
+          (col (sexpr-col expr))
+          (mut result-type (Ptr ResolvedType) nil)
+          (mut i 2))  ;; Skip 'match' and scrutinee
+      ;; Process each clause
+      (while (< i len)
+        (match (list-get items i)
+          ((some clause)
+            (match (deref clause)
+              ((list clause-lst)
+                (let ((clause-items (. clause-lst items))
+                      (clause-len (list-len clause-items)))
+                  (when (> clause-len 1)
+                    (match (list-get clause-items (- clause-len 1))
+                      ((some body)
+                        (let ((body-type (infer-expr env body)))
+                          (if (== result-type nil)
+                            (set! result-type body-type)
+                            (set! result-type (unify-branch-types env result-type body-type line col)))))
+                      ((none) (do))))))
+              (_ (do))))
+          ((none) (do)))
+        (set! i (+ i 1)))
+      (if (== result-type nil)
+        (env-get-unit-type env)
+        result-type)))
 
   (fn infer-fn-body ((env (Ptr TypeEnv)) (fn-form (Ptr SExpr)))
     (@intent "Type check a function body, binding parameters and inferring body type")

@@ -1,0 +1,18 @@
+;; Test: Match branch type mismatch - should produce warning
+;; Expected warning: Branch types differ
+
+(module warn-match-types
+  (export process-option)
+
+  (type MyOption (union
+    (some-val Int)
+    (no-val)))
+
+  (fn process-option ((opt MyOption))
+    (@intent "Process option - branches return different types")
+    (@spec ((MyOption) -> Int))
+    ;; This match has mismatched branch types
+    (match opt
+      ((some-val n) n)        ;; Int
+      ((no-val) "missing")))  ;; String
+)

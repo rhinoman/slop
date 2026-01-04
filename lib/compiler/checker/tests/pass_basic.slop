@@ -1,0 +1,23 @@
+;; Test: Basic valid code - should pass with no warnings
+
+(module pass-basic
+  (export add get-status)
+
+  (type Status (enum active inactive pending))
+
+  (fn add ((a Int) (b Int))
+    (@intent "Add two integers")
+    (@spec ((Int Int) -> Int))
+    (@pure)
+    (+ a b))
+
+  (fn get-status ((code Int))
+    (@intent "Get status from code")
+    (@spec ((Int) -> Status))
+    (@pure)
+    (if (== code 0)
+      'active
+      (if (== code 1)
+        'inactive
+        'pending)))
+)

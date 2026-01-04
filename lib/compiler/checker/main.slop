@@ -56,10 +56,35 @@
       (for (i 0 len)
         (match (list-get ast i)
           ((some expr)
-            (when (is-form expr "fn")
-              (let ((_ (infer-fn-body env expr)))
-                (do))))
+            (cond
+              ;; Direct function at top level
+              ((is-form expr "fn")
+                (let ((_ (infer-fn-body env expr)))
+                  (do)))
+              ;; Module - check functions inside
+              ((is-form expr "module")
+                (check-module-functions env expr))
+              (else (do))))
           ((none) (do))))))
+
+  (fn check-module-functions ((env (Ptr TypeEnv)) (module-form (Ptr SExpr)))
+    (@intent "Type check all function bodies inside a module")
+    (@spec (((Ptr TypeEnv) (Ptr SExpr)) -> Unit))
+    (@pre (!= env nil))
+    (@pre (!= module-form nil))
+    (match (deref module-form)
+      ((list lst)
+        (let ((items (. lst items))
+              (len (list-len items)))
+          ;; Skip module name and export, start at index 2
+          (for (i 2 len)
+            (match (list-get items i)
+              ((some item)
+                (when (is-form item "fn")
+                  (let ((_ (infer-fn-body env item)))
+                    (do))))
+              ((none) (do))))))
+      (_ (do))))
 
   ;; ============================================================
   ;; Diagnostic Printing

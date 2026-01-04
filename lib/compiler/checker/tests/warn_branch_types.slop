@@ -1,0 +1,16 @@
+;; Test: Branch type mismatch - should produce warning
+;; Expected warning at line 14: Branch types differ: Int vs String
+
+(module warn-branch-types
+  (export get-value)
+
+  (fn get-value ((flag Bool))
+    (@intent "Return different types based on flag - BAD")
+    (@spec ((Bool) -> Int))
+    ;; This if has mismatched branch types:
+    ;; - then branch: Int (42)
+    ;; - else branch: String ("hello")
+    (if flag
+      42
+      "hello"))
+)
