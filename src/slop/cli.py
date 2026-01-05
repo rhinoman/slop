@@ -1813,6 +1813,8 @@ def cmd_build(args):
             import tempfile
             import subprocess
 
+            # TODO: Add --split support to native transpiler for per-module output
+            # For now, use Python transpiler for multi-module builds
             results = transpile_multi_split(graph.modules, order)
 
             # Write to temp directory and compile
