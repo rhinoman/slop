@@ -637,8 +637,11 @@
             ((none) (do)))
           (set! i (+ i 1)))
 
-        ;; Emit if/else structure
-        (emit-line em (string-concat arena "if (" (string-concat arena target-code ".has_value) {")))
+        ;; Emit if/else structure - evaluate target once to avoid C2x issues
+        ;; with anonymous structs in statement expressions
+        (emit-line em "{ __auto_type _match_opt = ")
+        (emit-line em (string-concat arena target-code ";"))
+        (emit-line em "if (_match_opt.has_value) {")
         (indent em)
         (match some-clause
           ((some some-c)
@@ -647,11 +650,9 @@
               (when (> (string-len some-binding) 0)
                 (let ((binding-c-name (to-c-name arena some-binding)))
                   (do
-                    (emit-line em (string-concat arena "auto "
-                      (string-concat arena binding-c-name
-                        (string-concat arena " = "
-                          (string-concat arena target-code ".value;")))))
-                    (ctx-register-var ctx (VarEntry some-binding binding-c-name "auto" false false)))))
+                    (emit-line em (string-concat arena "__auto_type "
+                      (string-concat arena binding-c-name " = _match_opt.value;")))
+                    (ctx-register-var ctx (VarEntry some-binding binding-c-name "__auto_type" false false)))))
               (match (deref some-c)
                 ((list some-lst)
                   (match (list-get (. some-lst items) 1)
@@ -673,7 +674,7 @@
               (_ (do))))
           ((none) (do)))
         (dedent em)
-        (emit-line em "}"))))
+        (emit-line em "} }"))))  ;; Close else and outer block
 
   (fn transpile-result-match ((ctx (Ptr TranspileContext)) (em (Ptr Emitter))
                               (target-code String) (clauses (List (Ptr SExpr)))
@@ -738,8 +739,10 @@
             ((none) (do)))
           (set! i (+ i 1)))
 
-        ;; Emit if/else structure
-        (emit-line em (string-concat arena "if (" (string-concat arena target-code ".is_ok) {")))
+        ;; Emit if/else structure - evaluate target once to avoid C2x issues
+        (emit-line em "{ __auto_type _match_res = ")
+        (emit-line em (string-concat arena target-code ";"))
+        (emit-line em "if (_match_res.is_ok) {")
         (indent em)
         (match ok-clause
           ((some ok-c)
@@ -748,11 +751,9 @@
               (when (> (string-len ok-binding) 0)
                 (let ((binding-c-name (to-c-name arena ok-binding)))
                   (do
-                    (emit-line em (string-concat arena "auto "
-                      (string-concat arena binding-c-name
-                        (string-concat arena " = "
-                          (string-concat arena target-code ".data.ok;")))))
-                    (ctx-register-var ctx (VarEntry ok-binding binding-c-name "auto" false false)))))
+                    (emit-line em (string-concat arena "__auto_type "
+                      (string-concat arena binding-c-name " = _match_res.data.ok;")))
+                    (ctx-register-var ctx (VarEntry ok-binding binding-c-name "__auto_type" false false)))))
               (match (deref ok-c)
                 ((list ok-lst)
                   (match (list-get (. ok-lst items) 1)
@@ -771,11 +772,9 @@
               (when (> (string-len err-binding) 0)
                 (let ((binding-c-name (to-c-name arena err-binding)))
                   (do
-                    (emit-line em (string-concat arena "auto "
-                      (string-concat arena binding-c-name
-                        (string-concat arena " = "
-                          (string-concat arena target-code ".data.err;")))))
-                    (ctx-register-var ctx (VarEntry err-binding binding-c-name "auto" false false)))))
+                    (emit-line em (string-concat arena "__auto_type "
+                      (string-concat arena binding-c-name " = _match_res.data.err;")))
+                    (ctx-register-var ctx (VarEntry err-binding binding-c-name "__auto_type" false false)))))
               (match (deref err-c)
                 ((list err-lst)
                   (match (list-get (. err-lst items) 1)
@@ -785,7 +784,7 @@
               (ctx-pop-scope ctx)))
           ((none) (do)))
         (dedent em)
-        (emit-line em "}"))))
+        (emit-line em "} }"))))  ;; Close else and outer block
 
   (fn transpile-enum-match ((ctx (Ptr TranspileContext)) (em (Ptr Emitter))
                             (target-code String) (clauses (List (Ptr SExpr)))
@@ -977,7 +976,7 @@
     (@pre (!= ctx nil))
     (@pre (!= em nil))
     (@pre (>= (list-len (. lst items)) 3))
-    ;; Emit: { slop_arena* arena = slop_arena_new(size); ... slop_arena_free(arena); }
+    ;; Emit: { slop_arena _arena = slop_arena_new(size); slop_arena* arena = &_arena; ... slop_arena_free(arena); }
     (match (list-get (. lst items) 1)
       ((some size-expr)
         (let ((size-code (transpile-expr ctx size-expr (none)))
@@ -985,7 +984,8 @@
           (do
             (emit-line em "{")
             (indent em)
-            (emit-line em (string-concat arena "slop_arena* arena = slop_arena_new(" (string-concat arena size-code ");")))
+            (emit-line em (string-concat arena "slop_arena _arena = slop_arena_new(" (string-concat arena size-code ");")))
+            (emit-line em "slop_arena* arena = &_arena;")
             (ctx-push-scope ctx)
             (ctx-register-var ctx (VarEntry "arena" "arena" "slop_arena*" true false))
             (transpile-body ctx em lst 2 is-return)

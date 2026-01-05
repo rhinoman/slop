@@ -23,9 +23,10 @@
   (import types (ResolvedType FnSignature))
   (import ctype (to-c-type is-pointer-type is-string-type
                  is-option-type is-result-type))
-  (import names (to-c-name to-qualified-name))
+  (import names (to-c-name to-qualified-name to-qualified-type-name))
   (import emit (Emitter))
-  (import strlib (float-to-string))
+  (import strlib (float-to-string substring))
+  (import transpiler-types (CFieldInfo))
 
   ;; ============================================================
   ;; Main Expression Transpilation
@@ -60,14 +61,48 @@
   ;; Literal Transpilation
   ;; ============================================================
 
+  (fn escape-c-string ((ctx (Ptr TranspileContext)) (s String))
+    (@intent "Escape special characters for C string literal")
+    (@spec (((Ptr TranspileContext) String) -> String))
+    (@pre (!= ctx nil))
+    (let ((arena (. (deref ctx) arena))
+          (len (. s len))
+          (data (. s data))
+          (mut result ""))
+      (do
+        (for (i 0 len)
+          (let ((c (cast Int (@ data i))))
+            (cond
+              ;; Backslash -> \\
+              ((== c 92)
+                (set! result (string-concat arena result "\\\\")))
+              ;; Quote -> \"
+              ((== c 34)
+                (set! result (string-concat arena result "\\\"")))
+              ;; Newline -> \n
+              ((== c 10)
+                (set! result (string-concat arena result "\\n")))
+              ;; Carriage return -> \r
+              ((== c 13)
+                (set! result (string-concat arena result "\\r")))
+              ;; Tab -> \t
+              ((== c 9)
+                (set! result (string-concat arena result "\\t")))
+              ;; Other characters - append as-is using substring
+              (else
+                (set! result (string-concat arena result
+                               (substring arena s i 1)))))))
+        result)))
+
   (fn transpile-string-literal ((ctx (Ptr TranspileContext)) (value String))
     (@intent "Transpile string literal to SLOP_STR macro")
     (@spec (((Ptr TranspileContext) String) -> String))
     (@pre (!= ctx nil))
     ;; Output: SLOP_STR("escaped content")
-    (let ((arena (. (deref ctx) arena)))
+    (let ((arena (. (deref ctx) arena))
+          (escaped (escape-c-string ctx value)))
       (string-concat arena
-        (string-concat arena "SLOP_STR(\"" value)
+        (string-concat arena "SLOP_STR(\"" escaped)
         "\")")))
 
   ;; ============================================================
@@ -188,8 +223,21 @@
                 ((string-eq op "Bytes")
                   (transpile-bytes-constructor ctx lst))
 
-                ;; Default: function call
-                (else (transpile-function-call ctx op lst)))))
+                ;; Statement forms as expressions - simple ternary/assignment forms
+                ((string-eq op "set!")
+                  (transpile-set-expr ctx lst))
+                ((string-eq op "if")
+                  (transpile-if-expr ctx lst))
+
+                ;; Default: check if record constructor or function call
+                (else
+                  (let ((arena (. (deref ctx) arena))
+                        (qtn (to-qualified-type-name arena ctx op)))
+                    (match (ctx-lookup-fields ctx qtn)
+                      ((some fields)
+                        (transpile-record-ctor ctx qtn fields lst))
+                      ((none)
+                        (transpile-function-call ctx op lst))))))))
           ;; Head is not a symbol - treat as computed function call
           (_ "/* computed function expressions not supported */")))))
 
@@ -271,21 +319,34 @@
     (@pre (!= ctx nil))
     (@pre (>= (list-len (. lst items)) 3))
     ;; Use -> for pointers, . for values
-    (match (list-get (. lst items) 1)
-      ((some base-expr)
-        (match (list-get (. lst items) 2)
-          ((some field-expr)
-            (let ((base-str (transpile-expr ctx base-expr (none)))
-                  (is-ptr (is-pointer-expr ctx base-expr))
-                  (arena (. (deref ctx) arena)))
+    ;; Special case: (. (deref x) field) -> x->field
+    (let ((arena (. (deref ctx) arena)))
+      (match (list-get (. lst items) 1)
+        ((some base-expr)
+          (match (list-get (. lst items) 2)
+            ((some field-expr)
               (match (deref field-expr)
                 ((symbol s)
-                  (let ((field-name (to-c-name arena (. s name)))
-                        (op (if is-ptr "->" ".")))
-                    (string-concat arena base-str (string-concat arena op field-name))))
-                (_ ""))))
-          ((none) "")))
-      ((none) "")))
+                  (let ((field-name (to-c-name arena (. s name))))
+                    ;; Check if base is (deref x) - emit x->field
+                    (if (is-form base-expr "deref")
+                      (match (deref base-expr)
+                        ((list deref-lst)
+                          (match (list-get (. deref-lst items) 1)
+                            ((some ptr-expr)
+                              (let ((ptr-str (transpile-expr ctx ptr-expr (none))))
+                                (string-concat arena ptr-str
+                                  (string-concat arena "->" field-name))))
+                            ((none) "")))
+                        (_ ""))
+                      ;; Normal case
+                      (let ((base-str (transpile-expr ctx base-expr (none)))
+                            (is-ptr (is-pointer-expr ctx base-expr))
+                            (op (if is-ptr "->" ".")))
+                        (string-concat arena base-str (string-concat arena op field-name))))))
+                (_ "")))
+            ((none) "")))
+        ((none) ""))))
 
   (fn transpile-index-access ((ctx (Ptr TranspileContext)) (lst SExprList))
     (@intent "Transpile index access (@ array index)")
@@ -948,4 +1009,95 @@
                           (some (. (deref (. (deref fn-sig) return-type)) c-name)))
                         ((none) (none)))))))
               (_ (none))))))))
+
+  ;; ============================================================
+  ;; Statement Forms as Expressions
+  ;; ============================================================
+
+  (fn transpile-set-expr ((ctx (Ptr TranspileContext)) (lst SExprList))
+    (@intent "Transpile set! as expression: (set! var val) -> (var = val)")
+    (@spec (((Ptr TranspileContext) SExprList) -> String))
+    (@pre (!= ctx nil))
+    (let ((arena (. (deref ctx) arena)))
+      (match (list-get (. lst items) 1)
+        ((some var-expr)
+          (match (list-get (. lst items) 2)
+            ((some val-expr)
+              (let ((var-str (transpile-expr ctx var-expr (none)))
+                    (val-str (transpile-expr ctx val-expr (none))))
+                (string-concat arena "("
+                  (string-concat arena var-str
+                    (string-concat arena " = "
+                      (string-concat arena val-str ")"))))))
+            ((none) "/* missing set! value */")))
+        ((none) "/* missing set! var */"))))
+
+  (fn transpile-if-expr ((ctx (Ptr TranspileContext)) (lst SExprList))
+    (@intent "Transpile if as expression: (if cond then else) -> (cond ? then : else)")
+    (@spec (((Ptr TranspileContext) SExprList) -> String))
+    (@pre (!= ctx nil))
+    (let ((arena (. (deref ctx) arena)))
+      (match (list-get (. lst items) 1)
+        ((some cond-expr)
+          (match (list-get (. lst items) 2)
+            ((some then-expr)
+              (let ((cond-str (transpile-expr ctx cond-expr (none)))
+                    (then-str (transpile-expr ctx then-expr (none))))
+                (match (list-get (. lst items) 3)
+                  ((some else-expr)
+                    (let ((else-str (transpile-expr ctx else-expr (none))))
+                      (string-concat arena "("
+                        (string-concat arena cond-str
+                          (string-concat arena " ? "
+                            (string-concat arena then-str
+                              (string-concat arena " : "
+                                (string-concat arena else-str ")"))))))))
+                  ;; No else branch - use void expression
+                  ((none)
+                    (string-concat arena "("
+                      (string-concat arena cond-str
+                        (string-concat arena " ? "
+                          (string-concat arena then-str " : (void)0)"))))))))
+            ((none) "/* missing if then */")))
+        ((none) "/* missing if cond */"))))
+
+  ;; ============================================================
+  ;; Positional Record Constructor
+  ;; ============================================================
+
+  (fn transpile-record-ctor ((ctx (Ptr TranspileContext)) (type-name String)
+                             (fields (List CFieldInfo)) (lst SExprList))
+    (@intent "Transpile positional record constructor: (Type arg1 arg2...) -> ((Type){.f1=a1, ...})")
+    (@spec (((Ptr TranspileContext) String (List CFieldInfo) SExprList) -> String))
+    (@pre (!= ctx nil))
+    (let ((arena (. (deref ctx) arena))
+          (items (. lst items))
+          (num-args (- (list-len items) 1))
+          (num-fields (list-len fields))
+          (mut result ""))
+      (do
+        ;; Start with ((TypeName){
+        (set! result (string-concat arena "(("
+                       (string-concat arena type-name "){")))
+        ;; Add each field assignment
+        (for (i 0 num-fields)
+          (match (list-get fields i)
+            ((some field-info)
+              (let ((field-c-name (. field-info c-name)))
+                ;; Get corresponding argument (index i+1 in items)
+                (match (list-get items (+ i 1))
+                  ((some arg-expr)
+                    (let ((arg-str (transpile-expr ctx arg-expr (none)))
+                          (field-assign (string-concat arena "."
+                                          (string-concat arena field-c-name
+                                            (string-concat arena " = " arg-str)))))
+                      (if (== i 0)
+                        (set! result (string-concat arena result field-assign))
+                        (set! result (string-concat arena result
+                                       (string-concat arena ", " field-assign))))))
+                  ((none) (do)))))
+            ((none) (do))))
+        ;; Close with })
+        (set! result (string-concat arena result "})"))
+        result)))
 )

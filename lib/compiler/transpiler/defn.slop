@@ -63,7 +63,8 @@
         (is-form expr "@post")
         (is-form expr "@pure")
         (is-form expr "@alloc")
-        (is-form expr "@example")))
+        (is-form expr "@example")
+        (is-form expr "@assume")))
 
   (fn find-form ((items (List (Ptr SExpr))) (name String))
     (@intent "Find a form with given name in list of forms")
@@ -577,11 +578,12 @@
     (@pre (!= em nil))
     (@pre (!= type-expr nil))
     (let ((arena (. (deref ctx) arena))
-          (c-name (to-qualified-type-name arena ctx name)))
+          (c-name (to-qualified-type-name arena ctx name))
+          (field-infos (list-new arena CFieldInfo)))
       ;; struct name { fields }; typedef struct name name;
       (do
         (emit-line em (string-concat arena "typedef struct "
-                        (string-concat arena c-name " {"))))
+                        (string-concat arena c-name " {")))
         (indent em)
         ;; Emit each field: (field-name Type) -> Type field_name;
         (match (deref type-expr)
@@ -601,10 +603,14 @@
                                   (match (list-get field-items 1)
                                     ((some field-type-expr)
                                       (let ((field-c-type (to-c-type ctx field-type-expr))
-                                            (field-c-name (to-c-name arena (. sym name))))
-                                        (emit-line em (string-concat arena field-c-type
-                                                        (string-concat arena " "
-                                                          (string-concat arena field-c-name ";"))))))
+                                            (field-c-name (to-c-name arena (. sym name)))
+                                            (is-ptr (is-pointer-type field-type-expr)))
+                                        (do
+                                          ;; Add field info for positional construction
+                                          (list-push field-infos (CFieldInfo (. sym name) field-c-name field-c-type is-ptr))
+                                          (emit-line em (string-concat arena field-c-type
+                                                          (string-concat arena " "
+                                                            (string-concat arena field-c-name ";")))))))
                                     ((none) (do))))
                                 (_ (do))))
                             ((none) (do)))))
@@ -613,7 +619,9 @@
           (_ (do)))
         (dedent em)
         (emit-line em (string-concat arena "} " (string-concat arena c-name ";")))
-        (emit-blank em)))
+        (emit-blank em)
+        ;; Register fields for positional construction
+        (ctx-register-fields ctx c-name field-infos))))
 
   (fn transpile-enum ((ctx (Ptr TranspileContext)) (em (Ptr Emitter))
                       (name String) (type-expr (Ptr SExpr)))

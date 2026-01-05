@@ -19,7 +19,9 @@
                    ctx-get-lists ctx-get-maps
                    ctx-is-emitted ctx-mark-emitted
                    ctx-lookup-type-def ctx-lookup-type-module
-                   ctx-set-module ctx-set-prefixing))
+                   ctx-set-module ctx-set-prefixing
+                   ctx-register-enum-value ctx-register-fields))
+  (import transpiler-types (CFieldInfo))
   (import emit (Emitter emit-line emit-blank emit-guard-start emit-guard-end indent dedent))
   (import names (type-to-identifier to-qualified-type-name to-c-name))
   (import ctype (to-c-type is-pointer-type))
@@ -949,7 +951,8 @@
   (fn emit-record-type ((ctx (Ptr TranspileContext)) (em (Ptr Emitter)) (form (Ptr SExpr)) (c-name String))
     (@intent "Emit record type definition inline")
     (@spec (((Ptr TranspileContext) (Ptr Emitter) (Ptr SExpr) String) -> Unit))
-    (let ((arena (. (deref ctx) arena)))
+    (let ((arena (. (deref ctx) arena))
+          (field-infos (list-new arena CFieldInfo)))
       (match (deref form)
         ((list lst)
           (let ((items (. lst items)))
@@ -963,7 +966,7 @@
                           (emit-line em (string-concat arena "typedef struct "
                                           (string-concat arena c-name " {")))
                           (indent em)
-                          ;; Emit fields
+                          ;; Emit fields and collect field info
                           (match (deref type-expr)
                             ((list type-lst)
                               (let ((type-items (. type-lst items))
@@ -981,11 +984,15 @@
                                                     (match (list-get field-items 1)
                                                       ((some ftype-expr)
                                                         (let ((field-c-type (to-c-type ctx ftype-expr))
-                                                              (field-c-name (to-c-name arena (. fsym name))))
-                                                          (emit-line em (string-concat arena "    "
-                                                                          (string-concat arena field-c-type
-                                                                            (string-concat arena " "
-                                                                              (string-concat arena field-c-name ";")))))))
+                                                              (field-c-name (to-c-name arena (. fsym name)))
+                                                              (is-ptr (is-pointer-type ftype-expr)))
+                                                          (do
+                                                            ;; Register field for positional construction
+                                                            (list-push field-infos (CFieldInfo (. fsym name) field-c-name field-c-type is-ptr))
+                                                            (emit-line em (string-concat arena "    "
+                                                                            (string-concat arena field-c-type
+                                                                              (string-concat arena " "
+                                                                                (string-concat arena field-c-name ";"))))))))
                                                       ((none) ())))
                                                   (_ ())))
                                               ((none) ()))))
@@ -994,7 +1001,9 @@
                             (_ ()))
                           (dedent em)
                           (emit-line em (string-concat arena "} " (string-concat arena c-name ";")))
-                          (emit-blank em))
+                          (emit-blank em)
+                          ;; Register fields for positional construction
+                          (ctx-register-fields ctx c-name field-infos))
                         ((none) ())))
                   (_ ())))
               ((none) ()))))
@@ -1088,6 +1097,8 @@
                                                 (qualified (string-concat arena c-name
                                                               (string-concat arena "_"
                                                                 (to-c-name arena variant-name)))))
+                                            ;; Register enum value for later lookup
+                                            (ctx-register-enum-value ctx variant-name qualified)
                                             (emit-line em (string-concat arena "    "
                                                             (string-concat arena qualified
                                                               (if (< i (- type-len 1)) "," ""))))))
