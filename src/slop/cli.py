@@ -1722,6 +1722,7 @@ def cmd_build(args):
         # Check for --native flag
         use_native = getattr(args, 'native', False)
         native_transpiler_bin = None
+        native_checker_bin = None
         if use_native:
             # Report which native components are available
             parser_bin = find_native_component('parser')
@@ -1729,7 +1730,11 @@ def cmd_build(args):
                 print(f"  [native] Parser: {parser_bin}")
             else:
                 print("  [native] Parser: not found, using Python")
-            print("  [native] Type checker: using Python")
+            native_checker_bin = find_native_component('checker')
+            if native_checker_bin:
+                print(f"  [native] Type checker: {native_checker_bin}")
+            else:
+                print("  [native] Type checker: not found, using Python")
             native_transpiler_bin = find_native_component('transpiler')
             if native_transpiler_bin:
                 print(f"  [native] Transpiler: {native_transpiler_bin}")
@@ -1893,27 +1898,44 @@ def cmd_build(args):
             if total_holes > 0:
                 print(f"  Warning: {total_holes} unfilled holes")
 
-            # Type check using the already-parsed AST
-            # This annotates AST nodes with resolved_type for the transpiler to use
+            # Type check
             print("  Type checking...")
-            from slop.type_checker import check_source_ast
-            diagnostics = check_source_ast(ast, str(input_path))
-            type_errors = [d for d in diagnostics if d.severity == 'error']
-            type_warnings = [d for d in diagnostics if d.severity == 'warning']
-
-            for w in type_warnings:
-                print(f"    {w}")
-
-            if type_errors:
-                for e in type_errors:
-                    print(f"    {e}")
-                print(f"  Type check failed: {len(type_errors)} error(s)")
-                return 1
-
-            if type_warnings:
-                print(f"  Type check passed with {len(type_warnings)} warning(s)")
+            if native_checker_bin:
+                # Use native type checker
+                import subprocess
+                check_result = subprocess.run(
+                    [str(native_checker_bin), str(input_path)],
+                    capture_output=True,
+                    text=True,
+                )
+                # Print output (contains warnings/errors)
+                if check_result.stdout:
+                    for line in check_result.stdout.strip().split('\n'):
+                        if line:
+                            print(f"    {line}")
+                if check_result.returncode != 0:
+                    print(f"  Type check failed")
+                    return 1
             else:
-                print("  Type check passed")
+                # Use Python type checker
+                from slop.type_checker import check_source_ast
+                diagnostics = check_source_ast(ast, str(input_path))
+                type_errors = [d for d in diagnostics if d.severity == 'error']
+                type_warnings = [d for d in diagnostics if d.severity == 'warning']
+
+                for w in type_warnings:
+                    print(f"    {w}")
+
+                if type_errors:
+                    for e in type_errors:
+                        print(f"    {e}")
+                    print(f"  Type check failed: {len(type_errors)} error(s)")
+                    return 1
+
+                if type_warnings:
+                    print(f"  Type check passed with {len(type_warnings)} warning(s)")
+                else:
+                    print("  Type check passed")
 
             # Transpile using native transpiler if available, else Python
             print("  Transpiling to C...")
