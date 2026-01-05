@@ -1,0 +1,20 @@
+;; Test for-each behavior
+
+(fn main ()
+  (@intent "Test for-each iteration")
+  (@spec (() -> Int))
+  (with-arena 1024
+    (let ((lst (list-new arena Int)))
+      (do
+        (list-push lst 10)
+        (list-push lst 20)
+        (list-push lst 30)
+        (print "List length: ")
+        (println (list-len lst))
+        (println "Starting for-each...")
+        (for-each (item lst)
+          (do
+            (print "Item: ")
+            (println item)))
+        (println "For-each done.")
+        0))))

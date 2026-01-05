@@ -1,0 +1,15 @@
+;; Test: Unknown field access - should produce error
+;; Expected error: Record 'Data' has no field 'y'
+
+(module error-unknown-field
+  (export get-field)
+
+  (type Data (record
+    (x Int)
+    (z Int)))
+
+  (fn get-field ((d Data))
+    (@intent "Access non-existent field")
+    (@spec ((Data) -> Int))
+    (. d y))
+)

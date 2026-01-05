@@ -322,9 +322,25 @@ def format_when(expr: SList, indent: int) -> str:
 def format_cond(expr: SList, indent: int) -> str:
     """Format cond: (cond (test1 result1) (test2 result2) ...)"""
     p = pad(indent + 1)
+    p2 = pad(indent + 2)
     lines = ["(cond"]
     for clause in expr.items[1:]:
-        lines.append(p + format_expr(clause, indent + 1))
+        if isinstance(clause, SList) and len(clause) >= 2:
+            # Format clause with test and body on separate lines
+            test = clause[0]
+            body = clause.items[1:]
+            test_str = format_expr(test, indent + 2) if isinstance(test, SList) else inline(test)
+            # Short clause: ((test) body) on one line if simple
+            if len(body) == 1 and fits_inline(clause, 60):
+                lines.append(p + f"({test_str} {format_expr(body[0], indent + 2)})")
+            else:
+                # Multi-line clause
+                lines.append(p + f"({test_str}")
+                for item in body:
+                    lines.append(p2 + format_expr(item, indent + 2))
+                lines[-1] += ")"
+        else:
+            lines.append(p + format_expr(clause, indent + 1))
     lines[-1] += ")"
     return '\n'.join(lines)
 

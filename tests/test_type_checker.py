@@ -609,3 +609,45 @@ class TestCollectionMutability:
         diagnostics = check_source(source)
         errors = [d for d in diagnostics if d.severity == 'error']
         assert len(errors) == 0
+
+    def test_map_keys_returns_list_of_key_type(self):
+        """map-keys returns List<K> for Map<K,V>"""
+        source = """
+        (module test
+          (fn get-keys ((arena Arena))
+            (@spec ((Arena) -> (List String)))
+            (let ((m (map-new arena String Int)))
+              (map-keys m))))
+        """
+        diagnostics = check_source(source)
+        errors = [d for d in diagnostics if d.severity == 'error']
+        assert len(errors) == 0
+
+    def test_map_remove_on_mutable_map_ok(self):
+        """Can remove from map created with map-new"""
+        source = """
+        (module test
+          (fn remove-key ((arena Arena))
+            (@spec ((Arena) -> Unit))
+            (let ((m (map-new arena String Int)))
+              (do
+                (map-put m "a" 1)
+                (map-remove m "a")))))
+        """
+        diagnostics = check_source(source)
+        errors = [d for d in diagnostics if d.severity == 'error']
+        assert len(errors) == 0
+
+    def test_map_remove_on_literal_errors(self):
+        """Cannot remove from map literal"""
+        source = """
+        (module test
+          (fn bad ((arena Arena))
+            (@spec ((Arena) -> Unit))
+            (let ((m (map String Int ("a" 1))))
+              (map-remove m "a"))))
+        """
+        diagnostics = check_source(source)
+        errors = [d for d in diagnostics if d.severity == 'error']
+        assert len(errors) == 1
+        assert "cannot remove from immutable map" in errors[0].message

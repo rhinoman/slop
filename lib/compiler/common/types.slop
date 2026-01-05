@@ -1,0 +1,412 @@
+(module types
+  (export
+    ;; Existing type definition structures
+    TypeKind RangeBounds FieldDef VariantDef TypeDef
+    ;; Resolved type information (for type checker)
+    ResolvedTypeKind ResolvedType ResolvedVariant ResolvedField
+    ;; Function signature info
+    ParamInfo FnSignature
+    ;; Type errors
+    TypeError TypeErrorKind
+    ;; Diagnostics
+    Diagnostic DiagnosticLevel
+    ;; Constructors
+    range-bounds-new range-bounds-unbounded
+    resolved-type-new resolved-variant-new resolved-field-new
+    param-info-new fn-signature-new type-error-new diagnostic-new
+    ;; Predicates
+    range-contains is-primitive-kind is-container-kind
+    resolved-type-is-pointer resolved-type-is-union resolved-type-is-record
+    ;; Accessors
+    resolved-type-get-variant-index resolved-type-get-variant-payload
+    resolved-type-has-field)
+  (import parser (SExpr))
+
+  (type TypeKind (enum kind-primitive kind-range kind-record kind-enum kind-union kind-alias kind-option kind-result kind-list kind-map kind-ptr kind-array kind-function kind-ffi))
+
+  (type RangeBounds (record
+      (has-min Bool)
+      (has-max Bool)
+      (min-val I64)
+      (max-val I64)))
+
+  (type FieldDef (record (name String) (type-expr (Ptr SExpr))))
+
+  (type VariantDef (record (tag String) (payload (Option (Ptr SExpr)))))
+
+  (type TypeDef (record
+      (name String)
+      (kind TypeKind)
+      (source-expr (Ptr SExpr))
+      (range (Option RangeBounds))
+      (fields (Option (List FieldDef)))
+      (variants (Option (List VariantDef)))
+      (type-params (Option (List String)))))
+
+  ;; ============================================================
+  ;; Resolved Type Structures
+  ;;
+  ;; These represent fully-resolved types with:
+  ;; - Module context (which module defined them)
+  ;; - C names (for code generation)
+  ;; - Variant indices (for union matching)
+  ;; ============================================================
+
+  ;; Resolved type kind - distinguishes primitives from user-defined types
+  (type ResolvedTypeKind (enum
+    rk-primitive      ;; Int, Bool, String, U8, I64, etc.
+    rk-range          ;; (Int min .. max)
+    rk-record         ;; (record (field Type)...)
+    rk-union          ;; (union (variant Payload)...)
+    rk-enum           ;; (enum val1 val2...)
+    rk-list           ;; (List T)
+    rk-ptr            ;; (Ptr T)
+    rk-option         ;; (Option T)
+    rk-result         ;; (Result T E)
+    rk-function       ;; Function type
+    rk-array          ;; (Array T N)
+    rk-map))          ;; (Map K V)
+
+  ;; A fully-resolved variant in a union type
+  (type ResolvedVariant (record
+    (name String)              ;; Variant name (e.g., "list", "symbol")
+    (index Int)                ;; Variant index (0, 1, 2, ...)
+    (tag-constant String)      ;; C tag constant (e.g., "parser_SExpr_list_TAG")
+    (payload-type (Option (Ptr ResolvedType)))))  ;; Payload type, if any
+
+  ;; A fully-resolved field in a record type
+  (type ResolvedField (record
+    (name String)              ;; Field name
+    (field-type (Ptr ResolvedType))  ;; Resolved field type
+    (offset Int)))             ;; Field offset (0, 1, 2, ... for ordering)
+
+  ;; A fully-resolved type with all information needed for code generation
+  (type ResolvedType (record
+    (kind ResolvedTypeKind)    ;; What kind of type
+    (name String)              ;; SLOP name (e.g., "SExpr")
+    (module-name (Option String))  ;; Module that defined this (e.g., "parser")
+    (c-name String)            ;; C type name (e.g., "parser_SExpr")
+    (variants (List ResolvedVariant))  ;; For unions/enums
+    (fields (List ResolvedField))      ;; For records
+    (inner-type (Option (Ptr ResolvedType)))   ;; For Ptr, List, Option
+    (inner-type2 (Option (Ptr ResolvedType)))  ;; For Result (error type), Map (value type)
+    (range (Option RangeBounds))       ;; For range types
+    (source-line Int)          ;; Source location for errors
+    (source-col Int)))
+
+  ;; ============================================================
+  ;; Function Signature Info
+  ;; ============================================================
+
+  ;; A function parameter
+  (type ParamInfo (record
+    (name String)              ;; Parameter name
+    (param-type (Ptr ResolvedType))))  ;; Parameter type
+
+  ;; A complete function signature
+  (type FnSignature (record
+    (name String)              ;; Function name (SLOP name)
+    (c-name String)            ;; C function name
+    (params (List ParamInfo))  ;; Parameters
+    (return-type (Ptr ResolvedType))   ;; Return type
+    (is-pure Bool)             ;; Has @pure annotation
+    (allocates Bool)           ;; Has @alloc annotation
+    (module-name (Option String))))    ;; Module that defines this
+
+  ;; ============================================================
+  ;; Type Errors
+  ;; ============================================================
+
+  (type TypeErrorKind (enum
+    te-undefined-type     ;; Reference to undefined type
+    te-undefined-var      ;; Reference to undefined variable
+    te-undefined-fn       ;; Reference to undefined function
+    te-type-mismatch      ;; Expected one type, got another
+    te-arity-mismatch     ;; Wrong number of arguments
+    te-not-a-function     ;; Tried to call non-function
+    te-not-a-record       ;; Field access on non-record
+    te-unknown-field      ;; Field doesn't exist
+    te-not-a-union        ;; Match on non-union
+    te-unknown-variant    ;; Variant doesn't exist
+    te-non-exhaustive     ;; Match not exhaustive
+    te-import-error))     ;; Import resolution failed
+
+  (type TypeError (record
+    (kind TypeErrorKind)
+    (message String)
+    (line Int)
+    (col Int)))
+
+  ;; ============================================================
+  ;; Diagnostics (warnings and errors)
+  ;; ============================================================
+
+  (type DiagnosticLevel (enum
+    diag-warning
+    diag-error))
+
+  (type Diagnostic (record
+    (level DiagnosticLevel)
+    (message String)
+    (line Int)
+    (col Int)))
+
+  ;; ============================================================
+  ;; Constructor Functions
+  ;; ============================================================
+
+  (fn range-bounds-new ((has-min Bool) (min-val I64) (has-max Bool) (max-val I64))
+    (@intent "Create RangeBounds from components")
+    (@spec ((Bool I64 Bool I64) -> RangeBounds))
+    (@pure)
+    (RangeBounds has-min has-max min-val max-val))
+
+  (fn range-bounds-unbounded ()
+    (@intent "Create unbounded range (full Int)")
+    (@spec (() -> RangeBounds))
+    (@pure)
+    (RangeBounds false false 0 0))
+
+  (fn range-contains ((bounds RangeBounds) (value I64))
+    (@intent "Check if value is within range bounds")
+    (@spec ((RangeBounds I64) -> Bool))
+    (@pure)
+    (and
+      (or (not (. bounds has-min)) (>= value (. bounds min-val)))
+      (or (not (. bounds has-max)) (<= value (. bounds max-val)))))
+
+  (fn range-intersect ((a RangeBounds) (b RangeBounds))
+    (@intent "Compute intersection of two ranges")
+    (@spec ((RangeBounds RangeBounds) -> RangeBounds))
+    (@pure)
+    ;; Intersection = tighter bounds. If only one has a bound, use it.
+    (let ((new-has-min (or (. a has-min) (. b has-min)))
+          (new-has-max (or (. a has-max) (. b has-max)))
+          (new-min-val (if (. a has-min)
+                         (if (. b has-min)
+                           (max (. a min-val) (. b min-val))
+                           (. a min-val))
+                         (. b min-val)))
+          (new-max-val (if (. a has-max)
+                         (if (. b has-max)
+                           (min (. a max-val) (. b max-val))
+                           (. a max-val))
+                         (. b max-val))))
+      (RangeBounds new-has-min new-has-max new-min-val new-max-val)))
+
+  (fn range-union ((a RangeBounds) (b RangeBounds))
+    (@intent "Compute union of two ranges")
+    (@spec ((RangeBounds RangeBounds) -> RangeBounds))
+    (@pure)
+    (let ((new-has-min (and (. a has-min) (. b has-min)))
+          (new-has-max (and (. a has-max) (. b has-max)))
+          (new-min-val (if (and (. a has-min) (. b has-min)) (min (. a min-val) (. b min-val)) 0))
+          (new-max-val (if (and (. a has-max) (. b has-max)) (max (. a max-val) (. b max-val)) 0)))
+      (RangeBounds new-has-min new-has-max new-min-val new-max-val)))
+
+  ;; ============================================================
+  ;; Resolved Type Constructors
+  ;; ============================================================
+
+  (fn resolved-variant-new ((arena Arena) (name String) (index Int)
+                            (tag-constant String) (payload (Option (Ptr ResolvedType))))
+    (@intent "Create a resolved variant with all code generation info")
+    (@spec ((Arena String Int String (Option (Ptr ResolvedType))) -> (Ptr ResolvedVariant)))
+    (@alloc arena)
+    ;; Example: (resolved-variant-new arena "list" 3 "parser_SExpr_list_TAG" (none))
+    ;; Returns pointer to ResolvedVariant with name="list", index=3
+    (let ((v (cast (Ptr ResolvedVariant) (arena-alloc arena 64))))
+      (set! (deref v) (ResolvedVariant name index tag-constant payload))
+      v))
+
+  (fn resolved-field-new ((arena Arena) (name String) (field-type (Ptr ResolvedType)) (offset Int))
+    (@intent "Create a resolved record field with type info")
+    (@spec ((Arena String (Ptr ResolvedType) Int) -> (Ptr ResolvedField)))
+    (@alloc arena)
+    (@pre (!= field-type nil))
+    ;; Example: (resolved-field-new arena "items" list-type 0)
+    ;; Returns pointer to ResolvedField with name="items", offset=0
+    (let ((f (cast (Ptr ResolvedField) (arena-alloc arena 48))))
+      (set! (deref f) (ResolvedField name field-type offset))
+      f))
+
+  (fn resolved-type-new ((arena Arena) (kind ResolvedTypeKind) (name String)
+                         (module-name (Option String)) (c-name String))
+    (@intent "Create a basic resolved type (without variants/fields)")
+    (@spec ((Arena ResolvedTypeKind String (Option String) String) -> (Ptr ResolvedType)))
+    (@alloc arena)
+    ;; Example: (resolved-type-new arena 'rk-primitive "Int" (none) "int64_t")
+    ;; Example: (resolved-type-new arena 'rk-union "SExpr" (some "parser") "parser_SExpr")
+    (let ((t (cast (Ptr ResolvedType) (arena-alloc arena 128))))
+      (set! (deref t) (ResolvedType
+        kind name module-name c-name
+        (list-new arena ResolvedVariant)  ;; Empty variants
+        (list-new arena ResolvedField)    ;; Empty fields
+        (none)   ;; inner-type
+        (none)   ;; inner-type2
+        (none)   ;; range
+        0 0))    ;; source location
+      t))
+
+  (fn param-info-new ((arena Arena) (name String) (param-type (Ptr ResolvedType)))
+    (@intent "Create a function parameter info")
+    (@spec ((Arena String (Ptr ResolvedType)) -> (Ptr ParamInfo)))
+    (@alloc arena)
+    (@pre (!= param-type nil))
+    ;; Example: (param-info-new arena "arena" arena-type)
+    (let ((p (cast (Ptr ParamInfo) (arena-alloc arena 24))))
+      (set! (deref p) (ParamInfo name param-type))
+      p))
+
+  (fn fn-signature-new ((arena Arena) (name String) (c-name String)
+                        (params (List ParamInfo)) (return-type (Ptr ResolvedType)))
+    (@intent "Create a function signature with default flags")
+    (@spec ((Arena String String (List ParamInfo) (Ptr ResolvedType)) -> (Ptr FnSignature)))
+    (@alloc arena)
+    (@pre (!= return-type nil))
+    ;; Example: (fn-signature-new arena "add" "add" params int-type)
+    (let ((sig (cast (Ptr FnSignature) (arena-alloc arena 96))))
+      (set! (deref sig) (FnSignature name c-name params return-type false false (none)))
+      sig))
+
+  (fn type-error-new ((kind TypeErrorKind) (message String) (line Int) (col Int))
+    (@intent "Create a type error with location info")
+    (@spec ((TypeErrorKind String Int Int) -> TypeError))
+    (@pure)
+    ;; Example: (type-error-new 'te-undefined-type "Unknown type: Foo" 10 5)
+    (TypeError kind message line col))
+
+  (fn diagnostic-new ((level DiagnosticLevel) (message String) (line Int) (col Int))
+    (@intent "Create a diagnostic with location info")
+    (@spec ((DiagnosticLevel String Int Int) -> Diagnostic))
+    (@pure)
+    ;; Example: (diagnostic-new 'diag-warning "Branch types differ" 10 5)
+    (Diagnostic level message line col))
+
+  ;; ============================================================
+  ;; Type Kind Predicates
+  ;; ============================================================
+
+  (fn is-primitive-kind ((kind ResolvedTypeKind))
+    (@intent "Check if type kind is a primitive (Int, Bool, String, etc.)")
+    (@spec ((ResolvedTypeKind) -> Bool))
+    (@pure)
+    (@post (== $result (== kind 'rk-primitive)))
+    (== kind 'rk-primitive))
+
+  (fn is-container-kind ((kind ResolvedTypeKind))
+    (@intent "Check if type kind is a container (List, Ptr, Option, Result, Map)")
+    (@spec ((ResolvedTypeKind) -> Bool))
+    (@pure)
+    (@post (== $result (or (== kind 'rk-list)
+                           (== kind 'rk-ptr)
+                           (== kind 'rk-option)
+                           (== kind 'rk-result)
+                           (== kind 'rk-map)
+                           (== kind 'rk-array))))
+    (or (== kind 'rk-list)
+        (== kind 'rk-ptr)
+        (== kind 'rk-option)
+        (== kind 'rk-result)
+        (== kind 'rk-map)
+        (== kind 'rk-array)))
+
+  ;; ============================================================
+  ;; Resolved Type Predicates
+  ;; ============================================================
+
+  (fn resolved-type-is-pointer ((t (Ptr ResolvedType)))
+    (@intent "Check if resolved type is a pointer type")
+    (@spec (((Ptr ResolvedType)) -> Bool))
+    (@pure)
+    (@pre (!= t nil))
+    (@post (== $result (== (. (deref t) kind) 'rk-ptr)))
+    (== (. (deref t) kind) 'rk-ptr))
+
+  (fn resolved-type-is-union ((t (Ptr ResolvedType)))
+    (@intent "Check if resolved type is a union type")
+    (@spec (((Ptr ResolvedType)) -> Bool))
+    (@pure)
+    (@pre (!= t nil))
+    (@post (== $result (== (. (deref t) kind) 'rk-union)))
+    (== (. (deref t) kind) 'rk-union))
+
+  (fn resolved-type-is-record ((t (Ptr ResolvedType)))
+    (@intent "Check if resolved type is a record type")
+    (@spec (((Ptr ResolvedType)) -> Bool))
+    (@pure)
+    (@pre (!= t nil))
+    (@post (== $result (== (. (deref t) kind) 'rk-record)))
+    (== (. (deref t) kind) 'rk-record))
+
+  ;; ============================================================
+  ;; Resolved Type Accessors
+  ;; ============================================================
+
+  (fn resolved-type-get-variant-index ((t (Ptr ResolvedType)) (name String))
+    (@intent "Look up a variant's index by name in a union type")
+    (@spec (((Ptr ResolvedType) String) -> (Option Int)))
+    (@pure)
+    (@pre (!= t nil))
+    (@pre (== (. (deref t) kind) 'rk-union))
+    ;; Returns (some index) if found, (none) otherwise
+    (let ((variants (. (deref t) variants))
+          (len (list-len variants))
+          (mut i 0)
+          (mut done false)
+          (mut found (Option Int) (none)))
+      (while (and (< i len) (not done))
+        (match (list-get variants i)
+          ((some v)
+            (when (string-eq (. v name) name)
+              (do
+                (set! done true)
+                (set! found (some (. v index))))))
+          ((none) (do)))
+        (set! i (+ i 1)))
+      found))
+
+  (fn resolved-type-get-variant-payload ((t (Ptr ResolvedType)) (name String))
+    (@intent "Get the payload type of a variant by name in a union type")
+    (@spec (((Ptr ResolvedType) String) -> (Option (Ptr ResolvedType))))
+    (@pure)
+    (@pre (!= t nil))
+    ;; Returns (some payload-type) if variant found and has payload, (none) otherwise
+    (if (== (. (deref t) kind) 'rk-union)
+      (let ((variants (. (deref t) variants))
+            (len (list-len variants))
+            (mut i 0)
+            (mut done false)
+            (mut found (Option (Ptr ResolvedType)) (none)))
+        (while (and (< i len) (not done))
+          (match (list-get variants i)
+            ((some v)
+              (when (string-eq (. v name) name)
+                (do
+                  (set! done true)
+                  (set! found (. v payload-type)))))
+            ((none) (do)))
+          (set! i (+ i 1)))
+        found)
+      (none)))
+
+  (fn resolved-type-has-field ((t (Ptr ResolvedType)) (name String))
+    (@intent "Check if a record type has a field with the given name")
+    (@spec (((Ptr ResolvedType) String) -> Bool))
+    (@pure)
+    (@pre (!= t nil))
+    (@pre (== (. (deref t) kind) 'rk-record))
+    ;; Returns true if field exists, false otherwise
+    (let ((fields (. (deref t) fields))
+          (len (list-len fields))
+          (mut i 0)
+          (mut found false))
+      (while (and (< i len) (not found))
+        (match (list-get fields i)
+          ((some f)
+            (when (string-eq (. f name) name)
+              (set! found true)))
+          ((none) (do)))
+        (set! i (+ i 1)))
+      found))
+)

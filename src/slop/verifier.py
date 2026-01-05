@@ -221,6 +221,48 @@ class Z3Translator:
                 if op == '.':
                     return self._translate_field_access(expr)
 
+                # List length - equivalent to (. list len)
+                if op == 'list-len':
+                    if len(expr) >= 2:
+                        lst = self.translate_expr(expr[1])
+                        if lst is None:
+                            return None
+                        # Use the same field accessor pattern as _translate_field_access
+                        func_name = "field_len"
+                        if func_name not in self.variables:
+                            func = z3.Function(func_name, z3.IntSort(), z3.IntSort())
+                            self.variables[func_name] = func
+                        else:
+                            func = self.variables[func_name]
+                        result = func(lst)
+                        # List length is always non-negative
+                        self.constraints.append(result >= 0)
+                        return result
+                    return None
+
+                # is-form - check if SExpr is a specific form type
+                if op == 'is-form':
+                    if len(expr) >= 3:
+                        form_expr = self.translate_expr(expr[1])
+                        # The second arg is a string literal for the form name
+                        # Model as uninterpreted function: form_type(expr) == form_name_hash
+                        if form_expr is None:
+                            return None
+                        func_name = "form_type"
+                        if func_name not in self.variables:
+                            func = z3.Function(func_name, z3.IntSort(), z3.IntSort())
+                            self.variables[func_name] = func
+                        else:
+                            func = self.variables[func_name]
+                        # Get form name and hash it for comparison
+                        form_name = expr[2]
+                        if isinstance(form_name, String):
+                            name_hash = hash(form_name.value) % (2**31)
+                        else:
+                            name_hash = 0
+                        return func(form_expr) == z3.IntVal(name_hash)
+                    return None
+
                 # Pointer dereference - pass through to inner expression
                 if op == 'deref':
                     if len(expr) >= 2:
@@ -902,6 +944,7 @@ def verify_file(path: str, mode: str = "error",
     try:
         with open(path) as f:
             source = f.read()
+        ast = parse(source)
     except Exception as e:
         return [VerificationResult(
             name="file",
@@ -910,4 +953,29 @@ def verify_file(path: str, mode: str = "error",
             message=f"Could not read file: {e}"
         )]
 
-    return verify_source(source, path, mode, timeout_ms)
+    # Use check_file which handles import resolution from slop.toml
+    diagnostics = check_file(path)
+
+    # Check for type errors
+    type_errors = [d for d in diagnostics if d.severity == 'error']
+    if type_errors:
+        return [VerificationResult(
+            name="typecheck",
+            verified=False,
+            status="error",
+            message=f"Type errors found: {len(type_errors)} error(s)"
+        )]
+
+    # Create type checker for contract verification (already type-checked via check_file)
+    type_checker = TypeChecker(path)
+    type_checker.check_module(ast)
+
+    # Run contract verification
+    contract_verifier = ContractVerifier(type_checker, timeout_ms)
+    results = contract_verifier.verify_all(ast)
+
+    # Run range verification
+    range_verifier = RangeVerifier(type_checker, timeout_ms)
+    results.extend(range_verifier.verify_range_safety(ast))
+
+    return results

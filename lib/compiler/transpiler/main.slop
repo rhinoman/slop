@@ -1,0 +1,104 @@
+;; ============================================================
+;; SLOP Transpiler CLI - Native transpiler binary entry point
+;;
+;; Usage: slop-transpiler <file.slop> [-o output.c]
+;; Transpiles SLOP source to C code and writes to stdout or file.
+;; ============================================================
+
+(module transpiler-cli
+  (export (main 2))
+
+  (import file (FileMode FileError File
+                file-open file-close file-read-all file-write))
+  (import parser (ParseResult ParseError SExpr parse))
+  (import transpiler (TranspileResult TranspileError transpile))
+  (import strlib (starts-with))
+
+  ;; FFI for string operations
+  (ffi "string.h"
+    (strlen ((s (Ptr U8))) U64))
+
+  (fn main ((argc Int) (argv (Ptr (Ptr U8))))
+    (@intent "Transpile a SLOP file to C code")
+    (@spec ((Int (Ptr (Ptr U8))) -> Int))
+    (if (< argc 2)
+      (do
+        (println "Usage: slop-transpiler <file.slop> [-o output.c]")
+        (println "")
+        (println "Options:")
+        (println "  -o FILE  Write output to FILE instead of stdout")
+        1)
+      (with-arena 4194304  ;; 4MB arena for transpiling
+        (let ((path (String (@ argv 1) (strlen (@ argv 1))))
+              (output-file (parse-output-arg arena argc argv)))
+          ;; Read source file
+          (match (file-open path 'read)
+            ((error e)
+              (do
+                (println "Error: Could not open input file")
+                1))
+            ((ok f)
+              (match (file-read-all arena (addr f))
+                ((error e)
+                  (do
+                    (file-close (addr f))
+                    (println "Error: Could not read input file")
+                    1))
+                ((ok source)
+                  (do
+                    (file-close (addr f))
+                    ;; Transpile to C
+                    (match (transpile arena source)
+                      ((error e)
+                        (do
+                          (print "Transpile error at line ")
+                          (print (. e line))
+                          (print ", col ")
+                          (print (. e col))
+                          (print ": ")
+                          (println (. e message))
+                          1))
+                      ((ok c-code)
+                        ;; Output the C code
+                        (match output-file
+                          ((some out-path)
+                            ;; Write to file
+                            (match (file-open out-path 'write)
+                              ((error e)
+                                (do
+                                  (println "Error: Could not open output file")
+                                  1))
+                              ((ok out-f)
+                                (let ((bytes (Bytes (cast (Ptr U8) (. c-code data)) (. c-code len) (. c-code len))))
+                                  (match (file-write (addr out-f) bytes)
+                                    ((error e)
+                                      (do
+                                        (file-close (addr out-f))
+                                        (println "Error: Could not write output file")
+                                        1))
+                                    ((ok _)
+                                      (do
+                                        (file-close (addr out-f))
+                                        (print "Wrote ")
+                                        (println out-path)
+                                        0)))))))
+                          ((none)
+                            ;; Write to stdout
+                            (do
+                              (print c-code)
+                              0))))))))))))))
+
+  (fn parse-output-arg ((arena Arena) (argc Int) (argv (Ptr (Ptr U8))))
+    (@intent "Parse -o argument from command line")
+    (@spec ((Arena Int (Ptr (Ptr U8))) -> (Option String)))
+    (@alloc arena)
+    ;; Look for -o flag
+    (let ((mut i 2))
+      (while (< i argc)
+        (let ((arg (String (@ argv i) (strlen (@ argv i)))))
+          (if (starts-with arg "-o")
+            (if (< (+ i 1) argc)
+              (return (some (String (@ argv (+ i 1)) (strlen (@ argv (+ i 1))))))
+              (return none))
+            (set! i (+ i 1)))))
+      none)))

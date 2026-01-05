@@ -1,0 +1,13 @@
+;; Test: with-arena binds arena variable - should pass
+
+(module pass-with-arena
+  (export main)
+
+  (fn main ()
+    (@intent "Test with-arena binds arena")
+    (@spec (() -> Int))
+    (with-arena 1024
+      ;; arena is bound and accessible here
+      (let ((x arena))
+        42)))
+)

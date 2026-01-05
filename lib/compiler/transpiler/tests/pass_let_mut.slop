@@ -1,0 +1,9 @@
+;; Test: Mutable let bindings - should transpile with mutable variable
+
+(fn main ()
+  (@intent "Test mutable let bindings with set!")
+  (@spec (() -> Int))
+  (let ((mut x 0))
+    (set! x (+ x 1))
+    (set! x (+ x 1))
+    x))

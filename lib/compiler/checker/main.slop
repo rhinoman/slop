@@ -1,0 +1,185 @@
+;; ============================================================
+;; Type Checker - Main Entry Point
+;;
+;; Orchestrates the type checking pipeline:
+;; 1. Collect type definitions
+;; 2. Resolve imports
+;; 3. Infer expression types
+;; ============================================================
+
+(module checker
+  (export
+    type-check TypeCheckResult (main 2))
+
+  (import parser (SExpr parse is-form))
+  (import types (TypeError TypeErrorKind type-error-new
+                 Diagnostic DiagnosticLevel))
+  (import env (TypeEnv env-new env-get-diagnostics))
+  (import collect (collect-module))
+  (import resolve (resolve-imports))
+  (import infer (infer-fn-body))
+  (import file (FileMode FileError File
+                file-open file-close file-read-all))
+  (import strlib (cstring-to-string))
+
+  ;; ============================================================
+  ;; Result Type
+  ;; ============================================================
+
+  (type TypeCheckResult (Result (Ptr TypeEnv) TypeError))
+
+  ;; ============================================================
+  ;; Main Entry Point
+  ;; ============================================================
+
+  (fn type-check ((arena Arena) (ast (List (Ptr SExpr))))
+    (@intent "Type check an AST and return populated type environment")
+    (@spec ((Arena (List (Ptr SExpr))) -> TypeCheckResult))
+    (@alloc arena)
+    (@pre (> (list-len ast) 0))
+    ;; Create type environment with builtins
+    (let ((env (env-new arena)))
+      ;; Phase 1: Collect all type and function definitions
+      (collect-module env ast)
+      ;; Phase 2: Resolve imports
+      (resolve-imports env ast)
+      ;; Phase 3: Type check function bodies
+      (check-all-functions env ast)
+      ;; Return populated environment
+      (ok env)))
+
+  (fn check-all-functions ((env (Ptr TypeEnv)) (ast (List (Ptr SExpr))))
+    (@intent "Type check all function bodies in the AST")
+    (@spec (((Ptr TypeEnv) (List (Ptr SExpr))) -> Unit))
+    (@pre (!= env nil))
+    (let ((len (list-len ast)))
+      (for (i 0 len)
+        (match (list-get ast i)
+          ((some expr)
+            (cond
+              ;; Direct function at top level
+              ((is-form expr "fn")
+                (let ((_ (infer-fn-body env expr)))
+                  (do)))
+              ;; Module - check functions inside
+              ((is-form expr "module")
+                (check-module-functions env expr))
+              (else (do))))
+          ((none) (do))))))
+
+  (fn check-module-functions ((env (Ptr TypeEnv)) (module-form (Ptr SExpr)))
+    (@intent "Type check all function bodies inside a module")
+    (@spec (((Ptr TypeEnv) (Ptr SExpr)) -> Unit))
+    (@pre (!= env nil))
+    (@pre (!= module-form nil))
+    (match (deref module-form)
+      ((list lst)
+        (let ((items (. lst items))
+              (len (list-len items)))
+          ;; Skip module name and export, start at index 2
+          (for (i 2 len)
+            (match (list-get items i)
+              ((some item)
+                (when (is-form item "fn")
+                  (let ((_ (infer-fn-body env item)))
+                    (do))))
+              ((none) (do))))))
+      (_ (do))))
+
+  ;; ============================================================
+  ;; Diagnostic Printing
+  ;; ============================================================
+
+  (fn print-diagnostic ((arena Arena) (filename String) (diag Diagnostic))
+    (@intent "Print a diagnostic message with location info")
+    (@spec ((Arena String Diagnostic) -> Unit))
+    (let ((msg (. diag message))
+          (line (. diag line))
+          (col (. diag col))
+          (level (. diag level)))
+      (print filename)
+      (print ":")
+      (print line)
+      (print ":")
+      (print col)
+      (print ": ")
+      (match level
+        ('diag-warning (print "warning: "))
+        ('diag-error (print "error: ")))
+      (println msg)))
+
+  ;; ============================================================
+  ;; Main - CLI Entry Point
+  ;; ============================================================
+
+  (fn main ((argc Int) (argv (Ptr (Ptr U8))))
+    (@intent "Entry point for the type checker CLI")
+    (@spec ((Int (Ptr (Ptr U8))) -> Int))
+    (if (< argc 2)
+      (do
+        (println "Usage: slop-checker <file.slop>")
+        1)
+      (with-arena 2097152
+        (let ((filename (cstring-to-string (@ argv 1))))
+          (match (file-open filename 'read)
+            ((error e)
+              (do
+                (println "Error: Could not open file")
+                1))
+            ((ok f)
+              (match (file-read-all arena (addr f))
+                ((error e)
+                  (do
+                    (file-close (addr f))
+                    (println "Error: Could not read file")
+                    1))
+                ((ok source)
+                  (do
+                    (file-close (addr f))
+                    (match (parse arena source)
+                      ((ok ast)
+                        (match (type-check arena ast)
+                          ((ok env)
+                            (let ((diagnostics (env-get-diagnostics env))
+                                  (num-diags (list-len diagnostics))
+                                  (mut num-warnings 0)
+                                  (mut num-errors 0))
+                              ;; Count and print diagnostics
+                              (for (i 0 num-diags)
+                                (match (list-get diagnostics i)
+                                  ((some diag)
+                                    (do
+                                      (print-diagnostic arena filename diag)
+                                      (match (. diag level)
+                                        ('diag-warning
+                                          (set! num-warnings (+ num-warnings 1)))
+                                        ('diag-error
+                                          (set! num-errors (+ num-errors 1))))))
+                                  ((none) (do))))
+                              ;; Print summary
+                              (if (> num-errors 0)
+                                (do
+                                  (print "Type check failed: ")
+                                  (print num-errors)
+                                  (println " error(s)")
+                                  1)
+                                (if (> num-warnings 0)
+                                  (do
+                                    (print "OK with ")
+                                    (print num-warnings)
+                                    (println " warning(s)")
+                                    0)
+                                  (do
+                                    (println "Type check passed")
+                                    0)))))
+                          ((error err)
+                            (do
+                              (print "Type error: ")
+                              (println (. err message))
+                              1))))
+                      ((error parse-err)
+                        (do
+                          (print "Parse error: ")
+                          (println (. parse-err message))
+                          1))))))))))))
+)

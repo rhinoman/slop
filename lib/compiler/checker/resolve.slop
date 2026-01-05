@@ -1,0 +1,69 @@
+;; ============================================================
+;; Import Resolution
+;;
+;; Resolves import statements, mapping local names to their
+;; fully qualified types from other modules.
+;; ============================================================
+
+(module resolve
+  (export
+    resolve-imports resolve-import-stmt)
+
+  (import parser (SExpr SExprList SExprSymbol is-form))
+  (import types (ResolvedType))
+  (import env (TypeEnv env-arena env-add-import env-resolve-import
+               env-lookup-type env-set-module))
+
+  ;; ============================================================
+  ;; Import Resolution
+  ;; ============================================================
+
+  (fn resolve-imports ((env (Ptr TypeEnv)) (ast (List (Ptr SExpr))))
+    (@intent "Process all import statements in the AST")
+    (@spec (((Ptr TypeEnv) (List (Ptr SExpr))) -> Unit))
+    (@pre (!= env nil))
+    (let ((len (list-len ast)))
+      (for (i 0 len)
+        (match (list-get ast i)
+          ((some expr)
+            (when (is-form expr "import")
+              (resolve-import-stmt env expr)))
+          ((none) (do))))))
+
+  (fn resolve-import-stmt ((env (Ptr TypeEnv)) (import-form (Ptr SExpr)))
+    (@intent "Process a single import statement")
+    (@spec (((Ptr TypeEnv) (Ptr SExpr)) -> Unit))
+    (@pre (!= env nil))
+    (@pre (!= import-form nil))
+    (@pre (is-form import-form "import"))
+    (let ((arena (env-arena env)))
+      (match (deref import-form)
+        ((list lst)
+          (let ((items (. lst items)))
+            (match (list-get items 1)
+              ((some mod-name-expr)
+                (match (deref mod-name-expr)
+                  ((symbol mod-sym)
+                    (match (list-get items 2)
+                      ((some names-expr)
+                        (match (deref names-expr)
+                          ((list names-lst)
+                            (let ((name-items (. names-lst items))
+                                  (name-len (list-len name-items)))
+                              (for (j 0 name-len)
+                                (match (list-get name-items j)
+                                  ((some name-expr)
+                                    (match (deref name-expr)
+                                      ((symbol name-sym)
+                                        (let ((local-name (. name-sym name))
+                                              (qualified-name (string-concat arena (. mod-sym name)
+                                                                (string-concat arena ":" local-name))))
+                                          (env-add-import env local-name qualified-name)))
+                                      (_ (do))))
+                                  ((none) (do))))))
+                          (_ (do))))
+                      ((none) (do))))
+                  (_ (do))))
+              ((none) (do)))))
+        (_ (do)))))
+)

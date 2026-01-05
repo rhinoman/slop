@@ -166,6 +166,28 @@ slop check-hole '(helper 42)' -t Int -c myfile.slop
 echo '(ok value)' | slop check-hole -t '(Result T E)'
 ```
 
+### Native Components
+
+SLOP includes native (self-hosted) implementations of core compiler components written in SLOP itself. Use the `--native` flag to use these instead of the Python implementations:
+
+```bash
+# Use native parser
+slop parse examples/rate-limiter.slop --native
+
+# Use native type checker
+slop check examples/rate-limiter.slop --native
+
+# Use native components for full build (parser, transpiler)
+slop build examples/rate-limiter.slop --native
+```
+
+Native components are located in `lib/compiler/`:
+- `lib/compiler/parser/` - Native S-expression parser
+- `lib/compiler/checker/` - Native type checker
+- `lib/compiler/transpiler/` - Native SLOP-to-C transpiler
+
+When `--native` is specified, the CLI looks for pre-built binaries (`slop-parser`, `slop-checker`, `slop-transpiler`). If a native component isn't found, it falls back to the Python implementation.
+
 ## Project Configuration
 
 Create a `slop.toml` file to configure your project:

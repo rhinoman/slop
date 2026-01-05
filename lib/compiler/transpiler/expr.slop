@@ -1,0 +1,894 @@
+;; ============================================================
+;; SLOP Transpiler - Expression Transpilation
+;;
+;; Convert SLOP expressions to C expression strings.
+;; Handles literals, symbols, operators, field access,
+;; function calls, and constructors.
+;; ============================================================
+
+(module expr
+  (export
+    transpile-expr
+    is-pointer-expr
+    infer-expr-c-type)
+
+  (import parser (SExpr SExprList SExprSymbol SExprNumber SExprString
+                  is-form sexpr-line sexpr-col))
+  (import context (TranspileContext ctx-lookup-var ctx-lookup-enum
+                   ctx-lookup-function ctx-lookup-ffi-func
+                   ctx-is-pointer ctx-get-return-type
+                   ctx-lookup-fields ctx-get-type-env))
+  ;; Import type checker for type inference
+  (import env (TypeEnv env-lookup-var env-lookup-function))
+  (import types (ResolvedType FnSignature))
+  (import ctype (to-c-type is-pointer-type is-string-type
+                 is-option-type is-result-type))
+  (import names (to-c-name to-qualified-name))
+  (import emit (Emitter))
+  (import strlib (float-to-string))
+
+  ;; ============================================================
+  ;; Main Expression Transpilation
+  ;; ============================================================
+
+  (fn transpile-expr ((ctx (Ptr TranspileContext)) (expr (Ptr SExpr))
+                      (expected-type (Option String)))
+    (@intent "Transpile SLOP expression to C expression string")
+    (@spec (((Ptr TranspileContext) (Ptr SExpr) (Option String)) -> String))
+    (@pre (!= ctx nil))
+    (@pre (!= expr nil))
+    (match (deref expr)
+      ;; Number literal
+      ((number n)
+        (if (. n is-float)
+          (float-to-string (. (deref ctx) arena) (. n float-value) 6)
+          (int-to-string (. (deref ctx) arena) (. n int-value))))
+
+      ;; String literal
+      ((string s)
+        (transpile-string-literal ctx (. s value)))
+
+      ;; Symbol (variable, enum, builtin)
+      ((symbol sym)
+        (transpile-symbol ctx (. sym name) expected-type))
+
+      ;; List (operator, function call, special form)
+      ((list l)
+        (transpile-list-expr ctx l expected-type))))
+
+  ;; ============================================================
+  ;; Literal Transpilation
+  ;; ============================================================
+
+  (fn transpile-string-literal ((ctx (Ptr TranspileContext)) (value String))
+    (@intent "Transpile string literal to SLOP_STR macro")
+    (@spec (((Ptr TranspileContext) String) -> String))
+    (@pre (!= ctx nil))
+    ;; Output: SLOP_STR("escaped content")
+    (let ((arena (. (deref ctx) arena)))
+      (string-concat arena
+        (string-concat arena "SLOP_STR(\"" value)
+        "\")")))
+
+  ;; ============================================================
+  ;; Symbol Transpilation
+  ;; ============================================================
+
+  (fn transpile-symbol ((ctx (Ptr TranspileContext)) (name String)
+                        (expected-type (Option String)))
+    (@intent "Transpile symbol to C expression")
+    (@spec (((Ptr TranspileContext) String (Option String)) -> String))
+    (@pre (!= ctx nil))
+    (cond
+      ;; Boolean literals
+      ((string-eq name "true") "true")
+      ((string-eq name "false") "false")
+      ;; Null
+      ((string-eq name "nil") "NULL")
+      ;; None constructor (needs expected type for proper typing)
+      ((string-eq name "none")
+        (transpile-none ctx expected-type))
+      ;; Check if it's an enum value
+      (else
+        (match (ctx-lookup-enum ctx name)
+          ((some qualified) qualified)
+          ((none) (to-c-name (. (deref ctx) arena) name))))))
+
+  ;; ============================================================
+  ;; List Expression Transpilation
+  ;; ============================================================
+
+  (fn transpile-list-expr ((ctx (Ptr TranspileContext))
+                           (lst SExprList)
+                           (expected-type (Option String)))
+    (@intent "Transpile list expression (operator, call, or special form)")
+    (@spec (((Ptr TranspileContext) SExprList (Option String)) -> String))
+    (@pre (!= ctx nil))
+    (@pre (> (list-len (. lst items)) 0))
+    ;; Get the operator/function name
+    (match (list-get (. lst items) 0)
+      ((none) "/* empty list */")
+      ((some head)
+        (match (deref head)
+          ((symbol sym)
+            (let ((op (. sym name)))
+              (cond
+                ;; Arithmetic operators
+                ((string-eq op "+") (transpile-binary ctx lst "+"))
+                ((string-eq op "-") (transpile-minus ctx lst))
+                ((string-eq op "*") (transpile-binary ctx lst "*"))
+                ((string-eq op "/") (transpile-binary ctx lst "/"))
+                ((string-eq op "%") (transpile-binary ctx lst "%"))
+
+                ;; Comparison operators
+                ((string-eq op "==") (transpile-comparison ctx lst "=="))
+                ((string-eq op "!=") (transpile-comparison ctx lst "!="))
+                ((string-eq op "<") (transpile-comparison ctx lst "<"))
+                ((string-eq op "<=") (transpile-comparison ctx lst "<="))
+                ((string-eq op ">") (transpile-comparison ctx lst ">"))
+                ((string-eq op ">=") (transpile-comparison ctx lst ">="))
+
+                ;; Logical operators
+                ((string-eq op "and") (transpile-binary ctx lst "&&"))
+                ((string-eq op "or") (transpile-binary ctx lst "||"))
+                ((string-eq op "not") (transpile-unary ctx lst "!"))
+
+                ;; Field access
+                ((string-eq op ".") (transpile-field-access ctx lst))
+
+                ;; Index access
+                ((string-eq op "@") (transpile-index-access ctx lst))
+
+                ;; Pointer operations
+                ((string-eq op "addr") (transpile-addr ctx lst))
+                ((string-eq op "deref") (transpile-deref ctx lst))
+
+                ;; Type cast
+                ((string-eq op "cast") (transpile-cast ctx lst))
+
+                ;; Option/Result constructors
+                ((string-eq op "some") (transpile-some ctx lst expected-type))
+                ((string-eq op "ok") (transpile-ok ctx lst expected-type))
+                ((string-eq op "error") (transpile-error ctx lst expected-type))
+
+                ;; List operations
+                ((string-eq op "list-new") (transpile-list-new ctx lst))
+                ((string-eq op "list-push") (transpile-list-push ctx lst))
+                ((string-eq op "list-pop") (transpile-list-pop ctx lst))
+                ((string-eq op "list-get") (transpile-list-get ctx lst))
+                ((string-eq op "list-len") (transpile-list-len ctx lst))
+
+                ;; Map operations
+                ((string-eq op "map-get") (transpile-map-get ctx lst))
+                ((string-eq op "map-has") (transpile-map-has ctx lst))
+                ((string-eq op "map-keys") (transpile-map-keys ctx lst))
+                ((string-eq op "map-remove") (transpile-map-remove ctx lst))
+
+                ;; Record construction
+                ((string-eq op "record-new") (transpile-record-new ctx lst))
+
+                ;; Union construction
+                ((string-eq op "union-new") (transpile-union-new ctx lst))
+
+                ;; Quote (enum literal)
+                ((string-eq op "quote") (transpile-quote ctx lst))
+
+                ;; C inline
+                ((string-eq op "c-inline") (transpile-c-inline ctx lst))
+
+                ;; Sizeof
+                ((string-eq op "sizeof") (transpile-sizeof ctx lst))
+
+                ;; Arena allocation
+                ((string-eq op "arena-alloc") (transpile-arena-alloc ctx lst))
+
+                ;; Default: function call
+                (else (transpile-function-call ctx op lst)))))
+          ;; Head is not a symbol - treat as computed function call
+          (_ "/* computed function expressions not supported */")))))
+
+  ;; ============================================================
+  ;; Arithmetic and Comparison
+  ;; ============================================================
+
+  (fn transpile-binary ((ctx (Ptr TranspileContext))
+                        (lst SExprList) (c-op String))
+    (@intent "Transpile binary operator expression")
+    (@spec (((Ptr TranspileContext) SExprList String) -> String))
+    (@pre (!= ctx nil))
+    (@pre (>= (list-len (. lst items)) 3))
+    (match (list-get (. lst items) 1)
+      ((some left)
+        (match (list-get (. lst items) 2)
+          ((some right)
+            (let ((left-str (transpile-expr ctx left (none)))
+                  (right-str (transpile-expr ctx right (none)))
+                  (arena (. (deref ctx) arena)))
+              (string-concat arena
+                (string-concat arena "(" left-str)
+                (string-concat arena (string-concat arena " " c-op)
+                  (string-concat arena (string-concat arena " " right-str) ")")))))
+          ((none) "")))
+      ((none) "")))
+
+  (fn transpile-minus ((ctx (Ptr TranspileContext)) (lst SExprList))
+    (@intent "Transpile minus (unary negation or binary subtraction)")
+    (@spec (((Ptr TranspileContext) SExprList) -> String))
+    (@pre (!= ctx nil))
+    (if (== (list-len (. lst items)) 2)
+      (transpile-unary ctx lst "-")
+      (transpile-binary ctx lst "-")))
+
+  (fn transpile-unary ((ctx (Ptr TranspileContext))
+                       (lst SExprList) (c-op String))
+    (@intent "Transpile unary operator expression")
+    (@spec (((Ptr TranspileContext) SExprList String) -> String))
+    (@pre (!= ctx nil))
+    (@pre (>= (list-len (. lst items)) 2))
+    (match (list-get (. lst items) 1)
+      ((none) "/* missing operand */")
+      ((some operand)
+        (let ((operand-str (transpile-expr ctx operand (none)))
+              (arena (. (deref ctx) arena)))
+          (string-concat arena
+            (string-concat arena c-op "(")
+            (string-concat arena operand-str ")"))))))
+
+  (fn transpile-comparison ((ctx (Ptr TranspileContext))
+                            (lst SExprList) (c-op String))
+    (@intent "Transpile comparison, handling string-eq specially")
+    (@spec (((Ptr TranspileContext) SExprList String) -> String))
+    (@pre (!= ctx nil))
+    (@pre (>= (list-len (. lst items)) 3))
+    ;; For string comparison, use slop_string_eq (TODO: add string check)
+    (match (list-get (. lst items) 1)
+      ((some left)
+        (match (list-get (. lst items) 2)
+          ((some right)
+            (let ((left-str (transpile-expr ctx left (none)))
+                  (right-str (transpile-expr ctx right (none)))
+                  (arena (. (deref ctx) arena)))
+              (string-concat arena
+                (string-concat arena "(" left-str)
+                (string-concat arena (string-concat arena " " c-op)
+                  (string-concat arena (string-concat arena " " right-str) ")")))))
+          ((none) "")))
+      ((none) "")))
+
+  ;; ============================================================
+  ;; Field and Index Access
+  ;; ============================================================
+
+  (fn transpile-field-access ((ctx (Ptr TranspileContext)) (lst SExprList))
+    (@intent "Transpile field access (. base field) or (. base field1 field2 ...)")
+    (@spec (((Ptr TranspileContext) SExprList) -> String))
+    (@pre (!= ctx nil))
+    (@pre (>= (list-len (. lst items)) 3))
+    ;; Use -> for pointers, . for values
+    (match (list-get (. lst items) 1)
+      ((some base-expr)
+        (match (list-get (. lst items) 2)
+          ((some field-expr)
+            (let ((base-str (transpile-expr ctx base-expr (none)))
+                  (is-ptr (is-pointer-expr ctx base-expr))
+                  (arena (. (deref ctx) arena)))
+              (match (deref field-expr)
+                ((symbol s)
+                  (let ((field-name (to-c-name arena (. s name)))
+                        (op (if is-ptr "->" ".")))
+                    (string-concat arena base-str (string-concat arena op field-name))))
+                (_ ""))))
+          ((none) "")))
+      ((none) "")))
+
+  (fn transpile-index-access ((ctx (Ptr TranspileContext)) (lst SExprList))
+    (@intent "Transpile index access (@ array index)")
+    (@spec (((Ptr TranspileContext) SExprList) -> String))
+    (@pre (!= ctx nil))
+    (@pre (>= (list-len (. lst items)) 3))
+    (match (list-get (. lst items) 1)
+      ((some arr-expr)
+        (match (list-get (. lst items) 2)
+          ((some idx-expr)
+            (let ((arr-str (transpile-expr ctx arr-expr (none)))
+                  (idx-str (transpile-expr ctx idx-expr (none)))
+                  (arena (. (deref ctx) arena)))
+              (string-concat arena arr-str (string-concat arena "[" (string-concat arena idx-str "]")))))
+          ((none) "")))
+      ((none) "")))
+
+  ;; ============================================================
+  ;; Pointer Operations
+  ;; ============================================================
+
+  (fn transpile-addr ((ctx (Ptr TranspileContext)) (lst SExprList))
+    (@intent "Transpile address-of (addr var)")
+    (@spec (((Ptr TranspileContext) SExprList) -> String))
+    (@pre (!= ctx nil))
+    (@pre (>= (list-len (. lst items)) 2))
+    (match (list-get (. lst items) 1)
+      ((some operand)
+        (let ((operand-str (transpile-expr ctx operand (none)))
+              (arena (. (deref ctx) arena)))
+          (string-concat arena "&(" (string-concat arena operand-str ")"))))
+      ((none) "")))
+
+  (fn transpile-deref ((ctx (Ptr TranspileContext)) (lst SExprList))
+    (@intent "Transpile pointer dereference (deref ptr)")
+    (@spec (((Ptr TranspileContext) SExprList) -> String))
+    (@pre (!= ctx nil))
+    (@pre (>= (list-len (. lst items)) 2))
+    (match (list-get (. lst items) 1)
+      ((some ptr-expr)
+        (let ((ptr-str (transpile-expr ctx ptr-expr (none)))
+              (arena (. (deref ctx) arena)))
+          (string-concat arena "*(" (string-concat arena ptr-str ")"))))
+      ((none) "")))
+
+  (fn transpile-cast ((ctx (Ptr TranspileContext)) (lst SExprList))
+    (@intent "Transpile type cast (cast Type expr)")
+    (@spec (((Ptr TranspileContext) SExprList) -> String))
+    (@pre (!= ctx nil))
+    (@pre (>= (list-len (. lst items)) 3))
+    ;; Handle range type constructors vs simple casts (TODO: add range check)
+    (match (list-get (. lst items) 1)
+      ((some type-expr)
+        (match (list-get (. lst items) 2)
+          ((some val-expr)
+            (let ((c-type (to-c-type ctx type-expr))
+                  (val-str (transpile-expr ctx val-expr (none)))
+                  (arena (. (deref ctx) arena)))
+              (string-concat arena "(("
+                (string-concat arena c-type
+                  (string-concat arena ")("
+                    (string-concat arena val-str "))"))))))
+          ((none) "")))
+      ((none) "")))
+
+  ;; ============================================================
+  ;; Option/Result Constructors
+  ;; ============================================================
+
+  (fn transpile-none ((ctx (Ptr TranspileContext))
+                      (expected-type (Option String)))
+    (@intent "Transpile none constructor")
+    (@spec (((Ptr TranspileContext) (Option String)) -> String))
+    (@pre (!= ctx nil))
+    ;; Output: ((type){ .has_value = false })
+    (let ((arena (. (deref ctx) arena)))
+      (match expected-type
+        ((some typ)
+          (string-concat arena "((" (string-concat arena typ "){ .has_value = false })")))
+        ((none)
+          (match (ctx-get-return-type ctx)
+            ((some typ)
+              (string-concat arena "((" (string-concat arena typ "){ .has_value = false })")))
+            ((none) "((void){ .has_value = false })"))))))
+
+  (fn transpile-some ((ctx (Ptr TranspileContext)) (lst SExprList)
+                      (expected-type (Option String)))
+    (@intent "Transpile some constructor (some value)")
+    (@spec (((Ptr TranspileContext) SExprList (Option String)) -> String))
+    (@pre (!= ctx nil))
+    (@pre (>= (list-len (. lst items)) 2))
+    ;; Output: ((type){ .has_value = true, .value = expr })
+    (match (list-get (. lst items) 1)
+      ((some val-expr)
+        (let ((val-str (transpile-expr ctx val-expr (none)))
+              (arena (. (deref ctx) arena))
+              (typ (match expected-type
+                     ((some t) t)
+                     ((none) (match (ctx-get-return-type ctx)
+                               ((some rt) rt)
+                               ((none) "slop_option"))))))
+          (string-concat arena
+            (string-concat arena "((" typ)
+            (string-concat arena "){ .has_value = true, .value = "
+              (string-concat arena val-str " })")))))
+      ((none) "")))
+
+  (fn transpile-ok ((ctx (Ptr TranspileContext)) (lst SExprList)
+                    (expected-type (Option String)))
+    (@intent "Transpile ok constructor (ok value)")
+    (@spec (((Ptr TranspileContext) SExprList (Option String)) -> String))
+    (@pre (!= ctx nil))
+    (@pre (>= (list-len (. lst items)) 2))
+    ;; Output: ((type){ .is_ok = true, .data.ok = expr })
+    (match (list-get (. lst items) 1)
+      ((some val-expr)
+        (let ((val-str (transpile-expr ctx val-expr (none)))
+              (arena (. (deref ctx) arena))
+              (typ (match expected-type
+                     ((some t) t)
+                     ((none) (match (ctx-get-return-type ctx)
+                               ((some rt) rt)
+                               ((none) "slop_result"))))))
+          (string-concat arena
+            (string-concat arena "((" typ)
+            (string-concat arena "){ .is_ok = true, .data.ok = "
+              (string-concat arena val-str " })")))))
+      ((none) "")))
+
+  (fn transpile-error ((ctx (Ptr TranspileContext)) (lst SExprList)
+                       (expected-type (Option String)))
+    (@intent "Transpile error constructor (error value)")
+    (@spec (((Ptr TranspileContext) SExprList (Option String)) -> String))
+    (@pre (!= ctx nil))
+    (@pre (>= (list-len (. lst items)) 2))
+    ;; Output: ((type){ .is_ok = false, .data.err = expr })
+    (match (list-get (. lst items) 1)
+      ((some err-expr)
+        (let ((err-str (transpile-expr ctx err-expr (none)))
+              (arena (. (deref ctx) arena))
+              (typ (match expected-type
+                     ((some t) t)
+                     ((none) (match (ctx-get-return-type ctx)
+                               ((some rt) rt)
+                               ((none) "slop_result"))))))
+          (string-concat arena
+            (string-concat arena "((" typ)
+            (string-concat arena "){ .is_ok = false, .data.err = "
+              (string-concat arena err-str " })")))))
+      ((none) "")))
+
+  ;; ============================================================
+  ;; Collection Operations
+  ;; ============================================================
+
+  (fn transpile-list-new ((ctx (Ptr TranspileContext)) (lst SExprList))
+    (@intent "Transpile list-new (list-new arena Type)")
+    (@spec (((Ptr TranspileContext) SExprList) -> String))
+    (@pre (!= ctx nil))
+    (match (list-get (. lst items) 1)
+      ((some arena-expr)
+        (let ((arena-str (transpile-expr ctx arena-expr (none)))
+              (arena (. (deref ctx) arena)))
+          (string-concat arena "slop_list_new(" (string-concat arena arena-str ")"))))
+      ((none) "")))
+
+  (fn transpile-list-push ((ctx (Ptr TranspileContext)) (lst SExprList))
+    (@intent "Transpile list-push (list-push list item)")
+    (@spec (((Ptr TranspileContext) SExprList) -> String))
+    (@pre (!= ctx nil))
+    (match (list-get (. lst items) 1)
+      ((some list-expr)
+        (match (list-get (. lst items) 2)
+          ((some val-expr)
+            (let ((list-str (transpile-expr ctx list-expr (none)))
+                  (val-str (transpile-expr ctx val-expr (none)))
+                  (arena (. (deref ctx) arena)))
+              (string-concat arena "slop_list_push(&"
+                (string-concat arena list-str
+                  (string-concat arena ", "
+                    (string-concat arena val-str ")"))))))
+          ((none) "")))
+      ((none) "")))
+
+  (fn transpile-list-pop ((ctx (Ptr TranspileContext)) (lst SExprList))
+    (@intent "Transpile list-pop (list-pop list) -> Option<T>")
+    (@spec (((Ptr TranspileContext) SExprList) -> String))
+    (@pre (!= ctx nil))
+    (match (list-get (. lst items) 1)
+      ((some list-expr)
+        (let ((list-str (transpile-expr ctx list-expr (none)))
+              (arena (. (deref ctx) arena)))
+          (string-concat arena
+            (string-concat arena "slop_list_pop(&" list-str)
+            ")")))
+      ((none) "")))
+
+  (fn transpile-list-get ((ctx (Ptr TranspileContext)) (lst SExprList))
+    (@intent "Transpile list-get (list-get list index)")
+    (@spec (((Ptr TranspileContext) SExprList) -> String))
+    (@pre (!= ctx nil))
+    (match (list-get (. lst items) 1)
+      ((some list-expr)
+        (match (list-get (. lst items) 2)
+          ((some idx-expr)
+            (let ((list-str (transpile-expr ctx list-expr (none)))
+                  (idx-str (transpile-expr ctx idx-expr (none)))
+                  (arena (. (deref ctx) arena)))
+              (string-concat arena "slop_list_get(" (string-concat arena list-str (string-concat arena ", " (string-concat arena idx-str ")"))))))
+          ((none) "")))
+      ((none) "")))
+
+  (fn transpile-list-len ((ctx (Ptr TranspileContext)) (lst SExprList))
+    (@intent "Transpile list-len (list-len list)")
+    (@spec (((Ptr TranspileContext) SExprList) -> String))
+    (@pre (!= ctx nil))
+    (match (list-get (. lst items) 1)
+      ((none) "0")
+      ((some expr)
+        (let ((list-expr (transpile-expr ctx expr (none))))
+          (string-concat (. (deref ctx) arena) list-expr ".len")))))
+
+  (fn transpile-map-get ((ctx (Ptr TranspileContext)) (lst SExprList))
+    (@intent "Transpile map-get (map-get map key)")
+    (@spec (((Ptr TranspileContext) SExprList) -> String))
+    (@pre (!= ctx nil))
+    (match (list-get (. lst items) 1)
+      ((some map-expr)
+        (match (list-get (. lst items) 2)
+          ((some key-expr)
+            (let ((map-str (transpile-expr ctx map-expr (none)))
+                  (key-str (transpile-expr ctx key-expr (none)))
+                  (arena (. (deref ctx) arena)))
+              (string-concat arena "slop_map_get("
+                (string-concat arena map-str
+                  (string-concat arena ", " (string-concat arena key-str ")"))))))
+          ((none) "")))
+      ((none) "")))
+
+  (fn transpile-map-has ((ctx (Ptr TranspileContext)) (lst SExprList))
+    (@intent "Transpile map-has (map-has map key)")
+    (@spec (((Ptr TranspileContext) SExprList) -> String))
+    (@pre (!= ctx nil))
+    (match (list-get (. lst items) 1)
+      ((some map-expr)
+        (match (list-get (. lst items) 2)
+          ((some key-expr)
+            (let ((map-str (transpile-expr ctx map-expr (none)))
+                  (key-str (transpile-expr ctx key-expr (none)))
+                  (arena (. (deref ctx) arena)))
+              (string-concat arena "slop_map_has("
+                (string-concat arena map-str
+                  (string-concat arena ", " (string-concat arena key-str ")"))))))
+          ((none) "")))
+      ((none) "")))
+
+  (fn transpile-map-keys ((ctx (Ptr TranspileContext)) (lst SExprList))
+    (@intent "Transpile map-keys (map-keys map)")
+    (@spec (((Ptr TranspileContext) SExprList) -> String))
+    (@pre (!= ctx nil))
+    (match (list-get (. lst items) 1)
+      ((some map-expr)
+        (let ((map-str (transpile-expr ctx map-expr (none)))
+              (arena (. (deref ctx) arena)))
+          (string-concat arena "slop_map_keys(arena, &"
+            (string-concat arena map-str ")"))))
+      ((none) "")))
+
+  (fn transpile-map-remove ((ctx (Ptr TranspileContext)) (lst SExprList))
+    (@intent "Transpile map-remove (map-remove map key)")
+    (@spec (((Ptr TranspileContext) SExprList) -> String))
+    (@pre (!= ctx nil))
+    (match (list-get (. lst items) 1)
+      ((some map-expr)
+        (match (list-get (. lst items) 2)
+          ((some key-expr)
+            (let ((map-str (transpile-expr ctx map-expr (none)))
+                  (key-str (transpile-expr ctx key-expr (none)))
+                  (arena (. (deref ctx) arena)))
+              (string-concat arena "slop_map_remove(&"
+                (string-concat arena map-str
+                  (string-concat arena ", " (string-concat arena key-str ")"))))))
+          ((none) "")))
+      ((none) "")))
+
+  ;; ============================================================
+  ;; Record and Union Construction
+  ;; ============================================================
+
+  (fn transpile-record-new ((ctx (Ptr TranspileContext)) (lst SExprList))
+    (@intent "Transpile record constructor (record-new Type (field val) ...)")
+    (@spec (((Ptr TranspileContext) SExprList) -> String))
+    (@pre (!= ctx nil))
+    ;; Syntax: (record-new Type (field1 val1) (field2 val2) ...)
+    ;; Output: ((TypeName){ .field1 = val1, .field2 = val2 })
+    (let ((items (. lst items))
+          (arena (. (deref ctx) arena))
+          (len (list-len items)))
+      (match (list-get items 1)
+        ((some type-expr)
+          (match (deref type-expr)
+            ((symbol s)
+              (let ((type-name (to-c-name arena (. s name)))
+                    (mut fields-str ""))
+                (do
+                  ;; Iterate over field pairs starting at index 2
+                  (for (i 2 len)
+                    (match (list-get items i)
+                      ((some field-pair)
+                        (match (deref field-pair)
+                          ((list pair-lst)
+                            (match (list-get (. pair-lst items) 0)
+                              ((some fname-expr)
+                                (match (deref fname-expr)
+                                  ((symbol fname-sym)
+                                    (match (list-get (. pair-lst items) 1)
+                                      ((some fval-expr)
+                                        (let ((fname (to-c-name arena (. fname-sym name)))
+                                              (fval (transpile-expr ctx fval-expr (none)))
+                                              (init (string-concat arena "."
+                                                      (string-concat arena fname
+                                                        (string-concat arena " = " fval)))))
+                                          (if (== i 2)
+                                            (set! fields-str init)
+                                            (set! fields-str (string-concat arena fields-str
+                                                               (string-concat arena ", " init))))))
+                                      ((none) (do))))
+                                  (_ (do))))
+                              ((none) (do))))
+                          (_ (do))))
+                      ((none) (do))))
+                  ;; Build final output: ((TypeName){ fields })
+                  (string-concat arena "(("
+                    (string-concat arena type-name
+                      (string-concat arena "){"
+                        (string-concat arena fields-str "})")))))))
+            (_ "/* invalid record-new */")))
+        ((none) ""))))
+
+  (fn transpile-union-new ((ctx (Ptr TranspileContext)) (lst SExprList))
+    (@intent "Transpile union constructor (union-new Type tag value?)")
+    (@spec (((Ptr TranspileContext) SExprList) -> String))
+    (@pre (!= ctx nil))
+    ;; Syntax: (union-new Type Tag value?)
+    ;; Output with value: ((TypeName){ .tag = TypeName_tag_TAG, .data.tag = value })
+    ;; Output without value: ((TypeName){ .tag = TypeName_tag_TAG })
+    (let ((items (. lst items))
+          (arena (. (deref ctx) arena))
+          (len (list-len items)))
+      (match (list-get items 1)
+        ((some type-expr)
+          (match (deref type-expr)
+            ((symbol type-sym)
+              (let ((type-name (to-c-name arena (. type-sym name))))
+                (match (list-get items 2)
+                  ((some tag-expr)
+                    (match (deref tag-expr)
+                      ((symbol tag-sym)
+                        (let ((tag (to-c-name arena (. tag-sym name)))
+                              ;; Build tag constant: TypeName_tag_TAG
+                              (tag-const (string-concat arena type-name
+                                           (string-concat arena "_"
+                                             (string-concat arena tag "_TAG")))))
+                          (if (> len 3)
+                            ;; Has payload value
+                            (match (list-get items 3)
+                              ((some val-expr)
+                                (let ((val (transpile-expr ctx val-expr (none))))
+                                  ;; ((TypeName){ .tag = TAG, .data.tag = val })
+                                  (string-concat arena "(("
+                                    (string-concat arena type-name
+                                      (string-concat arena "){ .tag = "
+                                        (string-concat arena tag-const
+                                          (string-concat arena ", .data."
+                                            (string-concat arena tag
+                                              (string-concat arena " = "
+                                                (string-concat arena val " })"))))))))))
+                              ((none) "/* missing union value */"))
+                            ;; No payload
+                            (string-concat arena "(("
+                              (string-concat arena type-name
+                                (string-concat arena "){ .tag = "
+                                  (string-concat arena tag-const " })")))))))
+                      (_ "/* invalid union tag */")))
+                  ((none) "/* missing union tag */"))))
+            (_ "/* invalid union-new */")))
+        ((none) ""))))
+
+  ;; ============================================================
+  ;; Quote (Enum Literals)
+  ;; ============================================================
+
+  (fn transpile-quote ((ctx (Ptr TranspileContext)) (lst SExprList))
+    (@intent "Transpile quoted symbol as enum value (quote sym) or 'sym")
+    (@spec (((Ptr TranspileContext) SExprList) -> String))
+    (@pre (!= ctx nil))
+    (@pre (>= (list-len (. lst items)) 2))
+    (match (list-get (. lst items) 1)
+      ((some sym-expr)
+        (match (deref sym-expr)
+          ((symbol s)
+            (let ((name (. s name))
+                  (arena (. (deref ctx) arena)))
+              (match (ctx-lookup-enum ctx name)
+                ((some qualified) qualified)
+                ((none) (to-c-name arena name)))))
+          (_ "/* quote requires symbol */")))
+      ((none) "")))
+
+  ;; ============================================================
+  ;; C Inline and Sizeof
+  ;; ============================================================
+
+  (fn transpile-c-inline ((ctx (Ptr TranspileContext)) (lst SExprList))
+    (@intent "Transpile c-inline (c-inline \"C code\")")
+    (@spec (((Ptr TranspileContext) SExprList) -> String))
+    (@pre (!= ctx nil))
+    (@pre (>= (list-len (. lst items)) 2))
+    (match (list-get (. lst items) 1)
+      ((some s-expr)
+        (match (deref s-expr)
+          ((string s) (. s value))
+          (_ "/* invalid c-inline */")))
+      ((none) "/* missing c-inline arg */")))
+
+  (fn transpile-sizeof ((ctx (Ptr TranspileContext)) (lst SExprList))
+    (@intent "Transpile sizeof (sizeof Type)")
+    (@spec (((Ptr TranspileContext) SExprList) -> String))
+    (@pre (!= ctx nil))
+    (@pre (>= (list-len (. lst items)) 2))
+    (match (list-get (. lst items) 1)
+      ((some type-expr)
+        (let ((arena (. (deref ctx) arena)))
+          (string-concat arena
+            (string-concat arena "sizeof(" (to-c-type ctx type-expr))
+            ")")))
+      ((none) "")))
+
+  (fn transpile-arena-alloc ((ctx (Ptr TranspileContext)) (lst SExprList))
+    (@intent "Transpile arena-alloc (arena-alloc arena size)")
+    (@spec (((Ptr TranspileContext) SExprList) -> String))
+    (@pre (!= ctx nil))
+    (@pre (>= (list-len (. lst items)) 3))
+    (match (list-get (. lst items) 1)
+      ((some arena-arg)
+        (match (list-get (. lst items) 2)
+          ((some size-arg)
+            (let ((arena-str (transpile-expr ctx arena-arg (none)))
+                  (size-str (transpile-expr ctx size-arg (none)))
+                  (arena (. (deref ctx) arena)))
+              (string-concat arena "slop_arena_alloc("
+                (string-concat arena arena-str
+                  (string-concat arena ", "
+                    (string-concat arena size-str ")"))))))
+          ((none) "")))
+      ((none) "")))
+
+  ;; ============================================================
+  ;; Function Calls
+  ;; ============================================================
+
+  (fn transpile-function-call ((ctx (Ptr TranspileContext))
+                               (fn-name String) (lst SExprList))
+    (@intent "Transpile function call")
+    (@spec (((Ptr TranspileContext) String SExprList) -> String))
+    (@pre (!= ctx nil))
+    (let ((arena (. (deref ctx) arena))
+          (c-name (to-qualified-name arena ctx fn-name))
+          (items (. lst items))
+          (len (list-len items))
+          (mut result ""))
+      (do
+        (set! result (string-concat arena c-name "("))
+        (for (i 1 len)
+          (match (list-get items i)
+            ((some arg)
+              (let ((arg-str (transpile-expr ctx arg (none))))
+                (if (> i 1)
+                  (set! result (string-concat arena result (string-concat arena ", " arg-str)))
+                  (set! result (string-concat arena result arg-str)))))
+            ((none) (do))))
+        (set! result (string-concat arena result ")"))
+        result)))
+
+  ;; ============================================================
+  ;; Type Inference Helpers
+  ;; ============================================================
+
+  (fn is-pointer-expr ((ctx (Ptr TranspileContext)) (expr (Ptr SExpr)))
+    (@intent "Check if expression evaluates to a pointer type")
+    (@spec (((Ptr TranspileContext) (Ptr SExpr)) -> Bool))
+    (@pre (!= ctx nil))
+    (@pre (!= expr nil))
+    (@pure)
+    ;; Checks:
+    ;; - Variable is marked as pointer
+    ;; - arena-alloc result
+    ;; - (addr x)
+    ;; - (cast (Ptr T) x)
+    ;; - Field access on pointer type yielding pointer
+    ;; - Function call returning pointer
+    (match (deref expr)
+      ((symbol s)
+        (ctx-is-pointer ctx (. s name)))
+      ((list lst)
+        (match (list-get (. lst items) 0)
+          ((some head)
+            (match (deref head)
+              ((symbol op-sym)
+                (let ((op (. op-sym name)))
+                  (or (string-eq op "addr")
+                      (or (string-eq op "arena-alloc")
+                          (string-eq op "cast")))))
+              (_ false)))
+          ((none) false)))
+      (_ false)))
+
+  (fn is-string-expr ((ctx (Ptr TranspileContext)) (expr (Ptr SExpr)))
+    (@intent "Check if expression evaluates to String type")
+    (@spec (((Ptr TranspileContext) (Ptr SExpr)) -> Bool))
+    (@pre (!= ctx nil))
+    (@pre (!= expr nil))
+    (@pure)
+    (match (deref expr)
+      ((string _) true)
+      ((symbol sym)
+        (match (ctx-lookup-var ctx (. sym name))
+          ((some entry) (string-eq (. entry c-type) "slop_string"))
+          ((none) false)))
+      (_ false)))
+
+  (fn infer-expr-c-type ((ctx (Ptr TranspileContext)) (expr (Ptr SExpr)))
+    (@intent "Infer the C type of an expression using type environment")
+    (@spec (((Ptr TranspileContext) (Ptr SExpr)) -> (Option String)))
+    (@pre (!= ctx nil))
+    (@pre (!= expr nil))
+    (@pure)
+    (match (ctx-get-type-env ctx)
+      ((none)
+        ;; No type environment available, fall back to none
+        (none))
+      ((some type-env)
+        ;; Use type environment for inference
+        (match (deref expr)
+          ;; Number literal -> int64_t or double
+          ((number n)
+            (if (. n is-float)
+              (some "double")
+              (some "int64_t")))
+          ;; String literal -> slop_string_t
+          ((string s)
+            (some "slop_string_t"))
+          ;; Symbol -> look up variable type
+          ((symbol sym)
+            (let ((name (. sym name)))
+              (cond
+                ;; Boolean literals
+                ((or (string-eq name "true") (string-eq name "false"))
+                  (some "bool"))
+                ;; nil
+                ((string-eq name "nil")
+                  (some "void*"))
+                ;; Variable lookup
+                (else
+                  (match (env-lookup-var type-env name)
+                    ((some resolved-type)
+                      (some (. (deref resolved-type) c-name)))
+                    ((none)
+                      ;; Try as function (return type)
+                      (match (env-lookup-function type-env name)
+                        ((some fn-sig)
+                          (some (. (deref (. (deref fn-sig) return-type)) c-name)))
+                        ((none) (none)))))))))
+          ;; List expression (function call, operator, etc)
+          ((list lst)
+            (infer-list-c-type ctx type-env lst))))))
+
+  (fn infer-list-c-type ((ctx (Ptr TranspileContext)) (type-env (Ptr TypeEnv)) (lst SExprList))
+    (@intent "Infer C type of a list expression")
+    (@spec (((Ptr TranspileContext) (Ptr TypeEnv) SExprList) -> (Option String)))
+    (@pre (!= ctx nil))
+    (@pre (!= type-env nil))
+    (@pure)
+    (let ((items (. lst items))
+          (len (list-len items)))
+      (if (== len 0)
+        (some "void")
+        (match (list-get items 0)
+          ((none) (none))
+          ((some head)
+            (match (deref head)
+              ((symbol sym)
+                (let ((op (. sym name)))
+                  (cond
+                    ;; Comparison operators return bool
+                    ((or (string-eq op "==") (string-eq op "!=")
+                         (string-eq op "<") (string-eq op "<=")
+                         (string-eq op ">") (string-eq op ">=")
+                         (string-eq op "and") (string-eq op "or") (string-eq op "not"))
+                      (some "bool"))
+                    ;; Arithmetic operators return int64_t
+                    ((or (string-eq op "+") (string-eq op "-")
+                         (string-eq op "*") (string-eq op "/") (string-eq op "%"))
+                      (some "int64_t"))
+                    ;; Function call - look up return type
+                    (else
+                      (match (env-lookup-function type-env op)
+                        ((some fn-sig)
+                          (some (. (deref (. (deref fn-sig) return-type)) c-name)))
+                        ((none) (none)))))))
+              (_ (none))))))))
+)

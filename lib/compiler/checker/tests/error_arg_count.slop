@@ -1,0 +1,16 @@
+;; Test: Wrong argument count - should error
+
+(module error-arg-count
+  (export add main)
+
+  (fn add ((a Int) (b Int))
+    (@intent "Add two integers")
+    (@spec ((Int Int) -> Int))
+    (+ a b))
+
+  (fn main ()
+    (@intent "Test wrong arg count")
+    (@spec (() -> Int))
+    ;; Too few args - should error
+    (add 1))
+)

@@ -1,0 +1,15 @@
+;; Test: Cond branch type mismatch - should produce warning
+;; Expected warning: Branch types differ
+
+(module warn-cond-types
+  (export classify)
+
+  (fn classify ((n Int))
+    (@intent "Classify number - branches return different types")
+    (@spec ((Int) -> Int))
+    ;; This cond has mismatched branch types
+    (cond
+      ((< n 0) "negative")    ;; String
+      ((== n 0) 0)            ;; Int
+      (else "positive")))     ;; String
+)

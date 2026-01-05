@@ -1,0 +1,6 @@
+;; Test: Basic arithmetic - should transpile and return correct value
+
+(fn main ()
+  (@intent "Test basic arithmetic operations")
+  (@spec (() -> Int))
+  (+ 1 (* 2 3)))

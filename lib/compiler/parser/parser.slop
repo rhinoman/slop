@@ -22,11 +22,12 @@
     parse
     ;; Utilities
     is-form find-holes pretty-print
-    sexpr-line sexpr-col)
+    sexpr-line sexpr-col
+    sexpr-list-len sexpr-list-get sexpr-is-list sexpr-get-symbol-name)
 
   ;; Import string utilities from strlib
   (import strlib (is-alpha is-digit is-alnum is-space
-                  string-char-at AsciiChar
+                  char-at AsciiChar
                   char-is-symbol-start char-is-symbol-char char-is-operator))
 
   ;; ============================================================
@@ -52,7 +53,7 @@
           (slen (cast Int (. s len)))
           (mut found false))
       (while (and (< i slen) (not found))
-        (if (== (string-char-at s (cast (Int 0 ..) i)) (cast AsciiChar 46))  ;; '.'
+        (if (== (char-at s (cast (Int 0 ..) i)) (cast AsciiChar 46))  ;; '.'
           (set! found true)
           (set! i (+ i 1))))
       found))
@@ -179,7 +180,7 @@
     (@pure)
     (if (lexer-at-end state)
       (cast AsciiChar 0)  ;; EOF represented as NUL
-      (string-char-at (. (deref state) source) (. (deref state) pos))))
+      (char-at (. (deref state) source) (. (deref state) pos))))
 
   (fn lexer-peek-next ((state (Ptr LexerState)))
     (@intent "Peek at next character (one ahead)")
@@ -188,7 +189,7 @@
     (let ((next-pos (+ (. (deref state) pos) 1)))
       (if (>= next-pos (cast Int (. (. (deref state) source) len)))
         (cast AsciiChar 0)
-        (string-char-at (. (deref state) source) next-pos))))
+        (char-at (. (deref state) source) next-pos))))
 
   (fn lexer-advance ((state (Ptr LexerState)))
     (@intent "Advance to next character, updating line/col")
@@ -950,6 +951,38 @@
             ((some first) (sexpr-is-symbol-with-name first keyword))
             ((none) false))))
       (_ false)))
+
+  (fn sexpr-list-len ((expr (Ptr SExpr)))
+    (@intent "Get number of items if expression is a list, else 0")
+    (@spec (((Ptr SExpr)) -> Int))
+    (@pure)
+    (match (deref expr)
+      ((list l) (list-len (. l items)))
+      (_ 0)))
+
+  (fn sexpr-list-get ((expr (Ptr SExpr)) (index Int))
+    (@intent "Get item at index if expression is a list")
+    (@spec (((Ptr SExpr) Int) -> (Option (Ptr SExpr))))
+    (@pure)
+    (match (deref expr)
+      ((list l) (list-get (. l items) index))
+      (_ (none))))
+
+  (fn sexpr-is-list ((expr (Ptr SExpr)))
+    (@intent "Check if expression is a list")
+    (@spec (((Ptr SExpr)) -> Bool))
+    (@pure)
+    (match (deref expr)
+      ((list l) true)
+      (_ false)))
+
+  (fn sexpr-get-symbol-name ((expr (Ptr SExpr)))
+    (@intent "Get name if expression is a symbol, else empty string")
+    (@spec (((Ptr SExpr)) -> String))
+    (@pure)
+    (match (deref expr)
+      ((symbol sym) (. sym name))
+      (_ "")))
 
   (fn find-holes ((arena Arena) (expr (Ptr SExpr)))
     (@intent "Find all hole expressions in AST")

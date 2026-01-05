@@ -1,0 +1,11 @@
+;; Test: Undefined variable - should produce error
+;; Expected error: Undefined variable: undefined_var
+
+(module error-undefined-var
+  (export bad)
+
+  (fn bad ()
+    (@intent "Use undefined variable")
+    (@spec (() -> Int))
+    undefined_var)
+)

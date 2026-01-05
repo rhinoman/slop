@@ -86,10 +86,14 @@ class Transpiler:
         self.emitted_generated_types: Set[str] = set()  # Track which generated types have been emitted (to avoid duplicates)
         self.type_alias_defs: Dict[str, SExpr] = {}  # Track type alias definitions: alias_name -> underlying type expr
         self.union_variants: Dict[str, Dict[str, SExpr]] = {}  # Track union variant types: union_name -> {variant_tag -> payload_type_expr}
+        self.union_variant_indices: Dict[str, Dict[str, int]] = {}  # Track union variant indices: union_name -> {variant_tag -> index}
 
         # Static literal tracking for immutable collection literals
         self.literal_counter: int = 0  # Counter for unique static literal names
         self.static_literals: List[str] = []  # Static array declarations for list/map literals
+
+        # Match counter for unique scrutinee variable names in nested matches
+        self.match_counter: int = 0
 
         # ScopedPtr tracking - stack of scopes, each maps var_name -> pointee_c_type
         self.scoped_vars: List[Dict[str, str]] = [{}]
@@ -364,6 +368,95 @@ class Transpiler:
                     return f"slop_map_{key_id}_{val_id}"
         return None
 
+    def _infer_expr_type(self, expr: SExpr) -> Optional[str]:
+        """Infer the C type of an expression.
+
+        Returns the C type string or None if it cannot be determined.
+        """
+        # String literal -> slop_string
+        if isinstance(expr, String):
+            return "slop_string"
+        # Number literal -> int64_t
+        elif isinstance(expr, Number):
+            return "int64_t"
+        # Boolean literal -> bool
+        elif isinstance(expr, Symbol) and expr.name in ('true', 'false'):
+            return "bool"
+        # nil -> void*
+        elif isinstance(expr, Symbol) and expr.name == 'nil':
+            return "void*"
+        # List expressions - check for various forms
+        elif isinstance(expr, SList) and len(expr) >= 1:
+            if isinstance(expr[0], Symbol):
+                head_name = expr[0].name
+                # (do ...) - check last expression
+                if head_name == 'do':
+                    if len(expr) > 1:
+                        return self._infer_expr_type(expr[-1])
+                    return "void"
+                # (let ((bindings)) body) - check last body expression
+                elif head_name == 'let':
+                    if len(expr) >= 3:
+                        return self._infer_expr_type(expr[-1])
+                # Nested match - recurse
+                elif head_name == 'match':
+                    return self._infer_match_result_type(expr)
+                # (if cond then else) - check then branch
+                elif head_name == 'if' and len(expr) >= 3:
+                    return self._infer_expr_type(expr[2])
+                # (when cond body...) - returns void
+                elif head_name == 'when':
+                    return "void"
+                # (for ...) - returns void
+                elif head_name == 'for':
+                    return "void"
+                # (while ...) - returns void
+                elif head_name == 'while':
+                    return "void"
+                # (set! ...) - returns void
+                elif head_name == 'set!':
+                    return "void"
+                # Function call - look up return type
+                else:
+                    fn_name = head_name
+                    # Try direct lookup
+                    if fn_name in self.functions and 'return_type' in self.functions[fn_name]:
+                        ret_type = self.functions[fn_name]['return_type']
+                        if ret_type:
+                            return self.to_c_type(ret_type)
+                    # Try with current module prefix
+                    if self.current_module:
+                        prefixed_name = f"{self.current_module}_{fn_name}"
+                        if prefixed_name in self.functions and 'return_type' in self.functions[prefixed_name]:
+                            ret_type = self.functions[prefixed_name]['return_type']
+                            if ret_type:
+                                return self.to_c_type(ret_type)
+                    # Check for known builtins
+                    if fn_name in ('cast',) and len(expr) >= 2:
+                        return self.to_c_type(expr[1])
+        return None
+
+    def _infer_match_result_type(self, match_expr: SExpr) -> Optional[str]:
+        """Infer the result C type from a match expression by checking its branches.
+
+        This is used when a branch of an outer match contains a nested match expression.
+        We check the nested match's branches to determine what type it returns.
+        """
+        if not isinstance(match_expr, SList) or len(match_expr) < 3:
+            return None
+
+        # Check each clause's body for type hints
+        for clause in match_expr.items[2:]:
+            if isinstance(clause, SList) and len(clause) >= 2:
+                body = clause.items[1:]
+                if body:
+                    last_expr = body[-1]
+                    inferred = self._infer_expr_type(last_expr)
+                    if inferred:
+                        return inferred
+
+        return None
+
     def _get_result_c_type(self) -> str:
         """Get the C type for the current function's Result return type.
 
@@ -586,6 +679,42 @@ class Transpiler:
 
         return None
 
+    def _identifier_to_c_type(self, elem_id: str) -> str:
+        """Convert an element identifier back to a proper C type.
+
+        This is the reverse of _type_to_identifier for generated types.
+        When we extract elem_id from slop_list_X, we need to convert X
+        back to a valid C type for use in typedefs.
+
+        Examples:
+            "map_string_Foo" -> "slop_map_string_Foo"
+            "list_int" -> "slop_list_int"
+            "option_ptr" -> "slop_option_ptr"
+            "string" -> "slop_string"
+            "int" -> "int64_t"
+            "Foo" -> "Foo" (user-defined type, unchanged)
+        """
+        # Check for generated type prefixes that need slop_ added back
+        if elem_id.startswith('map_'):
+            return f"slop_{elem_id}"
+        if elem_id.startswith('list_'):
+            return f"slop_{elem_id}"
+        if elem_id.startswith('option_'):
+            return f"slop_{elem_id}"
+        if elem_id.startswith('result_'):
+            return f"slop_{elem_id}"
+        # Check for runtime primitive types
+        if elem_id == 'string':
+            return 'slop_string'
+        if elem_id == 'int':
+            return 'int64_t'
+        if elem_id == 'float':
+            return 'double'
+        if elem_id == 'ptr':
+            return 'void*'
+        # For other identifiers (user-defined types), return as-is
+        return elem_id
+
     def _type_to_identifier(self, c_type: str) -> str:
         """Convert C type to valid identifier component.
 
@@ -727,6 +856,10 @@ class Transpiler:
         # Remove pointer suffix
         base_type = type_name.rstrip('*').strip()
 
+        # Remove slop_ prefix if present
+        if base_type.startswith('slop_'):
+            base_type = base_type[5:]
+
         # Try stripping module prefix
         lookup_name = base_type
         if '_' in base_type:
@@ -739,10 +872,18 @@ class Transpiler:
             if field_name in self.record_fields[lookup_name]:
                 return self.record_fields[lookup_name][field_name].get('type')
 
-        # Also try full name
+        # Also try full name (without slop_ prefix)
         if base_type in self.record_fields:
             if field_name in self.record_fields[base_type]:
                 return self.record_fields[base_type][field_name].get('type')
+
+        # Try just the simple name (last part after all underscores)
+        # This handles cases like "env_Scope" -> "Scope"
+        if '_' in base_type:
+            simple_name = base_type.split('_')[-1]
+            if simple_name in self.record_fields:
+                if field_name in self.record_fields[simple_name]:
+                    return self.record_fields[simple_name][field_name].get('type')
 
         return None
 
@@ -786,13 +927,31 @@ class Transpiler:
         # Use to_c_type which now generates named typedefs for inline records
         return self.to_c_type(record_expr)
 
-    def _transpile_match_expr(self, expr: SList) -> str:
+    def _transpile_match_expr(self, expr: SList, expected_type: Optional[SExpr] = None) -> str:
         """Transpile match as an expression using GCC statement expression.
 
         Handles Option, Result, and enum matching.
+
+        Args:
+            expr: The match expression
+            expected_type: The expected result type (e.g., from function parameter context)
         """
         scrutinee = self.transpile_expr(expr[1])
         clauses = expr.items[2:]
+
+        # Infer scrutinee type for union variant index lookup
+        scrutinee_type = self._infer_type(expr[1])
+        union_c_type = None
+        variant_indices = None
+        if scrutinee_type:
+            if scrutinee_type in self.union_variant_indices:
+                variant_indices = self.union_variant_indices[scrutinee_type]
+            if scrutinee_type in self.types:
+                union_c_type = self.types[scrutinee_type].c_type
+            elif not union_c_type:
+                # For imported types, construct the C type from the type name
+                # e.g., "SExpr" -> look up in types, or fall back to qualified name from scrutinee
+                union_c_type = self.to_c_type_name(scrutinee_type)
 
         # Detect pattern type from first clause
         first_clause = clauses[0] if clauses else None
@@ -802,7 +961,7 @@ class Transpiler:
                 tag = pattern[0].name if isinstance(pattern[0], Symbol) else None
                 # Option/Result patterns
                 if tag in ('some', 'none', 'ok', 'error'):
-                    return self._transpile_option_result_match_expr(scrutinee, clauses, tag)
+                    return self._transpile_option_result_match_expr(scrutinee, clauses, tag, expected_type)
 
         # Check if it's a simple enum match - both quoted ('ok) and unquoted (ok)
         is_simple_enum = False
@@ -832,15 +991,7 @@ class Transpiler:
                 first_body = first_clause.items[1:]
                 if first_body:
                     last_expr = first_body[-1]
-                    # Check for string literal
-                    if isinstance(last_expr, String):
-                        result_c_type = "slop_string"
-                    # Check for number literal
-                    elif isinstance(last_expr, Number):
-                        result_c_type = "int64_t"
-                    # Check for boolean literal (true/false)
-                    elif isinstance(last_expr, Symbol) and last_expr.name in ('true', 'false'):
-                        result_c_type = "bool"
+                    result_c_type = self._infer_expr_type(last_expr)
 
         # Fall back to function's result type if we couldn't infer
         if result_c_type is None:
@@ -866,6 +1017,12 @@ class Transpiler:
                         unquoted = self._unquote_symbol(pattern.name)
                         if unquoted in self.enums:
                             parts.append(f"case {self.enums[unquoted]}: {{ ")
+                        elif variant_indices and unquoted in variant_indices and union_c_type:
+                            # Use proper union variant tag constant
+                            parts.append(f"case {union_c_type}_{unquoted}_TAG: {{ ")
+                        elif union_c_type:
+                            # For imported unions without local variant_indices, still use proper tag constant
+                            parts.append(f"case {union_c_type}_{unquoted}_TAG: {{ ")
                         else:
                             parts.append(f"case {i}: {{ ")
 
@@ -887,6 +1044,12 @@ class Transpiler:
                     # Check for enum variant - allow both quoted ('ok) and unquoted (ok)
                     if is_simple_enum and tag in self.enums:
                         parts.append(f"case {self.enums[tag]}: {{ ")
+                    elif variant_indices and tag in variant_indices and union_c_type:
+                        # Use proper union variant tag constant
+                        parts.append(f"case {union_c_type}_{tag}_TAG: {{ ")
+                    elif union_c_type and tag:
+                        # For imported unions without local variant_indices, still use proper tag constant
+                        parts.append(f"case {union_c_type}_{tag}_TAG: {{ ")
                     else:
                         parts.append(f"case {i}: {{ ")
 
@@ -903,63 +1066,75 @@ class Transpiler:
         parts.append("} _match_result; })")
         return ''.join(parts)
 
-    def _transpile_option_result_match_expr(self, scrutinee: str, clauses: list, first_tag: str) -> str:
+    def _transpile_option_result_match_expr(self, scrutinee: str, clauses: list, first_tag: str,
+                                             expected_type: Optional[SExpr] = None) -> str:
         """Transpile Option/Result match as expression.
 
         Option uses: has_value (bool), value field
         Result uses: is_ok (bool), data.ok/data.err fields
+
+        Args:
+            expected_type: The expected result type from the calling context (e.g., function parameter)
         """
         is_option = first_tag in ('some', 'none')
         is_result = first_tag in ('ok', 'error')
 
-        # Try to infer result type from ANY branch value (check all branches)
+        # If we have an expected type, use that first
         result_c_type = None
-        for clause in clauses:
-            if isinstance(clause, SList) and len(clause) >= 2:
-                body = clause.items[1:]
-                if body:
-                    last_expr = body[-1]
-                    # Check for string literal
-                    if isinstance(last_expr, String):
-                        result_c_type = "slop_string"
-                        break
-                    # Check for number literal
-                    elif isinstance(last_expr, Number):
-                        result_c_type = "int64_t"
-                        break
-                    # Check for boolean literal (true/false)
-                    elif isinstance(last_expr, Symbol) and last_expr.name in ('true', 'false'):
-                        result_c_type = "bool"
-                        break
-                    # Check for (none) - result is an Option type
-                    elif isinstance(last_expr, Symbol) and last_expr.name == 'none':
-                        result_c_type = "slop_option_int"  # Default, will be refined below
-                        break
-                    # Check for (some val) - result is an Option type
-                    elif isinstance(last_expr, SList) and len(last_expr) >= 1:
-                        if isinstance(last_expr[0], Symbol) and last_expr[0].name == 'some':
-                            # Infer inner type from the value
-                            if len(last_expr) >= 2:
-                                inner = last_expr[1]
-                                if isinstance(inner, Number):
-                                    result_c_type = "slop_option_int"
-                                elif isinstance(inner, String):
-                                    result_c_type = "slop_option_string"
-                                elif isinstance(inner, SList) and len(inner) >= 1:
-                                    if isinstance(inner[0], Symbol) and inner[0].name == 'cast':
-                                        # (some (cast Type val)) - use int for now
+        if expected_type:
+            # Check if expected type is an Option type
+            if is_form(expected_type, 'Option') and len(expected_type) >= 2:
+                inner_c_type = self.to_c_type(expected_type[1])
+                inner_id = self._type_to_identifier(inner_c_type)
+                result_c_type = f"slop_option_{inner_id}"
+            # Check if expected type is a Result type
+            elif is_form(expected_type, 'Result') and len(expected_type) >= 2:
+                result_c_type = self.to_c_type(expected_type)
+            else:
+                # For other types, convert directly
+                result_c_type = self.to_c_type(expected_type)
+
+        # If no expected type or couldn't derive from it, try to infer from branch values
+        if result_c_type is None:
+            for clause in clauses:
+                if isinstance(clause, SList) and len(clause) >= 2:
+                    body = clause.items[1:]
+                    if body:
+                        last_expr = body[-1]
+                        # Check for (none) - result is an Option type
+                        if isinstance(last_expr, Symbol) and last_expr.name == 'none':
+                            result_c_type = "slop_option_int"  # Default, will be refined below
+                            break
+                        # Check for (some val) - result is an Option type
+                        elif isinstance(last_expr, SList) and len(last_expr) >= 1:
+                            if isinstance(last_expr[0], Symbol) and last_expr[0].name == 'some':
+                                # Infer inner type from the value
+                                if len(last_expr) >= 2:
+                                    inner = last_expr[1]
+                                    if isinstance(inner, Number):
                                         result_c_type = "slop_option_int"
+                                    elif isinstance(inner, String):
+                                        result_c_type = "slop_option_string"
+                                    elif isinstance(inner, SList) and len(inner) >= 1:
+                                        if isinstance(inner[0], Symbol) and inner[0].name == 'cast':
+                                            # (some (cast Type val)) - use int for now
+                                            result_c_type = "slop_option_int"
+                                        else:
+                                            result_c_type = "slop_option_ptr"
                                     else:
                                         result_c_type = "slop_option_ptr"
                                 else:
                                     result_c_type = "slop_option_ptr"
-                            else:
-                                result_c_type = "slop_option_ptr"
+                                break
+                            elif isinstance(last_expr[0], Symbol) and last_expr[0].name == 'none':
+                                result_c_type = "slop_option_int"
+                                break
+                        # Try generic expression type inference (handles function calls, etc.)
+                        inferred = self._infer_expr_type(last_expr)
+                        if inferred:
+                            result_c_type = inferred
                             break
-                        elif isinstance(last_expr[0], Symbol) and last_expr[0].name == 'none':
-                            result_c_type = "slop_option_int"
-                            break
-                    # For symbols/variables, continue checking other branches
+                        # For symbols/variables, continue checking other branches
 
         # If still None and this is an Option match with bound variable,
         # the result type is the Option's inner type - use __auto_type workaround
@@ -1078,27 +1253,38 @@ class Transpiler:
                 # Array index: (@ arr idx) -> element type (not pointer to element)
                 if op == '@' and len(expr) >= 2:
                     arr_expr = expr[1]
+                    arr_type = None
                     if isinstance(arr_expr, Symbol):
                         arr_type = self.var_types.get(arr_expr.name)
-                        if arr_type:
-                            # Handle pointer to array type: "Storage*" -> look up "Storage"
-                            base_type = arr_type.rstrip('*')
-                            if base_type in self.types:
-                                type_info = self.types[base_type]
-                                # If it's an array alias, return the element type
-                                if type_info.is_array and type_info.c_type.endswith('*'):
-                                    # c_type is like "Invoice*", return "Invoice"
-                                    elem_type = type_info.c_type[:-1].strip()
-                                    return elem_type
-                            # If arr_type is directly an array alias
-                            if arr_type in self.types:
-                                type_info = self.types[arr_type]
-                                if type_info.is_array and type_info.c_type.endswith('*'):
-                                    elem_type = type_info.c_type[:-1].strip()
-                                    return elem_type
-                            # If it's a pointer type like "Invoice*", return "Invoice"
-                            if arr_type.endswith('*'):
-                                return arr_type[:-1].strip()
+                    else:
+                        # For complex expressions, recursively infer type
+                        arr_type = self._infer_type(arr_expr)
+                    if arr_type:
+                        # Handle List[X] format -> element type is X
+                        if arr_type.startswith('List[') and arr_type.endswith(']'):
+                            return arr_type[5:-1]  # Extract X from List[X]
+                        # Handle slop_list_X -> element type is X (but need to reconstruct the actual type)
+                        if arr_type.startswith('slop_list_'):
+                            elem_id = arr_type[len('slop_list_'):]
+                            return elem_id
+                        # Handle pointer to array type: "Storage*" -> look up "Storage"
+                        base_type = arr_type.rstrip('*')
+                        if base_type in self.types:
+                            type_info = self.types[base_type]
+                            # If it's an array alias, return the element type
+                            if type_info.is_array and type_info.c_type.endswith('*'):
+                                # c_type is like "Invoice*", return "Invoice"
+                                elem_type = type_info.c_type[:-1].strip()
+                                return elem_type
+                        # If arr_type is directly an array alias
+                        if arr_type in self.types:
+                            type_info = self.types[arr_type]
+                            if type_info.is_array and type_info.c_type.endswith('*'):
+                                elem_type = type_info.c_type[:-1].strip()
+                                return elem_type
+                        # If it's a pointer type like "Invoice*", return "Invoice"
+                        if arr_type.endswith('*'):
+                            return arr_type[:-1].strip()
                     return None
 
                 # Cast: (cast Type expr) -> Type
@@ -1109,6 +1295,13 @@ class Transpiler:
                 if op == 'record-new' and len(expr) >= 2:
                     if isinstance(expr[1], Symbol):
                         return expr[1].name
+
+                # Arena allocation: (arena-alloc arena TypeName) -> TypeName*
+                if op == 'arena-alloc' and len(expr) >= 3:
+                    type_expr = expr[2]
+                    # Convert the type expression to C type and add pointer suffix
+                    c_type = self.to_c_type(type_expr)
+                    return f"{c_type}*"
 
                 # List construction: (list-new arena Type) -> List[C_Type]
                 if op == 'list-new' and len(expr) > 2:
@@ -1127,6 +1320,21 @@ class Transpiler:
                     if isinstance(key_type_expr, Symbol) and key_type_expr.name == 'String':
                         return f"slop_map_string_{value_id}"
                     return f"slop_map_{key_id}_{value_id}"
+
+                # List get: (list-get list idx) -> Option[elem_type]
+                if op == 'list-get' and len(expr) >= 3:
+                    lst_expr = expr[1]
+                    list_type = self._infer_type(lst_expr)
+                    if list_type:
+                        # Extract element type and return option type
+                        if list_type.startswith('List[') and list_type.endswith(']'):
+                            elem_c_type = list_type[5:-1]
+                            elem_id = self._type_to_identifier(elem_c_type)
+                            return f"slop_option_{elem_id}"
+                        elif list_type.startswith('slop_list_'):
+                            elem_id = list_type[10:]  # Remove "slop_list_"
+                            return f"slop_option_{elem_id}"
+                    return None
 
                 # Map get: (map-get map key) -> Option[value_type]
                 if op == 'map-get' and len(expr) >= 3:
@@ -1177,15 +1385,89 @@ class Transpiler:
                     return None
 
                 # Function call: check return type
+                ret_type = None
                 if op in self.func_return_types:
                     ret_type = self.func_return_types[op]
+                elif op in self.functions and 'return_type' in self.functions[op]:
+                    # Check cross-module functions from all_functions
+                    ret_type = self.functions[op]['return_type']
+                if ret_type:
                     # For list types, return List[elem_c_type] format
                     if is_form(ret_type, 'List') and len(ret_type) >= 2:
                         elem_c_type = self.to_c_type(ret_type[1])
                         return f"List[{elem_c_type}]"
+                    # For map types, return slop_map_string_X format
+                    if is_form(ret_type, 'Map') and len(ret_type) >= 3:
+                        key_type = self.to_c_type(ret_type[1])
+                        val_type = self.to_c_type(ret_type[2])
+                        if isinstance(ret_type[1], Symbol) and ret_type[1].name == 'String':
+                            val_id = self._type_to_identifier(val_type)
+                            return f"slop_map_string_{val_id}"
                     return self.to_c_type(ret_type)
 
         return None
+
+    def _get_arena_from_expr(self, expr: SExpr) -> str:
+        """Get the arena expression for an expression that's a field access.
+
+        For (. (deref ctx) field), returns "ctx->arena" if the base type has an arena field.
+        For (. obj field), returns "obj.arena" if the base type has an arena field.
+        Falls back to "arena" if the expression is a simple variable.
+        """
+        if isinstance(expr, SList) and len(expr) >= 3:
+            head = expr[0]
+            if isinstance(head, Symbol) and head.name == '.':
+                base = expr[1]
+                # Get the base expression's type
+                base_type = self._infer_type(base)
+                if base_type:
+                    # Check if this type has an arena field
+                    arena_field = self._get_type_field(base_type, 'arena')
+                    if arena_field:
+                        # Transpile the base and add .arena or ->arena
+                        base_c = self.transpile_expr(base)
+                        # Check if base is a deref (pointer access)
+                        if isinstance(base, SList) and len(base) >= 2:
+                            if isinstance(base[0], Symbol) and base[0].name == 'deref':
+                                # (deref ptr) -> ptr->arena
+                                ptr = self.transpile_expr(base[1])
+                                return f"{ptr}->arena"
+                        # Check if base is a pointer variable (Symbol with Ptr type)
+                        if isinstance(base, Symbol):
+                            if base.name in self.pointer_vars:
+                                return f"{base_c}->arena"
+                            # Also check if the inferred type indicates a pointer
+                            if base_type and is_form(base_type, 'Ptr'):
+                                return f"{base_c}->arena"
+                        # Otherwise use dot access
+                        return f"{base_c}.arena"
+            # Handle index access: (@ list idx) - look for arena in the list source
+            if isinstance(head, Symbol) and head.name == '@':
+                list_expr = expr[1]
+                # Recursively find arena from the list expression
+                return self._get_arena_from_expr(list_expr)
+        # Check if this is a simple variable with known source that has arena
+        if isinstance(expr, Symbol):
+            var_name = expr.name
+            # Check if we have a tracked source for this variable (e.g., from let binding)
+            var_sources = getattr(self, 'var_sources', {})
+            if var_name in var_sources:
+                source_expr = var_sources[var_name]
+                return self._get_arena_from_expr(source_expr)
+        # Look for any pointer parameter named 'ctx' that has an arena field
+        current_func_params = getattr(self, 'current_func_params', {})
+        for param_name, param_type in current_func_params.items():
+            if 'ctx' in param_name.lower() or 'context' in param_name.lower():
+                # Check if this param type has an arena field
+                base_type = param_type.rstrip('*')
+                arena_field = self._get_type_field(base_type, 'arena')
+                if arena_field:
+                    c_name = self.to_c_name(param_name)
+                    if param_type.endswith('*'):
+                        return f"{c_name}->arena"
+                    return f"{c_name}.arena"
+        # Fallback: assume 'arena' is in scope from @alloc annotation
+        return "arena"
 
     def _infer_expr_c_type(self, expr: SExpr) -> Optional[str]:
         """Infer the C type of an expression for code generation.
@@ -1384,8 +1666,9 @@ class Transpiler:
             if not is_form(type_expr, 'record') and not is_form(type_expr, 'enum') and not is_form(type_expr, 'union'):
                 self.transpile_type(form)
 
-        # SECOND: Emit generated Option/List/Result types (now base types are defined)
-        self._emit_generated_types()
+        # SECOND: Emit List types first (they use pointers, so forward declarations are sufficient)
+        # Then emit records, then Option types (which need full record definitions)
+        self._emit_generated_types(phase='pointer')
 
         # THIRD PASS: Process records, enums, unions
         for form in types:
@@ -1393,6 +1676,10 @@ class Transpiler:
             # Process records, enums, unions (skip range types already processed)
             if is_form(type_expr, 'record') or is_form(type_expr, 'enum') or is_form(type_expr, 'union'):
                 self.transpile_type(form)
+
+        # FOURTH: Emit Option/Result types that contain records by value
+        # (these need full record definitions, not just forward declarations)
+        self._emit_generated_types(phase='value')
 
         # Track position where types end (for inserting static literals)
         types_end_pos = len(self.output)
@@ -1661,14 +1948,26 @@ class Transpiler:
         for t in simple_records:
             self.transpile_type(t)
 
+        # Pre-populate record_fields for ALL record types (needed for function body scanning)
+        for t in record_types + complex_records:
+            self._prescan_record_fields(t)
+
         # Pre-scan types and functions to discover needed generic types
         for t in types:
             self._scan_type_definition(t)
         for fn in functions:
             self._scan_function_types(fn)
+            self._scan_function_body_types(fn)  # Also scan function bodies for list-pop/list-get/map-new
 
-        # Emit generated Option/List/Result types AFTER simple records
-        self._emit_generated_types()
+        # Build set of C type names for simple records (used to decide Option emission phase)
+        simple_record_c_types = set()
+        for t in simple_records:
+            type_name = t[1].name
+            c_type = self.to_qualified_type_name(type_name)
+            simple_record_c_types.add(c_type)
+
+        # Emit List types and Options for simple records/pointers (phase='pointer')
+        self._emit_generated_types(phase='pointer', simple_record_types=simple_record_c_types)
 
         # Emit wrapper alias types (type aliases for Result/Option/List) AFTER generated types
         for t in wrapper_alias_types:
@@ -1677,6 +1976,10 @@ class Transpiler:
         # Emit complex record types (e.g., State - uses generated types)
         for t in complex_records:
             self.transpile_type(t)
+
+        # Emit Option/Result types for complex records (phase='value')
+        # These need full record definitions, not just forward declarations
+        self._emit_generated_types(phase='value', simple_record_types=simple_record_c_types)
 
         # Emit union types AFTER all records (unions may contain records by value)
         for t in union_types:
@@ -1872,7 +2175,9 @@ class Transpiler:
         self.indent += 1
 
         # Track field types for pointer detection
+        # Key by both raw name (for local lookups) and qualified name (for cross-module lookups)
         self.record_fields[raw_name] = {}
+        self.record_fields[qualified_name] = self.record_fields[raw_name]
 
         # Track ScopedPtr fields for destructor generation
         scoped_fields = []
@@ -1906,7 +2211,9 @@ class Transpiler:
         self.emit("")
 
         # Track with raw name for lookup, but store qualified C type
+        # Key by both raw name (for local lookups) and qualified name (for cross-module lookups)
         self.types[raw_name] = TypeInfo(raw_name, qualified_name)
+        self.types[qualified_name] = TypeInfo(raw_name, qualified_name)
 
         # Generate destructor if record has ScopedPtr fields
         if scoped_fields:
@@ -1971,7 +2278,9 @@ class Transpiler:
         self.emit("")
 
         # Track with raw name for lookup, but store qualified C type
+        # Key by both raw name (for local lookups) and qualified name (for cross-module lookups)
         self.types[raw_name] = TypeInfo(raw_name, qualified_name)
+        self.types[qualified_name] = TypeInfo(raw_name, qualified_name)
         self.simple_enums.add(raw_name)
 
     def transpile_union(self, raw_name: str, qualified_name: str, form: SList):
@@ -2012,9 +2321,20 @@ class Transpiler:
         self.emit("")
 
         # Track with raw name for lookup, but store qualified C type
+        # Key by both raw name (for local lookups) and qualified name (for cross-module lookups)
         self.types[raw_name] = TypeInfo(raw_name, qualified_name)
+        self.types[qualified_name] = TypeInfo(raw_name, qualified_name)
         # Track variant payload types for type inference in match expressions
         self.union_variants[raw_name] = variants
+        self.union_variants[qualified_name] = variants
+        # Track variant indices for match expression generation
+        variant_indices = {}
+        for i, variant in enumerate(form.items[1:]):
+            if isinstance(variant, SList) and len(variant) >= 1:
+                tag = variant[0].name
+                variant_indices[tag] = i
+        self.union_variant_indices[raw_name] = variant_indices
+        self.union_variant_indices[qualified_name] = variant_indices
 
     def transpile_range_type(self, raw_name: str, qualified_name: str, type_expr: SExpr):
         """Transpile range type to typedef + constructor"""
@@ -2111,6 +2431,8 @@ class Transpiler:
         # Clear pointer and type tracking for this function scope
         self.pointer_vars = set()
         self.var_types = {}
+        self.current_func_params = {}  # Track function params for arena lookup
+        self.var_sources = {}  # Track variable source expressions
 
         # Register parameter types and track pointers (mode-aware)
         for p in params:
@@ -2121,6 +2443,7 @@ class Transpiler:
                     type_name = self._get_type_name(ptype)
                     if type_name:
                         self.var_types[pname] = type_name
+                        self.current_func_params[pname] = type_name  # Also track for arena lookup
                     # Track pointers: explicit Ptr types, or out/mut modes
                     if self._is_pointer_type(ptype) or mode in ('out', 'mut'):
                         self.pointer_vars.add(pname)
@@ -2133,10 +2456,10 @@ class Transpiler:
         # Track current return type for context (used by ok/error/record)
         self.current_return_type = ret_type_expr
 
-        # Register function return type for type inference in function calls
+        # Register function return type and parameters for type inference in function calls
         if ret_type_expr:
             self.func_return_types[raw_name] = ret_type_expr
-            self.functions[raw_name] = {'return_type': ret_type_expr}
+            self.functions[raw_name] = {'return_type': ret_type_expr, 'params': params}
 
         # Extract annotations and body
         annotations = {}
@@ -2334,10 +2657,25 @@ class Transpiler:
             var_name = self.to_c_name(raw_name)
 
             # Handle typed bindings: (name Type init) or (mut name Type init)
+            explicit_type = None
+            type_expr = None
             if len(binding) >= idx + 3:
                 # Typed binding
                 type_expr = binding[idx + 1]
                 init_expr = binding[idx + 2]
+                explicit_type = self.to_c_type(type_expr)
+
+                # Track the explicit type in var_types
+                self.var_types[raw_name] = explicit_type
+
+                # Track the SLOP type expression for set! expected_type
+                if not hasattr(self, 'var_slop_types'):
+                    self.var_slop_types = {}
+                self.var_slop_types[raw_name] = type_expr
+
+                # Track pointer variables if type is a pointer
+                if self._is_pointer_type(type_expr):
+                    self.pointer_vars.add(raw_name)
 
                 # Check if this is a ScopedPtr binding
                 if self._is_scoped_ptr_type(type_expr):
@@ -2356,6 +2694,10 @@ class Transpiler:
             inferred_type = self._infer_type(init_expr)
             if inferred_type:
                 self.var_types[raw_name] = inferred_type
+
+            # Track variable source expression for arena lookup
+            if hasattr(self, 'var_sources'):
+                self.var_sources[raw_name] = init_expr
 
             # Register pointer variables
             if self._is_pointer_expr(init_expr):
@@ -2377,13 +2719,16 @@ class Transpiler:
                     self.var_types[raw_name] = type_name  # Track type
                     continue
 
-            var_expr = self.transpile_expr(init_expr)
+            var_expr = self.transpile_expr(init_expr, expected_type=type_expr if explicit_type else None)
             # Skip binding for _ wildcards - just evaluate for side effects
             if raw_name == "_":
                 self.emit(f"(void){var_expr};")
             else:
-                # Type inference would go here; for now use auto
-                self.emit(f"__auto_type {var_name} = {var_expr};")
+                # Use explicit type if provided, otherwise use auto
+                if explicit_type:
+                    self.emit(f"{explicit_type} {var_name} = {var_expr};")
+                else:
+                    self.emit(f"__auto_type {var_name} = {var_expr};")
 
         # Pop scope now to check if we need special return handling
         scoped = self._pop_scoped_scope()
@@ -2620,7 +2965,16 @@ class Transpiler:
                             self.emit(f"{base_code}.{self.to_c_name(field_name)} = {value};")
                     return
 
-            value = self.transpile_expr(expr[2])
+            # Look up the variable's type to pass as expected_type for Option/Result constructors
+            expected_type = None
+            if isinstance(target, Symbol) and target.name in self.var_types:
+                # The var_types stores C types, but we need the SLOP type for expected_type
+                # Check if there's a stored SLOP type in var_slop_types
+                var_slop_types = getattr(self, 'var_slop_types', {})
+                if target.name in var_slop_types:
+                    expected_type = var_slop_types[target.name]
+
+            value = self.transpile_expr(expr[2], expected_type)
 
             # Check if target is a symbol with dot notation (e.g., addr.sin_addr.s_addr)
             if isinstance(target, Symbol) and '.' in target.name:
@@ -2668,8 +3022,24 @@ class Transpiler:
     def transpile_for_each(self, expr: SList):
         """Transpile for-each loop: (for-each (item collection) body)"""
         binding = expr[1]
-        var_name = self.to_c_name(binding[0].name)
+        raw_var_name = binding[0].name
+        var_name = self.to_c_name(raw_var_name)
         collection = self.transpile_expr(binding[1])
+
+        # Infer element type from collection for type tracking
+        collection_type = self._infer_type(binding[1])
+        if collection_type:
+            # List[X] -> X, or slop_list_X -> X
+            if collection_type.startswith('List[') and collection_type.endswith(']'):
+                elem_type = collection_type[5:-1]
+                self.var_types[raw_var_name] = elem_type
+            elif collection_type.startswith('slop_list_'):
+                elem_type = collection_type[len('slop_list_'):]
+                # For pointer list types like "slop_list_parser_SExpr_ptr", extract element type
+                if elem_type.endswith('_ptr'):
+                    elem_type = elem_type[:-4] + '*'
+                self.var_types[raw_var_name] = elem_type
+
         self.emit(f"for (size_t _i = 0; _i < {collection}.len; _i++) {{")
         self.indent += 1
         self.emit(f"__auto_type {var_name} = {collection}.data[_i];")
@@ -2678,12 +3048,28 @@ class Transpiler:
         self.indent -= 1
         self.emit("}")
 
+        # Clean up var type tracking
+        if raw_var_name in self.var_types:
+            del self.var_types[raw_var_name]
+
     def transpile_match(self, expr: SList, is_return: bool):
         """Transpile match expression"""
         scrutinee_expr = expr[1]
         scrutinee = self.transpile_expr(scrutinee_expr)
         # Infer the type of the scrutinee for union match type tracking
         scrutinee_type = self._infer_type(scrutinee_expr)
+
+        # Look up union variant indices for proper tag constant generation
+        union_c_type = None
+        variant_indices = None
+        if scrutinee_type:
+            if scrutinee_type in self.union_variant_indices:
+                variant_indices = self.union_variant_indices[scrutinee_type]
+            if scrutinee_type in self.types:
+                union_c_type = self.types[scrutinee_type].c_type
+            elif not union_c_type:
+                # For imported types, construct the C type from the type name
+                union_c_type = self.to_c_type_name(scrutinee_type)
 
         # Check for Option/Result match patterns (some/none/ok/error)
         # BUT first check if these are actually registered enum values
@@ -2732,7 +3118,41 @@ class Transpiler:
                         break
 
         # Handle Option/Result matches with if-else (bool check)
+        # But only if the scrutinee type is actually Option/Result, not a pointer
         if is_option_match or is_result_match:
+            # Check if scrutinee is a pointer type - if so, treat as pointer match not Option/Result
+            is_pointer_type = False
+            is_option_or_result_type = False
+
+            if scrutinee_type:
+                if is_form(scrutinee_type, 'Ptr'):
+                    is_pointer_type = True
+                elif isinstance(scrutinee_type, str):
+                    if scrutinee_type.endswith('*'):
+                        is_pointer_type = True
+                    elif scrutinee_type.startswith('slop_option_') or scrutinee_type.startswith('slop_result_'):
+                        is_option_or_result_type = True
+                    elif scrutinee_type.startswith('(Option ') or scrutinee_type.startswith('(Result '):
+                        is_option_or_result_type = True
+
+            # If we know it's an Option/Result, use that matching
+            if is_option_or_result_type:
+                self._transpile_option_result_match_stmt(scrutinee, expr[1], expr.items[2:], is_option_match, is_return)
+                return
+
+            # If we know it's a pointer, use pointer matching
+            if is_pointer_type:
+                self._transpile_pointer_match_stmt(scrutinee, scrutinee_expr, expr.items[2:], is_return)
+                return
+
+            # If scrutinee type is unknown, check if it's a known pointer variable
+            if isinstance(scrutinee_expr, Symbol):
+                var_name = scrutinee_expr.name
+                if var_name in self.pointer_vars:
+                    self._transpile_pointer_match_stmt(scrutinee, scrutinee_expr, expr.items[2:], is_return)
+                    return
+
+            # Default: treat as Option/Result for backwards compatibility
             self._transpile_option_result_match_stmt(scrutinee, expr[1], expr.items[2:], is_option_match, is_return)
             return
 
@@ -2776,6 +3196,12 @@ class Transpiler:
                         if unquoted in self.enums:
                             enum_const = self.enums[unquoted]
                             self.emit(f"case {enum_const}: {{")
+                        elif variant_indices and unquoted in variant_indices and union_c_type:
+                            # Use proper union variant tag constant
+                            self.emit(f"case {union_c_type}_{unquoted}_TAG: {{")
+                        elif union_c_type:
+                            # For imported unions without local variant_indices
+                            self.emit(f"case {union_c_type}_{unquoted}_TAG: {{")
                         else:
                             # Unknown pattern, use index as fallback
                             self.emit(f"case {i}: {{")
@@ -2792,25 +3218,33 @@ class Transpiler:
                     raw_tag = pattern[0].name if isinstance(pattern[0], Symbol) else None
                     is_quoted_tag = raw_tag and raw_tag.startswith("'")
                     tag = self._unquote_symbol(raw_tag) if raw_tag else None
-                    var_name = self.to_c_name(pattern[1].name) if len(pattern) > 1 else None
+                    raw_var_name = pattern[1].name if len(pattern) > 1 and isinstance(pattern[1], Symbol) else None
+                    var_name = self.to_c_name(raw_var_name) if raw_var_name else None
 
                     # Check for enum variant - allow both quoted ('ok) and unquoted (ok)
                     if is_simple_enum and tag in self.enums:
                         enum_const = self.enums[tag]
                         self.emit(f"case {enum_const}: {{")
+                    elif variant_indices and tag in variant_indices and union_c_type:
+                        # Use proper union variant tag constant
+                        self.emit(f"case {union_c_type}_{tag}_TAG: {{")
+                    elif union_c_type and tag:
+                        # For imported unions without local variant_indices
+                        self.emit(f"case {union_c_type}_{tag}_TAG: {{")
                     else:
                         self.emit(f"case {i}: {{")
                     self.indent += 1
                     if var_name and not is_simple_enum:
                         self.emit(f"__auto_type {var_name} = {scrutinee}.data.{tag};")
                         # Track the type of the bound variable for type flow analysis
-                        if scrutinee_type:
+                        # Use raw_var_name (SLOP name) since _infer_type looks up SLOP names
+                        if scrutinee_type and raw_var_name:
                             # Get unqualified union type name for lookup
                             union_type = scrutinee_type.replace('*', '').strip()
                             if union_type in self.union_variants and tag in self.union_variants[union_type]:
                                 payload_type_expr = self.union_variants[union_type][tag]
                                 payload_c_type = self.to_c_type(payload_type_expr)
-                                self.var_types[var_name] = payload_c_type
+                                self.var_types[raw_var_name] = payload_c_type
                     for j, item in enumerate(body):
                         is_last = (j == len(body) - 1)
                         self.transpile_statement(item, is_return and is_last)
@@ -2829,8 +3263,12 @@ class Transpiler:
 
         # Store scrutinee in temp variable to avoid evaluating side effects twice
         # (e.g., file reads should only happen once)
-        self.emit(f"__auto_type _match_scrutinee = {scrutinee};")
-        scrutinee = "_match_scrutinee"
+        # Use unique name to support nested matches
+        match_id = self.match_counter
+        self.match_counter += 1
+        match_var = f"_match_scrutinee_{match_id}"
+        self.emit(f"__auto_type {match_var} = {scrutinee};")
+        scrutinee = match_var
 
         # Check if scrutinee is a pointer type - need -> instead of .
         is_pointer = scrutinee_type and (scrutinee_type.endswith('*') or scrutinee_type.startswith('(Ptr '))
@@ -2848,33 +3286,42 @@ class Transpiler:
             body = clause.items[1:]
             tag = None
             var_name = None
+            raw_var_name = None
 
             if isinstance(pattern, SList) and len(pattern) >= 1:
                 tag = pattern[0].name if isinstance(pattern[0], Symbol) else None
-                var_name = self.to_c_name(pattern[1].name) if len(pattern) > 1 else None
+                raw_var_name = pattern[1].name if len(pattern) > 1 and isinstance(pattern[1], Symbol) else None
+                var_name = self.to_c_name(raw_var_name) if raw_var_name else None
             elif isinstance(pattern, Symbol):
                 tag = pattern.name
 
             if tag in ('some', 'ok'):
-                some_ok_clause = (var_name, body, tag)
+                some_ok_clause = (var_name, raw_var_name, body, tag)
             elif tag in ('none', 'error'):
-                none_err_clause = (var_name, body, tag)
+                none_err_clause = (var_name, raw_var_name, body, tag)
 
         # Generate if-else
         check_field = f"{scrutinee}{access_op}has_value" if is_option else f"{scrutinee}{access_op}is_ok"
 
         if some_ok_clause:
-            var_name, body, tag = some_ok_clause
+            var_name, raw_var_name, body, tag = some_ok_clause
             self.emit(f"if ({check_field}) {{")
             self.indent += 1
             if var_name and var_name != '_':
                 if is_option:
                     self.emit(f"__auto_type {var_name} = {scrutinee}{access_op}value;")
                     # Track the type of the bound variable for type flow analysis
-                    if scrutinee_type and scrutinee_type.startswith('slop_option_'):
-                        # Extract inner type: slop_option_string -> slop_string
-                        inner_type = 'slop_' + scrutinee_type[len('slop_option_'):]
-                        self.var_types[var_name] = inner_type
+                    # Use raw_var_name (SLOP name) as key since _infer_type looks up SLOP names
+                    if scrutinee_type and scrutinee_type.startswith('slop_option_') and raw_var_name:
+                        # Extract inner type from option type
+                        inner_part = scrutinee_type[len('slop_option_'):]
+                        # For pointer types like slop_option_parser_SExpr_ptr -> parser_SExpr*
+                        if inner_part.endswith('_ptr'):
+                            inner_type = inner_part[:-4] + '*'
+                        else:
+                            # slop_option_string -> slop_string
+                            inner_type = 'slop_' + inner_part
+                        self.var_types[raw_var_name] = inner_type
                 else:
                     self.emit(f"__auto_type {var_name} = {scrutinee}{access_op}data.ok;")
             for j, item in enumerate(body):
@@ -2883,7 +3330,7 @@ class Transpiler:
             self.indent -= 1
 
         if none_err_clause:
-            var_name, body, tag = none_err_clause
+            var_name, raw_var_name, body, tag = none_err_clause
             if some_ok_clause:
                 self.emit("} else {")
             else:
@@ -2897,6 +3344,77 @@ class Transpiler:
             self.indent -= 1
             self.emit("}")
         elif some_ok_clause:
+            self.emit("}")
+
+    def _transpile_pointer_match_stmt(self, scrutinee: str, scrutinee_expr: SExpr, clauses: list, is_return: bool):
+        """Transpile nullable pointer match using (some x) / (none) patterns.
+
+        For nullable pointers, (some x) means 'if not NULL, bind x = pointer'
+        and (none) means 'if NULL'.
+        """
+        # Store scrutinee in temp variable to avoid evaluating side effects twice
+        # Use unique name to support nested matches
+        match_id = self.match_counter
+        self.match_counter += 1
+        match_var = f"_match_scrutinee_{match_id}"
+        self.emit(f"__auto_type {match_var} = {scrutinee};")
+        scrutinee = match_var
+
+        # Infer type of scrutinee for tracking bound variables
+        scrutinee_type = self._infer_type(scrutinee_expr)
+
+        # Collect clauses
+        some_clause = None
+        none_clause = None
+
+        for clause in clauses:
+            if not isinstance(clause, SList) or len(clause) < 2:
+                continue
+
+            pattern = clause[0]
+            body = clause.items[1:]
+            tag = None
+            var_name = None
+
+            if isinstance(pattern, SList) and len(pattern) >= 1:
+                tag = pattern[0].name if isinstance(pattern[0], Symbol) else None
+                var_name = self.to_c_name(pattern[1].name) if len(pattern) > 1 and isinstance(pattern[1], Symbol) else None
+            elif isinstance(pattern, Symbol):
+                tag = pattern.name
+
+            if tag == 'some':
+                some_clause = (var_name, body)
+            elif tag in ('none', '_'):
+                none_clause = (var_name, body)
+
+        # Generate if-else with NULL check
+        if some_clause:
+            var_name, body = some_clause
+            self.emit(f"if ({scrutinee} != NULL) {{")
+            self.indent += 1
+            if var_name and var_name != '_':
+                self.emit(f"__auto_type {var_name} = {scrutinee};")
+                # Track the type of the bound variable
+                if scrutinee_type:
+                    self.var_types[var_name] = scrutinee_type
+            for j, item in enumerate(body):
+                is_last = (j == len(body) - 1)
+                self.transpile_statement(item, is_return and is_last)
+            self.indent -= 1
+
+        if none_clause:
+            _, body = none_clause
+            if some_clause:
+                self.emit("} else {")
+            else:
+                self.emit(f"if ({scrutinee} == NULL) {{")
+            self.indent += 1
+            for j, item in enumerate(body):
+                is_last = (j == len(body) - 1)
+                self.transpile_statement(item, is_return and is_last)
+            self.indent -= 1
+            self.emit("}")
+        elif some_clause:
             self.emit("}")
 
     def transpile_cond(self, expr: SList, is_return: bool):
@@ -3158,7 +3676,7 @@ class Transpiler:
 
                 # Match as expression (GCC statement expression with switch)
                 if op == 'match':
-                    return self._transpile_match_expr(expr)
+                    return self._transpile_match_expr(expr, expected_type)
 
                 # Cond as expression (GCC statement expression)
                 if op == 'cond':
@@ -3205,12 +3723,19 @@ class Transpiler:
                 if op == '@':
                     arr = self.transpile_expr(expr[1])
                     idx = self.transpile_expr(expr[2])
-                    # Check if indexing a string - use .data[i] for struct access
+                    # Check if indexing a string or list - use .data[i] for struct access
                     arr_expr = expr[1]
                     arr_type = None
                     if isinstance(arr_expr, Symbol) and arr_expr.name in self.var_types:
                         arr_type = self.var_types[arr_expr.name]
-                    if arr_type in ('slop_string', 'string', 'String'):
+                    # Also try _infer_type for complex expressions like (. (deref ctx) field)
+                    if not arr_type:
+                        arr_type = self._infer_type(arr_expr)
+                    # Strings and Lists are structs with .data field
+                    if arr_type in ('slop_string', 'string', 'String', 'slop_list_string'):
+                        return f"({arr}).data[{idx}]"
+                    # Handle List[X] format from _infer_type, slop_list_X, and slop_map_X types
+                    if arr_type and (arr_type.startswith('slop_list_') or arr_type.startswith('slop_map_') or arr_type.startswith('List[')):
                         return f"({arr}).data[{idx}]"
                     return f"{arr}[{idx}]"
 
@@ -3348,31 +3873,75 @@ class Transpiler:
                     m = self.transpile_expr(expr[1])
                     key = self.transpile_expr(expr[2])
                     val = self.transpile_expr(expr[3])
-                    # Check if map variable has a known string-keyed map type
-                    map_var = expr[1]
-                    if isinstance(map_var, Symbol) and map_var.name in self.var_types:
-                        var_type = self.var_types[map_var.name]
-                        # Handle pointer to string-keyed map: slop_map_string_X*
-                        if var_type.endswith('*') and 'slop_map_string_' in var_type:
-                            base_type = var_type.rstrip('*')
+                    # Try to infer map type from expression
+                    map_expr = expr[1]
+                    map_type = self._infer_type(map_expr)
+                    if map_type and 'slop_map_string_' in map_type:
+                        base_type = map_type.rstrip('*')
+                        # Try to find arena from context
+                        arena_expr = self._get_arena_from_expr(map_expr)
+                        if map_type.endswith('*'):
                             # For pointer, pass map directly (already a pointer)
-                            return f"{base_type}_put(arena, {m}, {key}, {val})"
-                        # Handle value type string-keyed map
-                        elif var_type.startswith('slop_map_string_'):
+                            return f"{base_type}_put({arena_expr}, {m}, {key}, {val})"
+                        else:
                             # Use typed putter: slop_map_string_X_put(arena, &map, key, val)
-                            return f"{var_type}_put(arena, &{m}, {key}, {val})"
+                            return f"{base_type}_put({arena_expr}, &{m}, {key}, {val})"
                     # Fallback for generic maps
                     return f"map_put({m}, {key}, {val})"
 
                 if op == 'map-has':
                     m = self.transpile_expr(expr[1])
                     key = self.transpile_expr(expr[2])
+                    # Try to infer map type from expression
+                    map_type = self._infer_type(expr[1])
+                    if map_type and 'slop_map_string_' in map_type:
+                        base_type = map_type.rstrip('*')
+                        if map_type.endswith('*'):
+                            # Pointer to map - already a pointer
+                            return f"{base_type}_has({m}, {key})"
+                        else:
+                            # Value map - need address
+                            return f"{base_type}_has(&{m}, {key})"
                     return f"map_has({m}, {key})"
 
                 if op == 'map-remove':
                     m = self.transpile_expr(expr[1])
                     key = self.transpile_expr(expr[2])
+                    map_type = self._infer_type(expr[1])
+                    if map_type and 'slop_map_string_' in map_type:
+                        if map_type.endswith('*'):
+                            return f"slop_map_remove({m}, {key})"
+                        return f"slop_map_remove(&{m}, {key})"
                     return f"map_remove({m}, {key})"
+
+                if op == 'map-keys':
+                    m = self.transpile_expr(expr[1])
+                    map_var = expr[1]
+                    # Check if this is a string-keyed map
+                    is_string_map = False
+                    if isinstance(map_var, Symbol) and map_var.name in self.var_types:
+                        var_type = self.var_types[map_var.name]
+                        if 'map_string' in var_type.lower() or 'slop_map_string' in var_type:
+                            is_string_map = True
+                    # Also try to infer from the expression type (returns C type string)
+                    map_type = self._infer_type(expr[1])
+                    if map_type and isinstance(map_type, str):
+                        # Check for C type name containing map_string
+                        if 'map_string' in map_type.lower():
+                            is_string_map = True
+                    # Check if expr is a function call and the function returns a Map String type
+                    if isinstance(expr[1], SList) and len(expr[1]) >= 1:
+                        fn_head = expr[1][0]
+                        if isinstance(fn_head, Symbol) and fn_head.name in self.functions:
+                            ret_type = self.functions[fn_head.name].get('return_type')
+                            if ret_type and is_form(ret_type, 'Map') and len(ret_type) >= 2:
+                                if isinstance(ret_type[1], Symbol) and ret_type[1].name == 'String':
+                                    is_string_map = True
+                    if is_string_map:
+                        # Get arena from context (function param with arena field, or explicit arena in scope)
+                        arena = self._get_arena_from_expr(expr[1])
+                        return f"slop_map_keys({arena}, &{m})"
+                    return f"map_keys({m})"
 
                 if op == 'map-values':
                     m = self.transpile_expr(expr[1])
@@ -3447,7 +4016,13 @@ class Transpiler:
 
                 # List construction: (list-new arena Type)
                 if op == 'list-new':
-                    arena = self.transpile_expr(expr[1])
+                    arena_arg = expr[1]
+                    # If the arena argument is just a symbol 'arena', try to resolve from context
+                    # (in case the variable doesn't exist but there's a ctx with arena field)
+                    if isinstance(arena_arg, Symbol) and arena_arg.name == 'arena':
+                        arena = self._get_arena_from_expr(expr)
+                    else:
+                        arena = self.transpile_expr(arena_arg)
                     # Get element type from explicit type parameter (new syntax)
                     if len(expr) > 2:
                         elem_type_expr = expr[2]
@@ -3465,22 +4040,41 @@ class Transpiler:
 
                 # List push - inline implementation with growth support
                 if op == 'list-push':
-                    lst = self.transpile_expr(expr[1])
+                    lst_expr = expr[1]
+                    lst = self.transpile_expr(lst_expr)
                     item = self.transpile_expr(expr[2])
+                    # Try to get arena from expression context (field access on struct with arena)
+                    arena_expr = self._get_arena_from_expr(lst_expr)
                     # Generate inline push with capacity check and growth
-                    # Uses arena (assumed in scope from @alloc annotation)
-                    return f"""({{ \\
-    __auto_type _lst_p = &({lst}); \\
-    __auto_type _item = ({item}); \\
-    if (_lst_p->len >= _lst_p->cap) {{ \\
-        size_t _new_cap = _lst_p->cap == 0 ? 16 : _lst_p->cap * 2; \\
-        __typeof__(_lst_p->data) _new_data = (__typeof__(_lst_p->data))slop_arena_alloc(arena, _new_cap * sizeof(*_lst_p->data)); \\
-        if (_lst_p->len > 0) memcpy(_new_data, _lst_p->data, _lst_p->len * sizeof(*_lst_p->data)); \\
-        _lst_p->data = _new_data; \\
-        _lst_p->cap = _new_cap; \\
-    }} \\
-    _lst_p->data[_lst_p->len++] = _item; \\
-}})"""
+                    return f"""({{ __auto_type _lst_p = &({lst}); __auto_type _item = ({item}); if (_lst_p->len >= _lst_p->cap) {{ size_t _new_cap = _lst_p->cap == 0 ? 16 : _lst_p->cap * 2; __typeof__(_lst_p->data) _new_data = (__typeof__(_lst_p->data))slop_arena_alloc({arena_expr}, _new_cap * sizeof(*_lst_p->data)); if (_lst_p->len > 0) memcpy(_new_data, _lst_p->data, _lst_p->len * sizeof(*_lst_p->data)); _lst_p->data = _new_data; _lst_p->cap = _new_cap; }} _lst_p->data[_lst_p->len++] = _item; }})"""
+
+                # List pop - removes and returns last element as Option<T>
+                if op == 'list-pop':
+                    lst_expr = expr[1]
+                    lst = self.transpile_expr(lst_expr)
+
+                    # Try to infer element type from the list expression
+                    option_type = None
+                    list_type = self._infer_type(lst_expr)
+
+                    if list_type and list_type.startswith('List[') and list_type.endswith(']'):
+                        elem_c_type = list_type[5:-1]
+                        elem_id = self._type_to_identifier(elem_c_type)
+                        option_type = f"slop_option_{elem_id}"
+                        self.generated_option_types.add((option_type, elem_c_type))
+                    elif list_type and list_type.startswith('slop_list_'):
+                        elem_id = list_type[10:]  # Remove "slop_list_"
+                        elem_c_type = self._identifier_to_c_type(elem_id)  # Convert back to C type
+                        option_type = f"slop_option_{elem_id}"
+                        self.generated_option_types.add((option_type, elem_c_type))
+
+                    if not option_type:
+                        option_type = self._get_option_c_type(expected_type)
+
+                    if option_type:
+                        return f"""({{ __auto_type _lst_p = &({lst}); {option_type} _r = {{0}}; if (_lst_p->len > 0) {{ _lst_p->len--; _r.has_value = true; _r.value = _lst_p->data[_lst_p->len]; }} _r; }})"""
+                    # Fallback with __typeof__
+                    return f"""({{ __auto_type _lst_p = &({lst}); struct {{ bool has_value; __typeof__(_lst_p->data[0]) value; }} _r = {{0}}; if (_lst_p->len > 0) {{ _lst_p->len--; _r.has_value = true; _r.value = _lst_p->data[_lst_p->len]; }} _r; }})"""
 
                 # List get - returns Option<T> for bounds-checked access
                 if op == 'list-get':
@@ -3503,9 +4097,10 @@ class Transpiler:
                     elif list_type and list_type.startswith('slop_list_'):
                         # Handle slop_list_X format from function parameters
                         elem_id = list_type[10:]  # Remove "slop_list_"
+                        elem_c_type = self._identifier_to_c_type(elem_id)  # Convert back to C type
                         option_type = f"slop_option_{elem_id}"
-                        # Register option type (elem_c_type may be derived from elem_id)
-                        self.generated_option_types.add((option_type, elem_id))
+                        # Register option type with proper C type
+                        self.generated_option_types.add((option_type, elem_c_type))
 
                     # Fallback to expected_type if still no option_type
                     if not option_type:
@@ -3845,14 +4440,65 @@ class Transpiler:
                         # Positional constructor: (Point x y) -> ((math_Point){.x = x, .y = y})
                         field_inits = []
                         for i, (fname, arg) in enumerate(zip(fields, args)):
-                            fval = self.transpile_expr(arg)
+                            # Get field type to pass as expected_type for proper type inference
+                            field_type = self.record_fields[op][fname].get('type')
+                            fval = self.transpile_expr(arg, expected_type=field_type)
                             field_inits.append(f".{self.to_c_name(fname)} = {fval}")
                         return f"(({c_type}){{{', '.join(field_inits)}}})"
 
                 # Function call (user-defined or imported)
                 fn_name = self.to_qualified_c_name(op)
-                args = [self.transpile_expr(a) for a in expr.items[1:]]
+                raw_args = expr.items[1:]
+                args = []
+
+                # Try to get parameter types for type-aware transpilation
+                func_info = self.functions.get(op)
+                params = func_info.get('params') if func_info else None
+
+                for i, arg in enumerate(raw_args):
+                    param_type = None
+                    if params and isinstance(params, SList) and i < len(params):
+                        param_spec = params[i]
+                        if isinstance(param_spec, SList) and len(param_spec) >= 2:
+                            # Extract type from (name Type) or (mode name Type)
+                            param_type = param_spec[-1]  # Type is last element
+                    args.append(self.transpile_expr(arg, expected_type=param_type))
+
                 return f"{fn_name}({', '.join(args)})"
+
+            # Handle inline record construction: ((record (field1 Type1) ...) val1 val2 ...)
+            # The head is an SList that defines the record type inline
+            if isinstance(head, SList) and len(head) >= 1:
+                if isinstance(head[0], Symbol) and head[0].name == 'record':
+                    # Extract field names from the inline record type
+                    field_defs = head.items[1:]
+                    field_names = []
+                    fields = []
+                    for field_def in field_defs:
+                        if isinstance(field_def, SList) and len(field_def) >= 2:
+                            if isinstance(field_def[0], Symbol):
+                                field_names.append(field_def[0].name)
+                                field_c_name = self.to_c_name(field_def[0].name)
+                                field_type = self.to_c_type(field_def[1])
+                                fields.append(f"{field_type} {field_c_name}")
+
+                    # Generate struct body matching to_c_type's format for consistent hashing
+                    struct_body = "{ " + "; ".join(fields) + "; }"
+                    import hashlib
+                    hash_val = hashlib.md5(struct_body.encode()).hexdigest()[:8]
+                    type_name = f"_anon_record_{hash_val}"
+                    # Register if not already registered
+                    if type_name not in self.generated_inline_records:
+                        self.generated_inline_records[type_name] = struct_body
+
+                    # Get field values from the expression arguments
+                    field_vals = expr.items[1:]
+                    field_inits = []
+                    for i, (fname, fval_expr) in enumerate(zip(field_names, field_vals)):
+                        fval = self.transpile_expr(fval_expr)
+                        field_inits.append(f".{self.to_c_name(fname)} = {fval}")
+
+                    return f"(({type_name}){{{', '.join(field_inits)}}})"
 
         return "/* unknown */"
 
@@ -4094,6 +4740,174 @@ class Transpiler:
                     option_type = f"slop_option_{elem_id}"
                     self.generated_option_types.add((option_type, elem_c_type))
 
+    def _scan_function_body_types(self, form: SList):
+        """Pre-scan function body to discover type-creating expressions like map-new.
+
+        This is needed because map-new in function bodies creates Map types
+        that need to be emitted to the header file, but the body is only
+        transpiled when generating the implementation file.
+        """
+        # First, collect parameter types for this function so we can infer types
+        # for expressions like (deref ctx)
+        param_types = {}
+        params = form[2] if len(form) > 2 else SList([])
+        for p in params:
+            if isinstance(p, SList) and len(p) >= 2:
+                # Handle (name Type) or (mode name Type)
+                if len(p) == 2:
+                    pname = p[0].name if isinstance(p[0], Symbol) else None
+                    ptype = p[1]
+                elif len(p) == 3:
+                    pname = p[1].name if isinstance(p[1], Symbol) else None
+                    ptype = p[2]
+                else:
+                    pname = None
+                    ptype = None
+                if pname:
+                    param_types[pname] = ptype
+
+        def scan_expr(expr):
+            """Recursively scan expression for type-creating forms."""
+            if isinstance(expr, SList) and len(expr) >= 1:
+                head = expr[0]
+                if isinstance(head, Symbol):
+                    # Check for map-new: (map-new arena KeyType ValueType)
+                    if head.name == 'map-new' and len(expr) >= 4:
+                        key_type_expr = expr[2]
+                        value_type_expr = expr[3]
+                        key_type = self.to_c_type(key_type_expr)
+                        value_type = self.to_c_type(value_type_expr)
+                        key_id = self._type_to_identifier(key_type)
+                        value_id = self._type_to_identifier(value_type)
+                        type_name = f"slop_map_{key_id}_{value_id}"
+                        self.generated_map_types.add((type_name, key_type, value_type))
+                        # Also ensure the Option type for value exists
+                        option_type = f"slop_option_{value_id}"
+                        self.generated_option_types.add((option_type, value_type))
+                    # Check for list-new: (list-new arena Type)
+                    elif head.name == 'list-new' and len(expr) >= 3:
+                        elem_type_expr = expr[2]
+                        elem_type = self.to_c_type(elem_type_expr)
+                        elem_id = self._type_to_identifier(elem_type)
+                        list_type = f"slop_list_{elem_id}"
+                        self.generated_list_types.add((list_type, elem_type))
+                        # Also ensure Option type for element exists (for list-get)
+                        option_type = f"slop_option_{elem_id}"
+                        self.generated_option_types.add((option_type, elem_type))
+                    # Check for list-pop/list-get on fields: (list-pop (. obj field))
+                    # These return Option<T> where T is the list element type
+                    elif head.name in ('list-pop', 'list-get') and len(expr) >= 2:
+                        list_expr = expr[1]
+                        # Try to infer the list type from field access
+                        if isinstance(list_expr, SList) and len(list_expr) >= 3:
+                            if isinstance(list_expr[0], Symbol) and list_expr[0].name == '.':
+                                # (. obj field) - try to look up field type from record
+                                obj_expr = list_expr[1]
+                                field_name = list_expr[2].name if isinstance(list_expr[2], Symbol) else None
+                                if field_name:
+                                    # Try to find the object's type
+                                    obj_type = None
+                                    # Handle (deref param) case
+                                    if isinstance(obj_expr, SList) and len(obj_expr) >= 2:
+                                        if isinstance(obj_expr[0], Symbol) and obj_expr[0].name == 'deref':
+                                            inner = obj_expr[1]
+                                            if isinstance(inner, Symbol) and inner.name in param_types:
+                                                ptr_type = param_types[inner.name]
+                                                # Extract inner type from (Ptr T)
+                                                if is_form(ptr_type, 'Ptr') and len(ptr_type) >= 2:
+                                                    obj_type = ptr_type[1]
+                                    # Look up field in record definitions
+                                    if obj_type and isinstance(obj_type, Symbol):
+                                        type_name = obj_type.name
+                                        # Try to find in record_fields
+                                        field_type = None
+                                        for full_name, fields in self.record_fields.items():
+                                            if full_name.endswith(type_name) or full_name == type_name:
+                                                if field_name in fields:
+                                                    field_info = fields[field_name]
+                                                    # Handle both dict format {'type': expr} and direct expr
+                                                    field_type = field_info['type'] if isinstance(field_info, dict) else field_info
+                                                    break
+                                        if field_type and is_form(field_type, 'List') and len(field_type) >= 2:
+                                            elem_type_expr = field_type[1]
+                                            elem_type = self.to_c_type(elem_type_expr)
+                                            elem_id = self._type_to_identifier(elem_type)
+                                            option_type = f"slop_option_{elem_id}"
+                                            self.generated_option_types.add((option_type, elem_type))
+                # Recurse into all sub-expressions
+                for item in expr.items:
+                    scan_expr(item)
+
+        # Scan all forms in the function body (skip name, params, contracts)
+        for item in form.items[3:]:
+            if not is_form(item, '@intent') and not is_form(item, '@spec') and \
+               not is_form(item, '@pre') and not is_form(item, '@post') and \
+               not is_form(item, '@pure') and not is_form(item, '@alloc'):
+                scan_expr(item)
+
+    def _prescan_record_fields(self, form: SList):
+        """Pre-populate record_fields for a record type without emitting anything.
+
+        This allows function body scanning to look up field types.
+        """
+        if len(form) < 3:
+            return
+
+        raw_name = form[1].name if isinstance(form[1], Symbol) else None
+        if not raw_name:
+            return
+
+        type_expr = form[2]
+        if not is_form(type_expr, 'record'):
+            return
+
+        # Initialize record_fields entry if not present
+        if raw_name not in self.record_fields:
+            self.record_fields[raw_name] = {}
+
+        # Collect field info
+        for item in type_expr.items[1:]:
+            if isinstance(item, SList) and len(item) >= 2:
+                raw_field_name = item[0].name if isinstance(item[0], Symbol) else None
+                field_type_expr = item[1]
+                if raw_field_name:
+                    self.record_fields[raw_name][raw_field_name] = {
+                        'is_pointer': self._is_pointer_type(field_type_expr),
+                        'type': field_type_expr
+                    }
+
+    def _lookup_field_type(self, obj_expr: SExpr, field_name: str) -> Optional[SExpr]:
+        """Look up the type of a field from record definitions.
+
+        Used during pre-scanning to discover types for list-pop/list-get on fields.
+        """
+        # Try to determine the type of obj_expr
+        obj_type_name = None
+
+        if isinstance(obj_expr, SList):
+            # Could be (deref ptr) - extract pointer type
+            if is_form(obj_expr, 'deref') and len(obj_expr) >= 2:
+                inner = obj_expr[1]
+                if isinstance(inner, Symbol):
+                    # Look up in var_types or assume from parameter
+                    obj_type_name = self.var_types.get(inner.name)
+                    if obj_type_name and obj_type_name.endswith('*'):
+                        obj_type_name = obj_type_name[:-1].strip()
+
+        # Look up field in record_fields
+        if obj_type_name and obj_type_name in self.record_fields:
+            fields = self.record_fields[obj_type_name]
+            if field_name in fields:
+                return fields[field_name]
+
+        # Also check with module prefix stripped
+        for full_name, fields in self.record_fields.items():
+            if full_name.endswith(f'_{obj_type_name}') or full_name == obj_type_name:
+                if field_name in fields:
+                    return fields[field_name]
+
+        return None
+
     def _scan_function_types(self, form: SList):
         """Pre-scan function to discover needed generic types.
 
@@ -4101,10 +4915,11 @@ class Transpiler:
         Option/List/Result types are emitted before they're used.
         """
         # Scan parameter types
+        func_name = form[1].name if len(form) > 1 and isinstance(form[1], Symbol) else None
         params = form[2] if len(form) > 2 else SList([])
         for p in params:
             if isinstance(p, SList) and len(p) >= 2:
-                param_type = p[1]
+                param_type = p[-1]  # Type is last element (handles mode annotations)
                 self.to_c_type(param_type)  # This populates generated_*_types sets
                 # For List<T> parameters, also register Option<T> since list-get returns Option
                 if is_form(param_type, 'List') and len(param_type) >= 2:
@@ -4114,14 +4929,22 @@ class Transpiler:
                     option_type = f"slop_option_{elem_id}"
                     self.generated_option_types.add((option_type, elem_c_type))
 
+        # Register function parameters for cross-module type inference
+        if func_name:
+            if func_name not in self.functions:
+                self.functions[func_name] = {}
+            self.functions[func_name]['params'] = params
+
         # Scan return type from @spec
-        func_name = form[1].name if len(form) > 1 and isinstance(form[1], Symbol) else None
         for item in form.items[3:]:
             if is_form(item, '@spec'):
                 spec = item[1] if len(item) > 1 else None
                 if spec and isinstance(spec, SList) and len(spec) >= 3:
                     ret_type = spec[-1]  # Return type
                     self.to_c_type(ret_type)
+                    # Register return type for cross-module type inference
+                    if func_name:
+                        self.functions[func_name]['return_type'] = ret_type
                     # Track if function returns String
                     if func_name and isinstance(ret_type, Symbol) and ret_type.name == 'String':
                         self.func_returns_string.add(func_name)
@@ -4156,14 +4979,325 @@ class Transpiler:
                 return True
         return False
 
-    def _emit_generated_types(self, phase: str = 'all'):
+    def _is_primitive_type(self, c_type: str) -> bool:
+        """Check if a C type is a primitive (no definition needed)."""
+        primitives = {
+            'int8_t', 'int16_t', 'int32_t', 'int64_t',
+            'uint8_t', 'uint16_t', 'uint32_t', 'uint64_t',
+            'float', 'double', 'bool', 'char', 'void',
+            'slop_string', 'slop_bytes', 'slop_arena*', 'size_t'
+        }
+        base = c_type.rstrip('*').strip()
+        return base in primitives
+
+    def _get_by_value_dependencies(self, type_kind: str, type_info: tuple) -> set:
+        """Get the set of types that must be defined BEFORE this type (by-value deps).
+
+        Returns C type names that this type depends on by value (not pointer).
+        """
+        deps = set()
+
+        if type_kind == 'option':
+            # Option[T] stores T by value
+            type_name, inner = type_info
+            if '*' not in inner and not self._is_primitive_type(inner):
+                deps.add(inner)
+
+        elif type_kind == 'result':
+            # Result[T, E] stores both by value in union
+            type_name, ok_type, err_type = type_info
+            if ok_type != 'void' and '*' not in ok_type and not self._is_primitive_type(ok_type):
+                deps.add(ok_type)
+            if '*' not in err_type and not self._is_primitive_type(err_type):
+                deps.add(err_type)
+
+        elif type_kind == 'list':
+            # List[T] stores T* (pointer), but the typedef uses T* which needs T defined.
+            # For generated types (Map, Option, etc.), they can't be forward-declared,
+            # so we need to depend on them to ensure proper ordering.
+            type_name, inner = type_info
+            # If inner type is a generated type (starts with slop_), add as dependency
+            if inner.startswith('slop_') and not self._is_primitive_type(inner):
+                deps.add(inner)
+
+        elif type_kind == 'map':
+            # Map needs Option[V] for SLOP_STRING_MAP_DEFINE
+            type_name, key_type, value_type = type_info
+            if key_type == 'slop_string':
+                value_id = self._type_to_identifier(value_type)
+                option_type = f"slop_option_{value_id}"
+                deps.add(option_type)
+            # Also depends on value_type if used by value in entry struct
+            if '*' not in value_type and not self._is_primitive_type(value_type):
+                deps.add(value_type)
+
+        elif type_kind == 'inline_record':
+            # Inline records may have field dependencies - for now assume none
+            pass
+
+        return deps
+
+    def _collect_all_generated_types(self) -> dict:
+        """Collect all generated types into a unified structure for sorting.
+
+        Returns dict mapping type_name -> (kind, info, dependencies)
+        where kind is 'option', 'result', 'list', 'map', 'inline_record'
+        """
+        all_types = {}
+
+        # Collect inline records
+        for type_name, struct_body in self.generated_inline_records.items():
+            if type_name not in self.emitted_generated_types:
+                info = (type_name, struct_body)
+                deps = self._get_by_value_dependencies('inline_record', info)
+                all_types[type_name] = ('inline_record', info, deps)
+
+        # Collect Option types
+        for type_name, inner in self.generated_option_types:
+            if type_name not in self.RUNTIME_PREDEFINED_TYPES and type_name not in self.emitted_generated_types:
+                info = (type_name, inner)
+                deps = self._get_by_value_dependencies('option', info)
+                all_types[type_name] = ('option', info, deps)
+
+        # Collect Result types
+        for type_name, ok_type, err_type in self.generated_result_types:
+            if type_name not in self.RUNTIME_PREDEFINED_TYPES and type_name not in self.emitted_generated_types:
+                info = (type_name, ok_type, err_type)
+                deps = self._get_by_value_dependencies('result', info)
+                all_types[type_name] = ('result', info, deps)
+
+        # Collect List types
+        for type_name, inner in self.generated_list_types:
+            if type_name not in self.RUNTIME_PREDEFINED_TYPES and type_name not in self.emitted_generated_types:
+                info = (type_name, inner)
+                deps = self._get_by_value_dependencies('list', info)
+                all_types[type_name] = ('list', info, deps)
+
+        # Collect Map types
+        for type_name, key_type, value_type in self.generated_map_types:
+            if type_name not in self.RUNTIME_PREDEFINED_TYPES and type_name not in self.emitted_generated_types:
+                info = (type_name, key_type, value_type)
+                deps = self._get_by_value_dependencies('map', info)
+                all_types[type_name] = ('map', info, deps)
+
+        return all_types
+
+    def _topological_sort_types(self, all_types: dict) -> list:
+        """Topologically sort types based on by-value dependencies.
+
+        Uses Kahn's algorithm. Returns list of type_names in valid emission order.
+        """
+        # Build in-degree count and adjacency list
+        in_degree = {name: 0 for name in all_types}
+        dependents = {name: [] for name in all_types}
+
+        for name, (kind, info, deps) in all_types.items():
+            for dep in deps:
+                if dep in all_types:
+                    in_degree[name] += 1
+                    dependents[dep].append(name)
+
+        # Start with types that have no dependencies
+        queue = [name for name, degree in in_degree.items() if degree == 0]
+        sorted_types = []
+
+        while queue:
+            # Sort queue for deterministic output
+            queue.sort()
+            current = queue.pop(0)
+            sorted_types.append(current)
+
+            for dependent in dependents[current]:
+                in_degree[dependent] -= 1
+                if in_degree[dependent] == 0:
+                    queue.append(dependent)
+
+        # Check for cycles (shouldn't happen with valid types)
+        if len(sorted_types) != len(all_types):
+            # Cycle detected - emit remaining types anyway with a warning
+            remaining = [name for name in all_types if name not in sorted_types]
+            sorted_types.extend(sorted(remaining))
+
+        return sorted_types
+
+    def _emit_type_definition(self, type_name: str, kind: str, info: tuple):
+        """Emit a single generated type definition.
+
+        Uses named struct tags to allow forward declarations: typedef struct Name {...} Name;
+        """
+        if kind == 'inline_record':
+            _, struct_body = info
+            guard = self._type_guard_name(type_name)
+            self.emit(f"#ifndef {guard}")
+            self.emit(f"#define {guard}")
+            self.emit(f"typedef struct {type_name} {struct_body} {type_name};")
+            self.emit("#endif")
+
+        elif kind == 'option':
+            _, inner = info
+            guard = self._type_guard_name(type_name)
+            self.emit(f"#ifndef {guard}")
+            self.emit(f"#define {guard}")
+            self.emit(f"typedef struct {type_name} {{ bool has_value; {inner} value; }} {type_name};")
+            self.emit("#endif")
+
+        elif kind == 'result':
+            _, ok_type, err_type = info
+            guard = self._type_guard_name(type_name)
+            self.emit(f"#ifndef {guard}")
+            self.emit(f"#define {guard}")
+            if ok_type == 'void':
+                self.emit(f"typedef struct {type_name} {{ bool is_ok; union {{ uint8_t ok; {err_type} err; }} data; }} {type_name};")
+            else:
+                self.emit(f"typedef struct {type_name} {{ bool is_ok; union {{ {ok_type} ok; {err_type} err; }} data; }} {type_name};")
+            self.emit("#endif")
+
+        elif kind == 'list':
+            _, inner = info
+            guard = self._type_guard_name(type_name)
+            self.emit(f"#ifndef {guard}")
+            self.emit(f"#define {guard}")
+            self.emit(f"typedef struct {type_name} {{ {inner}* data; size_t len; size_t cap; }} {type_name};")
+            self.emit("#endif")
+
+        elif kind == 'map':
+            _, key_type, value_type = info
+            if key_type == 'slop_string':
+                # Ensure the Option type for the value exists
+                value_id = self._type_to_identifier(value_type)
+                option_type = f"slop_option_{value_id}"
+                # The Option should already be emitted due to dependency ordering
+                # But emit it if somehow missed
+                if option_type not in self.emitted_generated_types and option_type not in self.RUNTIME_PREDEFINED_TYPES:
+                    guard_opt = self._type_guard_name(option_type)
+                    self.emit(f"#ifndef {guard_opt}")
+                    self.emit(f"#define {guard_opt}")
+                    self.emit(f"typedef struct {option_type} {{ bool has_value; {value_type} value; }} {option_type};")
+                    self.emit("#endif")
+                    self.emitted_generated_types.add(option_type)
+                guard = self._type_guard_name(type_name)
+                self.emit(f"#ifndef {guard}")
+                self.emit(f"#define {guard}")
+                self.emit(f"SLOP_STRING_MAP_DEFINE({value_type}, {type_name}, {option_type})")
+                self.emit("#endif")
+            else:
+                guard = self._type_guard_name(type_name)
+                self.emit(f"#ifndef {guard}")
+                self.emit(f"#define {guard}")
+                self.emit(f"typedef struct {type_name}_entry {{ {key_type} key; {value_type} value; bool occupied; }} {type_name}_entry;")
+                self.emit(f"typedef struct {type_name} {{ {type_name}_entry* entries; size_t len; size_t cap; }} {type_name};")
+                self.emit("#endif")
+
+        self.emitted_generated_types.add(type_name)
+
+    def _emit_generated_types_sorted(self):
+        """Emit all generated types in topologically sorted order.
+
+        This replaces the old phase-based approach with proper dependency ordering.
+        """
+        all_types = self._collect_all_generated_types()
+        if not all_types:
+            return
+
+        sorted_names = self._topological_sort_types(all_types)
+
+        if sorted_names:
+            self.emit("/* Generated generic type definitions */")
+            for name in sorted_names:
+                kind, info, deps = all_types[name]
+                self._emit_type_definition(name, kind, info)
+            self.emit("")
+
+    def _get_record_field_deps(self, record_type_ast) -> set:
+        """Extract by-value type dependencies from a record or union type AST.
+
+        Returns C type names that this type depends on by value.
+        """
+        deps = set()
+        if len(record_type_ast) < 3:
+            return deps
+
+        type_expr = record_type_ast[2]
+        is_record = is_form(type_expr, 'record')
+        is_union = is_form(type_expr, 'union')
+
+        if not (is_record or is_union):
+            return deps
+
+        # For records: iterate over fields (field-name field-type)
+        # For unions: iterate over variants (variant-name variant-type)
+        for i in range(1, len(type_expr)):
+            field = type_expr[i]
+            if isinstance(field, SList) and len(field) >= 2:
+                field_type = field[1]
+                c_type = self.to_c_type(field_type)
+                # Only add if it's a by-value (non-pointer) type and not primitive
+                if '*' not in c_type and not self._is_primitive_type(c_type):
+                    deps.add(c_type)
+
+        return deps
+
+    def _collect_unified_types(self, record_asts: list) -> dict:
+        """Collect both record types and generated types into a unified structure.
+
+        Returns dict mapping type_name -> (kind, info, dependencies)
+        where kind is 'record', 'option', 'result', 'list', 'map', 'inline_record'
+        """
+        all_types = {}
+
+        # Collect record types from AST
+        for t in record_asts:
+            if len(t) >= 2 and isinstance(t[1], Symbol):
+                # Get the module-prefixed type name (same logic as to_c_type)
+                raw_name = t[1].name
+                if self.enable_prefixing and self.current_module:
+                    type_name = f"{self.to_c_name(self.current_module)}_{self.to_c_name(raw_name)}"
+                else:
+                    type_name = self.to_c_name(raw_name)
+                deps = self._get_record_field_deps(t)
+                all_types[type_name] = ('record', t, deps)
+
+        # Collect generated types
+        generated = self._collect_all_generated_types()
+        for name, (kind, info, deps) in generated.items():
+            all_types[name] = (kind, info, deps)
+
+        return all_types
+
+    def _emit_all_types_unified(self, record_asts: list):
+        """Emit both record types and generated types in topologically sorted order.
+
+        This creates a single unified dependency graph and sorts all types together.
+        """
+        all_types = self._collect_unified_types(record_asts)
+        if not all_types:
+            return
+
+        sorted_names = self._topological_sort_types(all_types)
+
+        if sorted_names:
+            for name in sorted_names:
+                kind, info, deps = all_types[name]
+                if kind == 'record':
+                    # info is the record AST, transpile it
+                    self.transpile_type(info)
+                else:
+                    # Generated type - use emit_type_definition
+                    self._emit_type_definition(name, kind, info)
+
+    def _emit_generated_types(self, phase: str = 'all', simple_record_types: set = None):
         """Emit type definitions for generated Option/List/Result/Map types.
 
         Args:
-            phase: 'pointer' = emit List/Map (use pointers)
-                   'value' = emit Option/Result that use record values
+            phase: 'pointer' = emit List/Map (use pointers) + Options for simple records
+                   'value' = emit Option/Result for complex records (have generated type fields)
                    'all' = emit everything (default, for backward compat)
+            simple_record_types: Set of C type names for "simple" records (already emitted,
+                                 no generated type fields). Options for these are safe to emit
+                                 in 'pointer' phase.
         """
+        if simple_record_types is None:
+            simple_record_types = set()
         has_types = (self.generated_option_types or self.generated_list_types or
                      self.generated_result_types or self.generated_map_types or
                      self.generated_inline_records)
@@ -4186,24 +5320,52 @@ class Transpiler:
                     self.emit("#endif")
                     self.emitted_generated_types.add(type_name)
 
-        # Emit Option types (skip pre-defined and already emitted ones)
-        # Uses same layout as SLOP_OPTION_DEFINE: { bool has_value; T value; }
-        for type_name, inner in sorted(self.generated_option_types):
+        # Emit Map types FIRST (Lists can contain Maps: List[Map[K,V]])
+        # Move this before List emission since List[Map[...]] depends on Map being defined
+        for type_name, key_type, value_type in sorted(self.generated_map_types):
             if type_name not in self.RUNTIME_PREDEFINED_TYPES and type_name not in self.emitted_generated_types:
-                # Option uses inner by value. If inner is a record (not pointer), defer to 'value' phase
-                uses_record_by_value = '*' not in inner and self._is_record_type(inner)
-                if phase == 'pointer' and uses_record_by_value:
-                    continue  # Defer to value phase
-                if phase == 'value' and not uses_record_by_value:
-                    continue  # Already emitted in pointer phase
+                # Check if value_type is a record - same logic as Option types
+                is_pointer_value = '*' in value_type
+                is_record = self._is_record_type(value_type)
+                is_simple_record = value_type in simple_record_types
+
+                if phase == 'pointer':
+                    # Emit if: pointer value, OR simple record value, OR not a record at all
+                    if is_record and not is_simple_record:
+                        continue  # Defer complex records to value phase
+                if phase == 'value':
+                    # Only emit maps with complex record values
+                    if not is_record or is_simple_record or is_pointer_value:
+                        continue  # Already emitted in pointer phase
                 if not emitted_any:
                     self.emit("/* Generated generic type definitions */")
                     emitted_any = True
-                self._emit_guarded_typedef(type_name,
-                    f"typedef struct {{ bool has_value; {inner} value; }} {type_name};")
+                # For string-keyed maps, use the SLOP_STRING_MAP_DEFINE macro
+                if key_type == 'slop_string':
+                    # SLOP_STRING_MAP_DEFINE requires the corresponding Option type
+                    # Emit it here if not already emitted
+                    value_id = self._type_to_identifier(value_type)
+                    option_type = f"slop_option_{value_id}"
+                    if option_type not in self.RUNTIME_PREDEFINED_TYPES and option_type not in self.emitted_generated_types:
+                        self._emit_guarded_typedef(option_type,
+                            f"typedef struct {{ bool has_value; {value_type} value; }} {option_type};")
+                        self.emitted_generated_types.add(option_type)
+                    guard = self._type_guard_name(type_name)
+                    self.emit(f"#ifndef {guard}")
+                    self.emit(f"#define {guard}")
+                    self.emit(f"SLOP_STRING_MAP_DEFINE({value_type}, {type_name}, {option_type})")
+                    self.emit("#endif")
+                else:
+                    # For non-string keys, emit custom struct with guards
+                    guard = self._type_guard_name(type_name)
+                    self.emit(f"#ifndef {guard}")
+                    self.emit(f"#define {guard}")
+                    self.emit(f"typedef struct {{ {key_type} key; {value_type} value; bool occupied; }} {type_name}_entry;")
+                    self.emit(f"typedef struct {{ {type_name}_entry* entries; size_t len; size_t cap; }} {type_name};")
+                    self.emit("#endif")
                 self.emitted_generated_types.add(type_name)
 
-        # Emit List types (skip pre-defined and already emitted ones)
+        # Emit List types AFTER Map types (List[Map[K,V]] depends on Map)
         # List uses T* (pointer), so safe in pointer phase
         if phase in ('pointer', 'all'):
             for type_name, inner in sorted(self.generated_list_types):
@@ -4215,45 +5377,69 @@ class Transpiler:
                         f"typedef struct {{ {inner}* data; size_t len; size_t cap; }} {type_name};")
                     self.emitted_generated_types.add(type_name)
 
-        # Emit Map types (skip pre-defined and already emitted ones)
-        # Map uses pointers in entries, so safe in pointer phase
-        if phase in ('pointer', 'all'):
-            for type_name, key_type, value_type in sorted(self.generated_map_types):
-                if type_name not in self.RUNTIME_PREDEFINED_TYPES and type_name not in self.emitted_generated_types:
-                    if not emitted_any:
-                        self.emit("/* Generated generic type definitions */")
-                        emitted_any = True
-                    # For string-keyed maps, use the SLOP_STRING_MAP_DEFINE macro
-                    if key_type == 'slop_string':
-                        # Find or create the corresponding option type
-                        value_id = self._type_to_identifier(value_type)
-                        option_type = f"slop_option_{value_id}"
-                        guard = self._type_guard_name(type_name)
-                        self.emit(f"#ifndef {guard}")
-                        self.emit(f"#define {guard}")
-                        self.emit(f"SLOP_STRING_MAP_DEFINE({value_type}, {type_name}, {option_type})")
-                        self.emit("#endif")
-                    else:
-                        # For non-string keys, emit custom struct with guards
-                        guard = self._type_guard_name(type_name)
-                        self.emit(f"#ifndef {guard}")
-                        self.emit(f"#define {guard}")
-                        self.emit(f"typedef struct {{ {key_type} key; {value_type} value; bool occupied; }} {type_name}_entry;")
-                        self.emit(f"typedef struct {{ {type_name}_entry* entries; size_t len; size_t cap; }} {type_name};")
-                        self.emit("#endif")
-                    self.emitted_generated_types.add(type_name)
+        # Emit Option types (skip pre-defined and already emitted ones)
+        # Uses same layout as SLOP_OPTION_DEFINE: { bool has_value; T value; }
+        for type_name, inner in sorted(self.generated_option_types):
+            if type_name not in self.RUNTIME_PREDEFINED_TYPES and type_name not in self.emitted_generated_types:
+                # Option uses inner by value. Determine when to emit based on inner type:
+                # - If inner is a pointer: emit in 'pointer' phase (forward decl is sufficient)
+                # - If inner is a simple record (already emitted): emit in 'pointer' phase
+                # - If inner is a primitive: emit in 'pointer' phase
+                # - If inner is a generated type (List, Map) already emitted: emit in 'pointer' phase
+                # - Otherwise (might be complex record): emit in 'value' phase
+                is_pointer_inner = '*' in inner
+                is_simple_record = inner in simple_record_types
+                is_primitive = self._is_primitive_type(inner)
+                # Check if inner is a generated type that's already been emitted (List, Map types)
+                is_emitted_generated = inner in self.emitted_generated_types
+                # Also check if it starts with slop_list_ or slop_map_ (these are pointer-based)
+                is_pointer_based_generated = inner.startswith('slop_list_') or inner.startswith('slop_map_')
+
+                emit_in_pointer_phase = (is_pointer_inner or is_primitive or is_simple_record or
+                                         is_emitted_generated or is_pointer_based_generated)
+
+                if phase == 'pointer':
+                    # Only emit if we're SURE it's safe
+                    if not emit_in_pointer_phase:
+                        continue  # Defer unknown/complex types to value phase
+                if phase == 'value':
+                    # Emit everything we deferred from pointer phase
+                    if emit_in_pointer_phase:
+                        continue  # Already emitted in pointer phase
+                if not emitted_any:
+                    self.emit("/* Generated generic type definitions */")
+                    emitted_any = True
+                self._emit_guarded_typedef(type_name,
+                    f"typedef struct {{ bool has_value; {inner} value; }} {type_name};")
+                self.emitted_generated_types.add(type_name)
+
+        # Note: Map types were emitted earlier (before Lists) since List[Map[...]] depends on Map
 
         # Emit Result types (skip pre-defined and already emitted ones)
         # Uses same layout as SLOP_RESULT_DEFINE: { bool is_ok; union { T ok; E err; } data; }
-        # Result uses ok_type by value in union, so defer if ok_type is a record
+        # Result uses ok_type by value in union, so defer if ok_type is a complex record
         for type_name, ok_type, err_type in sorted(self.generated_result_types):
             if type_name not in self.RUNTIME_PREDEFINED_TYPES and type_name not in self.emitted_generated_types:
-                # Result uses ok_type by value. If ok_type is a record (not pointer/void), defer to 'value' phase
-                uses_record_by_value = ok_type != 'void' and '*' not in ok_type and self._is_record_type(ok_type)
-                if phase == 'pointer' and uses_record_by_value:
-                    continue  # Defer to value phase
-                if phase == 'value' and not uses_record_by_value:
-                    continue  # Already emitted in pointer phase
+                # Result uses ok_type by value - same logic as Option types
+                is_void = ok_type == 'void'
+                is_pointer_ok = '*' in ok_type
+                is_primitive = self._is_primitive_type(ok_type)
+                is_simple_record = ok_type in simple_record_types
+                # Check if ok_type is a generated type that's already been emitted
+                is_emitted_generated = ok_type in self.emitted_generated_types
+                is_pointer_based_generated = ok_type.startswith('slop_list_') or ok_type.startswith('slop_map_')
+
+                emit_in_pointer_phase = (is_void or is_pointer_ok or is_primitive or is_simple_record or
+                                         is_emitted_generated or is_pointer_based_generated)
+
+                if phase == 'pointer':
+                    # Only emit if we're SURE it's safe
+                    if not emit_in_pointer_phase:
+                        continue  # Defer unknown/complex types to value phase
+                if phase == 'value':
+                    # Emit everything we deferred from pointer phase
+                    if emit_in_pointer_phase:
+                        continue  # Already emitted in pointer phase
                 if not emitted_any:
                     self.emit("/* Generated generic type definitions */")
                     emitted_any = True
@@ -4314,6 +5500,32 @@ class Transpiler:
         if result in self.C_KEYWORDS:
             return f"slop_{result}"
         return result
+
+    def to_c_type_name(self, type_name: str) -> str:
+        """Convert SLOP type name to C type name (handles imports).
+
+        For imported types, returns the module-prefixed C name.
+        For local types, returns the current module-prefixed name.
+        """
+        # Strip pointer suffix for lookups
+        is_pointer = type_name.endswith('*')
+        base_type = type_name.rstrip('*').strip() if is_pointer else type_name
+
+        # Check if it's an imported type
+        if base_type in self.import_map:
+            return self.import_map[base_type]
+        # Check if it's a known type with a c_type
+        if base_type in self.types:
+            return self.types[base_type].c_type
+        # If the type already contains underscore (module prefix), return as-is
+        # This handles C types like "parser_SExpr" that are already prefixed
+        if '_' in base_type:
+            return base_type
+        # For local types, prefix with current module
+        if self.current_module and self.enable_prefixing:
+            return f"{self.to_c_name(self.current_module)}_{self.to_c_name(base_type)}"
+        # Fallback - just convert to valid C name
+        return self.to_c_name(base_type)
 
     # Builtin runtime functions that should NOT be prefixed with module name
     # Aligns with BUILTIN_FUNCTIONS from types.py plus Option/Result constructors
@@ -4589,6 +5801,16 @@ def transpile_multi(modules: dict, order: list) -> str:
         for fn in functions:
             transpiler._scan_function_types(fn)
 
+        # Pre-populate record_fields for ALL record types (needed for function body scanning)
+        for t in types:
+            type_expr = t[2] if len(t) > 2 else None
+            if type_expr and is_form(type_expr, 'record'):
+                transpiler._prescan_record_fields(t)
+
+        # Pre-scan function bodies to discover types from list-pop/list-get/map-new
+        for fn in functions:
+            transpiler._scan_function_body_types(fn)
+
         # Emit types in order to resolve dependencies:
         # 1. Enums and range types first
         # 2. Simple records (no generated type fields) - needed by generated types
@@ -4628,8 +5850,15 @@ def transpile_multi(modules: dict, order: list) -> str:
         for t in simple_records:
             transpiler.transpile_type(t)
 
-        # Phase 3: Emit generated types
-        transpiler._emit_generated_types()
+        # Build set of C type names for simple records
+        simple_record_c_types = set()
+        for t in simple_records:
+            type_name = t[1].name
+            c_type = transpiler.to_qualified_type_name(type_name)
+            simple_record_c_types.add(c_type)
+
+        # Phase 3: Emit List types and Options for simple records/pointers
+        transpiler._emit_generated_types(phase='pointer', simple_record_types=simple_record_c_types)
 
         # Phase 3.5: Emit wrapper alias types (Result/Option/List type aliases)
         for t in wrapper_alias_types:
@@ -4638,6 +5867,9 @@ def transpile_multi(modules: dict, order: list) -> str:
         # Phase 4: Emit complex records and unions
         for t in complex_records:
             transpiler.transpile_type(t)
+
+        # Phase 4.5: Emit Option/Result types for complex records
+        transpiler._emit_generated_types(phase='value', simple_record_types=simple_record_c_types)
 
         # Emit function forward declarations
         if functions:
@@ -4671,6 +5903,14 @@ def transpile_multi_split(modules: dict, order: list) -> dict:
     all_enums = {}
     # Accumulate type alias definitions (Result/Option/List) for cross-module lookup
     all_type_alias_defs = {}
+    # Accumulate function info (params, return types) for cross-module type inference
+    all_functions = {}
+    # Accumulate record field info for cross-module record constructors
+    all_record_fields = {}
+    # Accumulate union variant info for cross-module type inference in match expressions
+    all_union_variants = {}
+    # Accumulate type info for cross-module type lookups
+    all_types = {}
 
     for mod_name in order:
         info = modules[mod_name]
@@ -4683,6 +5923,14 @@ def transpile_multi_split(modules: dict, order: list) -> dict:
         transpiler.enums.update(all_enums)
         # Copy type alias definitions from previously processed modules
         transpiler.type_alias_defs.update(all_type_alias_defs)
+        # Copy function info from previously processed modules
+        transpiler.functions.update(all_functions)
+        # Copy record field info from previously processed modules
+        transpiler.record_fields.update(all_record_fields)
+        # Copy union variant info from previously processed modules
+        transpiler.union_variants.update(all_union_variants)
+        # Copy type info from previously processed modules
+        transpiler.types.update(all_types)
 
         # Set up module context with imports
         imports = []
@@ -4791,11 +6039,20 @@ def transpile_multi_split(modules: dict, order: list) -> dict:
         for fn in functions:
             transpiler._scan_function_types(fn)
 
+        # Pre-scan function bodies for type-creating expressions (map-new, list-new)
+        for fn in functions:
+            transpiler._scan_function_body_types(fn)
+
+        # NOTE: We no longer add forward declarations for generated types (Option, Result, List, Map)
+        # because the unified topological sort in _emit_all_types_unified handles proper ordering.
+        # Also, Map types use SLOP_STRING_MAP_DEFINE macro which conflicts with forward declarations.
+
         # ===== BUILD HEADER FILE =====
         header_lines = []
         # Convert module name to valid C identifier for header guard
+        # Prefix with SLOP_ to avoid conflicts with C stdlib (e.g., CTYPE_H)
         c_mod_name = transpiler.to_c_name(mod_name)
-        guard_name = f"{c_mod_name.upper()}_H"
+        guard_name = f"SLOP_{c_mod_name.upper()}_H"
 
         header_lines.append(f"#ifndef {guard_name}")
         header_lines.append(f"#define {guard_name}")
@@ -4808,9 +6065,10 @@ def transpile_multi_split(modules: dict, order: list) -> dict:
         for header in sorted(ffi_includes):
             header_lines.append(f'#include <{header}>')
 
-        # Dependency headers
+        # Dependency headers (prefixed with slop_ to avoid C stdlib conflicts)
         for imp in info.imports:
-            header_lines.append(f'#include "{imp.module_name}.h"')
+            c_imp_name = transpiler.to_c_name(imp.module_name)
+            header_lines.append(f'#include "slop_{c_imp_name}.h"')
 
         header_lines.append("")
 
@@ -4839,45 +6097,20 @@ def transpile_multi_split(modules: dict, order: list) -> dict:
             header_lines.extend(transpiler.output)
             header_lines.append("")
 
-        # Split records into simple (no generated type fields) and complex
-        simple_records = []
-        complex_records = []
+        # Collect all record/union types
+        record_types = []
         for t in types:
             if len(t) > 2:
                 type_expr = t[2]
-                if is_form(type_expr, 'record'):
-                    if transpiler._record_uses_generated_types(t):
-                        complex_records.append(t)
-                    else:
-                        simple_records.append(t)
-                elif is_form(type_expr, 'union'):
-                    complex_records.append(t)
+                if is_form(type_expr, 'record') or is_form(type_expr, 'union'):
+                    record_types.append(t)
 
-        # Emit simple record bodies first
+        # Emit ALL types (records + generated) in unified topologically sorted order
+        # This handles the mutual dependencies between:
+        # - Records with List/Option fields (need generated types defined first)
+        # - Generated types like Option[Record] (need records defined first)
         transpiler.output = []
-        for t in simple_records:
-            transpiler.transpile_type(t)
-        if transpiler.output:
-            header_lines.extend(transpiler.output)
-            header_lines.append("")
-
-        # Emit generated types that use pointers (List, Map, Option<ptr>, Result<ptr,...>)
-        transpiler.output = []
-        transpiler._emit_generated_types(phase='pointer')
-        if transpiler.output:
-            header_lines.extend(transpiler.output)
-
-        # Emit complex record and union bodies (use generated pointer types)
-        transpiler.output = []
-        for t in complex_records:
-            transpiler.transpile_type(t)
-        if transpiler.output:
-            header_lines.extend(transpiler.output)
-            header_lines.append("")
-
-        # Emit generated types that use record values (Option<Record>, Result<Record,...>)
-        transpiler.output = []
-        transpiler._emit_generated_types(phase='value')
+        transpiler._emit_all_types_unified(record_types)
         if transpiler.output:
             header_lines.extend(transpiler.output)
 
@@ -4910,7 +6143,7 @@ def transpile_multi_split(modules: dict, order: list) -> dict:
 
         # ===== BUILD IMPLEMENTATION FILE =====
         impl_lines = []
-        impl_lines.append(f'#include "{mod_name}.h"')
+        impl_lines.append(f'#include "slop_{c_mod_name}.h"')
         impl_lines.append("")
 
         # Map operation wrappers
@@ -4940,6 +6173,14 @@ def transpile_multi_split(modules: dict, order: list) -> dict:
         all_enums.update(transpiler.enums)
         # Accumulate type alias definitions for subsequent modules
         all_type_alias_defs.update(transpiler.type_alias_defs)
+        # Accumulate function info for subsequent modules
+        all_functions.update(transpiler.functions)
+        # Accumulate record field info for subsequent modules
+        all_record_fields.update(transpiler.record_fields)
+        # Accumulate union variant info for subsequent modules
+        all_union_variants.update(transpiler.union_variants)
+        # Accumulate type info for subsequent modules
+        all_types.update(transpiler.types)
 
     return results
 

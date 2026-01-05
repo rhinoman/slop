@@ -1,0 +1,111 @@
+;; ============================================================
+;; SLOP Transpiler - C-Specific Type Representations
+;;
+;; Types specific to C code generation: C type strings,
+;; variable entries with C names, function entries, FFI.
+;;
+;; For abstract type definitions shared with type checker,
+;; see lib/compiler/common/types.slop
+;; ============================================================
+
+(module transpiler-types
+  (export
+    ;; C type information
+    CTypeInfo CRangeInfo
+    ;; C field/variant info (with C names/types)
+    CFieldInfo CVariantInfo
+    ;; Variable and function entries
+    VarEntry FuncEntry
+    ;; FFI entries
+    FFIFuncEntry FFIStructEntry)
+
+  ;; Import shared type definitions
+  (import types (TypeKind RangeBounds))
+
+  ;; ============================================================
+  ;; C Type Information
+  ;; ============================================================
+
+  ;; Range type with C-specific base type
+  (type CRangeInfo (record
+    (bounds RangeBounds)        ;; Abstract bounds (from common)
+    (c-base-type String)))      ;; C type: "uint8_t", "int64_t", etc.
+
+  ;; C representation of a SLOP type
+  (type CTypeInfo (record
+    (slop-name String)          ;; Original SLOP type name
+    (c-name String)             ;; Qualified C type name
+    (kind TypeKind)             ;; Type kind (from common)
+    (is-pointer Bool)           ;; Is this a pointer type?
+    (range (Option CRangeInfo)) ;; For range types
+    (fields (Option (List CFieldInfo)))     ;; For records
+    (variants (Option (List CVariantInfo))))) ;; For unions
+
+  ;; ============================================================
+  ;; C Field Information
+  ;; ============================================================
+
+  ;; Record field with C-specific representation
+  (type CFieldInfo (record
+    (name String)           ;; SLOP field name
+    (c-name String)         ;; C field name (mangled)
+    (c-type String)         ;; C type string
+    (is-pointer Bool)))     ;; Is field a pointer?
+
+  ;; ============================================================
+  ;; C Variant Information
+  ;; ============================================================
+
+  ;; Union variant with C-specific representation
+  (type CVariantInfo (record
+    (tag String)            ;; Variant tag name
+    (c-tag String)          ;; C enum value (e.g., TAG_some)
+    (tag-value Int)         ;; Numeric tag value
+    (has-payload Bool)      ;; Does variant have data?
+    (c-payload-type String))) ;; C type of payload (if any)
+
+  ;; ============================================================
+  ;; Variable Entry (for scope tracking)
+  ;; ============================================================
+
+  ;; Variable in the current scope during transpilation
+  (type VarEntry (record
+    (name String)           ;; SLOP variable name
+    (c-name String)         ;; C variable name (mangled)
+    (c-type String)         ;; C type string
+    (is-pointer Bool)       ;; Is this a pointer?
+    (is-mutable Bool)))     ;; Declared with 'mut'?
+
+  ;; ============================================================
+  ;; Function Entry (for call resolution)
+  ;; ============================================================
+
+  ;; Registered function for resolving calls
+  (type FuncEntry (record
+    (name String)           ;; SLOP function name
+    (c-name String)         ;; Qualified C function name
+    (return-c-type String)  ;; C return type
+    (returns-pointer Bool)  ;; Does it return a pointer?
+    (returns-string Bool)   ;; Does it return String?
+    (is-pure Bool)))        ;; Marked @pure?
+
+  ;; ============================================================
+  ;; FFI Function Entry
+  ;; ============================================================
+
+  ;; FFI function declaration
+  (type FFIFuncEntry (record
+    (slop-name String)      ;; Name used in SLOP code
+    (c-name String)         ;; Actual C function name
+    (return-c-type String)  ;; C return type
+    (returns-pointer Bool))) ;; Does it return a pointer?
+
+  ;; ============================================================
+  ;; FFI Struct Entry
+  ;; ============================================================
+
+  ;; FFI struct declaration
+  (type FFIStructEntry (record
+    (slop-name String)      ;; Name used in SLOP code
+    (c-name String)         ;; Actual C struct name
+    (fields (List CFieldInfo))))) ;; Fields with C types

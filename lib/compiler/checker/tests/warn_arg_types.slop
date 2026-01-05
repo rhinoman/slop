@@ -1,0 +1,16 @@
+;; Test: Wrong argument types - should warn
+
+(module warn-arg-types
+  (export process main)
+
+  (fn process ((x Int) (y Bool))
+    (@intent "Process with Int and Bool")
+    (@spec ((Int Bool) -> Int))
+    (if y x 0))
+
+  (fn main ()
+    (@intent "Test wrong arg types")
+    (@spec (() -> Int))
+    ;; Wrong types - should warn
+    (process true 42))
+)

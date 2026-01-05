@@ -1,0 +1,11 @@
+;; Test: Multi-module with type error - should fail type checking
+
+(module multi-error
+  (import multi-lib (Status User get-status))
+
+  (fn bad-function ((user User))
+    (@intent "This has a type error")
+    (@spec ((User) -> Int))
+    ;; Type error: get-status returns Status, not Int
+    (get-status user))
+)

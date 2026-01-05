@@ -382,6 +382,31 @@ static inline bool slop_map_has(slop_map* map, slop_string key) {
     return slop_map_get(map, key) != NULL;
 }
 
+static inline bool slop_map_remove(slop_map* map, slop_string key) {
+    uint64_t hash = slop_hash_string(key);
+    size_t idx = hash % map->cap;
+    for (size_t i = 0; i < map->cap; i++) {
+        size_t probe = (idx + i) % map->cap;
+        if (!map->entries[probe].occupied) return false;
+        if (slop_string_eq(map->entries[probe].key, key)) {
+            map->entries[probe].occupied = false;
+            map->len--;
+            return true;
+        }
+    }
+    return false;
+}
+
+static inline slop_list_string slop_map_keys(slop_arena* arena, slop_map* map) {
+    slop_list_string result = slop_list_string_new(arena, map->len > 0 ? map->len : 1);
+    for (size_t i = 0; i < map->cap; i++) {
+        if (map->entries[i].occupied) {
+            slop_list_string_push(arena, &result, map->entries[i].key);
+        }
+    }
+    return result;
+}
+
 /* ============================================================
  * Typed String-Keyed Map (generic via macro)
  *
@@ -406,6 +431,10 @@ static inline bool slop_map_has(slop_map* map, slop_string key) {
         V* stored = (V*)slop_arena_alloc(arena, sizeof(V)); \
         *stored = value; \
         slop_map_put(arena, map, key, stored); \
+    } \
+    \
+    static inline bool Name##_has(Name* map, slop_string key) { \
+        return slop_map_get(map, key) != NULL; \
     }
 
 /* ============================================================
@@ -542,6 +571,30 @@ static inline slop_gmap_list _slop_map_values_raw(void* gmap_ptr, size_t value_s
         }
     }
     return (slop_gmap_list){data, count, count};
+}
+
+/* Map keys - returns list of all int64_t keys */
+static inline slop_list_int _slop_map_keys_raw(void* gmap_ptr) {
+    slop_gmap_t* m = (slop_gmap_t*)gmap_ptr;
+    size_t count = 0;
+    for (size_t idx = 0; idx < m->gmap_len; idx++) {
+        if (m->gmap_entries[idx].gmap_occupied) count++;
+    }
+    if (count == 0) {
+        return (slop_list_int){0, 0, NULL};
+    }
+    int64_t* data = (int64_t*)malloc(count * sizeof(int64_t));
+    size_t write_idx = 0;
+    for (size_t idx = 0; idx < m->gmap_len; idx++) {
+        if (m->gmap_entries[idx].gmap_occupied) {
+            data[write_idx++] = m->gmap_entries[idx].gmap_key;
+        }
+    }
+    return (slop_list_int){count, count, data};
+}
+
+static inline slop_list_int map_keys(void* m) {
+    return _slop_map_keys_raw(m);
 }
 
 /* Take first n elements from list - modifies in place and returns */

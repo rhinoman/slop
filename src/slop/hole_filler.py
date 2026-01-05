@@ -294,6 +294,7 @@ class Hole:
     examples: Optional[List[SExpr]] = None
     context: Optional[List[str]] = None     # Whitelist of available identifiers
     required: Optional[List[str]] = None    # Identifiers that MUST appear in output
+    existing_code: Optional[SExpr] = None   # Existing code to refactor (if present, this is a refactoring hole)
 
 
 @dataclass
@@ -317,7 +318,15 @@ class CheckResult:
 
 
 def extract_hole(hole_expr: SList) -> Hole:
-    """Extract hole information from AST"""
+    """Extract hole information from AST.
+
+    Supports two modes:
+    - Generation: (hole Type "prompt" :keyword val ...)
+    - Refactoring: (hole Type "prompt" <existing-code> :keyword val ...)
+
+    If there's code between the prompt and keyword arguments, it's treated as
+    existing code to refactor.
+    """
     items = hole_expr.items[1:]
 
     type_expr = items[0] if items else None
@@ -328,8 +337,18 @@ def extract_hole(hole_expr: SList) -> Hole:
     examples = None
     context = None
     required = None
+    existing_code = None
 
+    # Check if items[2] is existing code (not a keyword symbol)
+    # Syntax: (hole Type "prompt" <existing-code> :keyword val ...)
     i = 2
+    if i < len(items):
+        item = items[i]
+        # If it's not a keyword symbol, it's existing code to refactor
+        if not (isinstance(item, Symbol) and item.name.startswith(':')):
+            existing_code = item
+            i = 3  # Start keyword parsing after existing code
+
     while i < len(items):
         if isinstance(items[i], Symbol) and items[i].name.startswith(':'):
             key = items[i].name[1:]
@@ -357,7 +376,7 @@ def extract_hole(hole_expr: SList) -> Hole:
         else:
             i += 1
 
-    return Hole(type_expr, prompt, complexity, constraints, examples, context, required)
+    return Hole(type_expr, prompt, complexity, constraints, examples, context, required, existing_code)
 
 
 def classify_tier(hole: Hole) -> Tier:
@@ -446,24 +465,21 @@ def _get_syntax_hints_for_type(type_str: str) -> str:
 # Common function mistakes and their correct alternatives
 FUNCTION_ALTERNATIVES = {
     # SLOP-specific
-    'parse-int': 'No parse-int in SLOP. Use (string-to-int str) via FFI or manual loop',
     'json-parse': 'No JSON library. Parse manually or use record-new with known fields',
-    'string-find': 'No string-find. Use for-each to iterate characters',
-    'substring': 'Use (string-slice s start end) if available via FFI',
-    'list-length': 'Arrays are fixed size (e.g., 100). Track length manually for lists',
+    'string-find': 'No string-find. Use (index-of haystack needle) from strlib or for-each',
+    'list-length': 'Use (list-len list) - it is a builtin',
     'print-int': 'Use (println (int-to-string arena n))',
     'arr.length': 'Use the declared array size directly (e.g., 100)',
     'malloc': 'Use (arena-alloc arena size)',
     'free': 'Arenas auto-free. Use (arena-free arena) only for explicit cleanup',
     # Common Lisp forms not in SLOP (ones we can't auto-transform)
-    'car': 'No car in SLOP. Use (@ list 0) for first element',
+    'car': 'No car in SLOP. Use (list-get list 0) for first element',
     'cdr': 'No cdr in SLOP. Use slice or iterate from index 1',
-    'first': 'No first in SLOP. Use (@ list 0)',
+    'first': 'No first in SLOP. Use (list-get list 0)',
     'rest': 'No rest in SLOP. Use slice or iterate from index 1',
     'cons': 'No cons in SLOP. Use (list ...) to create lists',
     'append': 'No append in SLOP. Build new list with for-each',
-    'reverse': 'No reverse in SLOP. Build reversed list with for loop',
-    'length': 'No length in SLOP. Use string-len for strings, track list length manually',
+    'length': 'Use string-len for strings, list-len for lists (both builtins)',
     'null?': 'No null? in SLOP. Use (== x nil) or (none? x) for Option',
     'nil?': 'No nil? in SLOP. Use (== x nil)',
     'empty?': 'No empty? in SLOP. Check length or use == nil',
@@ -842,6 +858,29 @@ def build_prompt(hole: Hole, context: Dict[str, Any], failed_attempts: List[tupl
         f"Type: {hole.type_expr}",
         f"Description: {hole.prompt}",
     ])
+
+    # Refactoring mode: existing code is provided to be improved/simplified
+    if hole.existing_code:
+        existing_code_str = pretty_print(hole.existing_code)
+        sections.extend([
+            "",
+            "## REFACTORING MODE",
+            "This hole contains EXISTING CODE that needs to be refactored.",
+            "Your task: Improve the code according to the description above.",
+            "",
+            "### Existing Code to Refactor:",
+            "```slop",
+            existing_code_str,
+            "```",
+            "",
+            "### Requirements:",
+            "1. The refactored code MUST have the same return type",
+            "2. The refactored code MUST preserve the same behavior/semantics",
+            "3. Apply the improvement described in the hole's description",
+            "4. You may restructure, simplify, or optimize the code",
+            "",
+            "Output the REFACTORED code only (not the original).",
+        ])
 
     if hole.constraints:
         sections.append("")

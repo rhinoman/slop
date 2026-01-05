@@ -1,0 +1,11 @@
+;; Test: Cond expressions - should transpile to chained if-else
+
+(fn main ()
+  (@intent "Test cond expression")
+  (@spec (() -> Int))
+  (let ((x 5))
+    (cond
+      ((< x 0) -1)
+      ((== x 0) 0)
+      ((> x 0) 1)
+      (else 42))))

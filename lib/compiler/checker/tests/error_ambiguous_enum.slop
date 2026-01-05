@@ -1,0 +1,9 @@
+;; Test: Ambiguous enum variants - should produce error
+;; Expected error: Ambiguous enum variant 'ok'
+
+(module error-ambiguous-enum
+  (export)
+
+  (type StatusA (enum ok error))
+  (type StatusB (enum ok fail))
+)

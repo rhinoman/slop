@@ -168,15 +168,21 @@ TOPICS = {
 
     'holes': """## Holes (LLM Generation Points)
 
-### Basic Syntax
+Holes support two modes: generation (new code) and refactoring (improve existing code).
+
+### Generation Mode (no existing code)
 (hole Type "prompt")
 
-### Full Form
 (hole Type "prompt"
   :complexity tier-2          ; tier-1 to tier-4
   :context (var1 fn1)         ; Whitelist of available identifiers
   :required (var1)            ; Identifiers that MUST appear in output
   :examples ((in) -> out))    ; Example behavior
+
+### Refactoring Mode (existing code provided)
+(hole Type "prompt"
+  existing-code               ; Code to refactor
+  :complexity tier-2)
 
 ### Complexity Tiers
 tier-1: 1-3B models   ; Trivial expressions, simple arithmetic
@@ -185,21 +191,31 @@ tier-3: 13-34B models ; Loops, moderate conditionals
 tier-4: 70B+ models   ; Complex algorithms, multi-step logic
 
 ### Examples
-; Simple hole
+
+; Generation: Simple hole
 (hole Int "calculate the sum of x and y"
   :context (x y))
 
-; Complex hole with constraints
+; Generation: Complex hole with constraints
 (hole (List Int) "sort the input list"
   :complexity tier-3
   :context (input compare)
   :required (input)
   :examples (((list 3 1 2)) -> (list 1 2 3)))
 
+; Refactoring: Simplify nested conditionals
+(hole Bool "simplify this logic"
+  (if (> x 0)
+    (if (> y 0) true false)
+    false)
+  :complexity tier-2)
+; Result: (and (> x 0) (> y 0))
+
 ### Best Practices
 ; Use :context to whitelist what the LLM can use
 ; Use :required for identifiers that MUST appear
 ; Match tier to actual complexity needed
+; For refactoring, existing code must type-check
 """,
 
     'memory': """## Memory Model
@@ -286,11 +302,13 @@ tier-4: 70B+ models   ; Complex algorithms, multi-step logic
 (string-eq a b) -> Bool
 (string-slice s start end) -> (Slice U8)
 (string-split arena s delim) -> (List String)
+(int-to-string arena n) -> String
 
 ### Lists
 (list-new arena Type) -> (List Type)
 (list Type e1 e2...) -> (List Type)     ; Literal
 (list-push list item) -> Unit
+(list-pop list) -> (Option T)
 (list-get list idx) -> (Option T)
 (list-len list) -> (Int 0 ..)
 (list-set list idx val) -> Unit
@@ -301,7 +319,8 @@ tier-4: 70B+ models   ; Complex algorithms, multi-step logic
 (map-put map k v) -> Unit
 (map-get map k) -> (Option V)
 (map-has map k) -> Bool
-(map-delete map k) -> Unit
+(map-keys map) -> (List K)
+(map-remove map k) -> Unit              ; Requires mutable map
 
 ### Results
 (ok val) -> (Result T E)
@@ -458,6 +477,93 @@ IMPORTANT: Quote error variants!
 
 (error 'not-found)     ; CORRECT: quoted
 (error not-found)      ; WRONG: undefined variable
+
+### Builtin vs Library Functions
+
+These string/list functions are BUILTINS - do NOT import from strlib:
+
+| Builtin (no import) | What it does |
+|---------------------|--------------|
+| `(string-len s)` | Get string length |
+| `(string-concat arena a b)` | Concatenate strings |
+| `(string-eq a b)` | Compare strings |
+| `(string-new arena cstr)` | Create string from C string |
+| `(string-slice s start end)` | Get substring slice |
+| `(string-split arena s delim)` | Split string |
+| `(int-to-string arena n)` | Convert int to string |
+| `(list-len list)` | Get list length |
+| `(list-get list idx)` | Get element at index |
+| `(list-push list item)` | Append to list |
+
+These ARE in strlib and need `(import strlib ...)`:
+
+| strlib function | What it does |
+|-----------------|--------------|
+| `starts-with`, `ends-with` | String prefix/suffix check |
+| `contains`, `index-of` | Substring search |
+| `trim`, `trim-start`, `trim-end` | Whitespace removal |
+| `substring`, `replace`, `replace-all` | String manipulation |
+| `to-upper`, `to-lower`, `capitalize` | Case conversion |
+| `parse-int`, `parse-float` | String to number |
+| `float-to-string` | Float to string |
+| `compare`, `compare-ignore-case` | String comparison |
+| `join`, `reverse`, `repeat` | Advanced operations |
+""",
+
+    'cli': """## CLI Reference
+
+### Commands
+
+| Command | Description |
+|---------|-------------|
+| `slop parse FILE` | Parse and display AST |
+| `slop check FILE` | Type check without transpiling |
+| `slop transpile FILE` | Convert to C source |
+| `slop build FILE` | Full pipeline: parse, check, transpile, compile |
+| `slop fill FILE` | Fill holes with LLM-generated code |
+| `slop verify FILE` | Verify contracts with Z3 |
+| `slop ref [TOPIC]` | Show language reference |
+| `slop doc FILE` | Generate documentation |
+
+### Native Components (--native flag)
+
+SLOP includes self-hosted compiler components written in SLOP. Use `--native` to use these instead of Python implementations:
+
+```bash
+slop parse FILE --native      # Use native parser
+slop check FILE --native      # Use native type checker
+slop build FILE --native      # Use native parser + transpiler
+```
+
+Native components are in `lib/compiler/`:
+- `slop-parser` - S-expression parser (outputs JSON AST)
+- `slop-checker` - Type checker with diagnostics
+- `slop-transpiler` - SLOP to C transpiler
+
+If a native component isn't found, falls back to Python.
+
+### Common Options
+
+| Option | Commands | Description |
+|--------|----------|-------------|
+| `-o, --output` | transpile, build | Output file path |
+| `-I, --include` | transpile, build | Add module search path |
+| `--native` | parse, check, build | Use native components |
+| `--debug` | build | Include debug symbols |
+| `--holes` | parse | Show only holes |
+| `-v, --verbose` | fill, verify | Increase verbosity |
+
+### Build Configuration
+
+With `slop.toml`, commands use project settings:
+
+```bash
+slop build                    # Uses [project].entry
+slop build --native           # Native components + config
+slop fill                     # Uses entry from config
+```
+
+See `slop.toml.example` for configuration options.
 """,
 }
 
@@ -473,6 +579,7 @@ TOPIC_ORDER = [
     'expressions',
     'patterns',
     'mistakes',
+    'cli',
 ]
 
 

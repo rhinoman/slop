@@ -1,0 +1,13 @@
+;; Test: Main module that imports from multi_lib
+
+(module multi-main
+  (import multi-lib (Point make-point point-add))
+
+  (fn main ()
+    (@intent "Test multi-module import")
+    (@spec (() -> Int))
+    (let ((p1 (make-point 10 20))
+          (p2 (make-point 5 7))
+          (sum (point-add p1 p2)))
+      (+ sum.x sum.y)))
+)

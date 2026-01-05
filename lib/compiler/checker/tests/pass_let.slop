@@ -1,0 +1,27 @@
+;; Test: Let bindings - should pass with no errors
+
+(module pass-let
+  (export test-let test-let-chain test-mut)
+
+  (fn test-let ((x Int))
+    (@intent "Test basic let bindings")
+    (@spec ((Int) -> Int))
+    (let ((y 5)
+          (z 10))
+      (+ x (+ y z))))
+
+  (fn test-let-chain ((x Int))
+    (@intent "Test sequential let bindings where later vars reference earlier ones")
+    (@spec ((Int) -> Int))
+    (let ((a x)
+          (b (+ a 1))
+          (c (+ b 1)))
+      c))
+
+  (fn test-mut ((start Int))
+    (@intent "Test mutable let bindings")
+    (@spec ((Int) -> Int))
+    (let ((mut count start))
+      (set! count (+ count 1))
+      count))
+)

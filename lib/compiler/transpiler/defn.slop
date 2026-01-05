@@ -1,0 +1,908 @@
+;; ============================================================
+;; SLOP Transpiler - Definition Transpilation
+;;
+;; Handle top-level definitions: functions, types, constants,
+;; and FFI declarations.
+;; ============================================================
+
+(module defn
+  (export
+    ;; Function definitions
+    transpile-function emit-forward-decl
+    ;; Type definitions
+    transpile-type
+    ;; Constants
+    transpile-const
+    ;; FFI
+    register-ffi register-ffi-struct
+    ;; Contract extraction
+    extract-return-type extract-contracts
+    ;; Helper types
+    ContractInfo)
+
+  (import parser (SExpr SExprList SExprSymbol SExprString is-form
+                  sexpr-line sexpr-col pretty-print))
+
+  ;; Helper type for contract extraction results
+  (type ContractInfo (record
+    (pre (List (Ptr SExpr)))
+    (post (List (Ptr SExpr)))
+    (intent (Option String))
+    (pure Bool)
+    (alloc (Option String))))
+  (import context (TranspileContext
+                   ctx-register-type ctx-lookup-type
+                   ctx-register-function ctx-register-enum-value
+                   ctx-register-fields ctx-register-variants
+                   ctx-register-ffi-func ctx-register-ffi-struct
+                   ctx-add-include
+                   ctx-set-return-type
+                   ctx-push-scope ctx-pop-scope ctx-register-var))
+  (import transpiler-types (CTypeInfo CRangeInfo CFieldInfo CVariantInfo
+                            FuncEntry FFIFuncEntry FFIStructEntry VarEntry))
+  (import emit (Emitter emit emit-line emit-blank indent dedent
+                emit-block-start emit-block-end))
+  (import stmt (transpile-stmt))
+  (import expr (transpile-expr))
+  (import ctype (to-c-type get-range-bounds select-int-type
+                 is-pointer-type is-void-type))
+  (import names (to-c-name to-qualified-name to-qualified-type-name))
+
+  ;; ============================================================
+  ;; Local Helpers
+  ;; ============================================================
+
+  (fn is-contract-form ((expr (Ptr SExpr)))
+    (@intent "Check if expression is a contract annotation (@spec, @pre, etc)")
+    (@spec (((Ptr SExpr)) -> Bool))
+    (@pre (!= expr nil))
+    (@pure)
+    (or (is-form expr "@spec")
+        (is-form expr "@intent")
+        (is-form expr "@pre")
+        (is-form expr "@post")
+        (is-form expr "@pure")
+        (is-form expr "@alloc")))
+
+  (fn find-form ((items (List (Ptr SExpr))) (name String))
+    (@intent "Find a form with given name in list of forms")
+    (@spec (((List (Ptr SExpr)) String) -> (Option (Ptr SExpr))))
+    (@pure)
+    (let ((len (list-len items))
+          (mut result (none)))
+      (do
+        (for (i 0 len)
+          (match (list-get items i)
+            ((some elem)
+              (if (is-form elem name)
+                (set! result (some elem))
+                (do)))
+            ((none) (do))))
+        result)))
+
+  (fn list-last ((items (List (Ptr SExpr))))
+    (@intent "Get last element of list")
+    (@spec (((List (Ptr SExpr))) -> (Option (Ptr SExpr))))
+    (@pure)
+    (let ((len (list-len items)))
+      (if (> len 0)
+        (list-get items (- len 1))
+        (none))))
+
+  (fn form-arg ((form (Ptr SExpr)) (n Int))
+    (@intent "Get nth argument of a form (0-indexed, skipping the form name)")
+    (@spec (((Ptr SExpr) Int) -> (Option (Ptr SExpr))))
+    (@pre (!= form nil))
+    (@pure)
+    (match (deref form)
+      ((list lst) (list-get (. lst items) (+ n 1)))
+      (_ (none))))
+
+  (fn is-integer-type ((type-expr (Ptr SExpr)))
+    (@intent "Check if type is an integer type (Int, I8, I16, etc)")
+    (@spec (((Ptr SExpr)) -> Bool))
+    (@pre (!= type-expr nil))
+    (@pure)
+    (match (deref type-expr)
+      ((symbol sym)
+        (let ((n (. sym name)))
+          (or (string-eq n "Int")
+              (string-eq n "I8") (string-eq n "I16")
+              (string-eq n "I32") (string-eq n "I64")
+              (string-eq n "U8") (string-eq n "U16")
+              (string-eq n "U32") (string-eq n "U64"))))
+      ((list lst)
+        ;; Range type (Int min .. max) is also integer
+        (is-form type-expr "Int"))
+      (_ false)))
+
+  (fn emit-param-list ((ctx (Ptr TranspileContext)) (em (Ptr Emitter))
+                       (params (List (Ptr SExpr))))
+    (@intent "Emit comma-separated parameter list")
+    (@spec (((Ptr TranspileContext) (Ptr Emitter) (List (Ptr SExpr))) -> Unit))
+    (@pre (!= ctx nil))
+    (@pre (!= em nil))
+    (let ((len (list-len params)))
+      (if (== len 0)
+        (emit em "void")
+        (for (i 0 len)
+          (match (list-get params i)
+            ((some param-expr)
+              (do
+                (emit-param ctx em param-expr)
+                (when (< i (- len 1))
+                  (emit em ", "))))
+            ((none) (do)))))))
+
+  (fn emit-param ((ctx (Ptr TranspileContext)) (em (Ptr Emitter))
+                  (param (Ptr SExpr)))
+    (@intent "Emit single parameter: type name")
+    (@spec (((Ptr TranspileContext) (Ptr Emitter) (Ptr SExpr)) -> Unit))
+    (@pre (!= ctx nil))
+    (@pre (!= em nil))
+    (@pre (!= param nil))
+    ;; param is ((name Type)) form
+    (let ((arena (. (deref ctx) arena)))
+      (match (deref param)
+        ((list lst)
+          (let ((items (. lst items)))
+            (match (list-get items 0)
+              ((some name-expr)
+                (match (deref name-expr)
+                  ((symbol sym)
+                    (match (list-get items 1)
+                      ((some type-expr)
+                        (let ((c-type (to-c-type ctx type-expr))
+                              (c-name (to-c-name arena (. sym name))))
+                          (emit em (string-concat arena c-type (string-concat arena " " c-name)))))
+                      ((none) (do))))
+                  (_ (do))))
+              ((none) (do)))))
+        (_ (do)))))
+
+  ;; ============================================================
+  ;; Function Definition
+  ;; ============================================================
+
+  (fn transpile-function ((ctx (Ptr TranspileContext)) (em (Ptr Emitter))
+                          (form (Ptr SExpr)))
+    (@intent "Transpile function definition to C")
+    (@spec (((Ptr TranspileContext) (Ptr Emitter) (Ptr SExpr)) -> Unit))
+    (@pre (!= ctx nil))
+    (@pre (!= em nil))
+    (@pre (!= form nil))
+    (@pre (is-form form "fn"))
+    (let ((arena (. (deref ctx) arena))
+          (name (get-function-name form))
+          (params (get-function-params arena form))
+          (return-type (extract-return-type form))
+          (contracts (extract-contracts arena form))
+          (body (get-function-body arena form)))
+      ;; Set return type for inference in body
+      (ctx-set-return-type ctx (match return-type
+                                  ((some rt) (some (to-c-type ctx rt)))
+                                  ((none) none)))
+
+      ;; Emit signature
+      (emit-function-signature ctx em name params return-type " {")
+      (indent em)
+
+      ;; Emit precondition checks
+      (emit-preconditions ctx em (. contracts pre))
+
+      ;; Push scope and register parameters
+      (ctx-push-scope ctx)
+      (register-parameters ctx params)
+
+      ;; Emit body
+      (emit-function-body ctx em body)
+
+      ;; Emit postcondition checks (only if non-void)
+      (emit-postconditions ctx em (. contracts post) return-type)
+
+      (ctx-pop-scope ctx)
+      (dedent em)
+      (emit-line em "}")
+      (emit-blank em)
+
+      ;; Clear return type
+      (ctx-set-return-type ctx none)))
+
+  (fn emit-forward-decl ((ctx (Ptr TranspileContext)) (em (Ptr Emitter))
+                         (form (Ptr SExpr)))
+    (@intent "Emit function forward declaration")
+    (@spec (((Ptr TranspileContext) (Ptr Emitter) (Ptr SExpr)) -> Unit))
+    (@pre (!= ctx nil))
+    (@pre (!= em nil))
+    (@pre (!= form nil))
+    (@pre (is-form form "fn"))
+    (let ((arena (. (deref ctx) arena))
+          (name (get-function-name form))
+          (params (get-function-params arena form))
+          (return-type (extract-return-type form)))
+      (emit-function-signature ctx em name params return-type ";")))
+
+  (fn emit-function-signature ((ctx (Ptr TranspileContext)) (em (Ptr Emitter))
+                               (name String) (params (List (Ptr SExpr)))
+                               (return-type (Option (Ptr SExpr))) (suffix String))
+    (@intent "Emit function signature with suffix (e.g. \" {\" or \";\")")
+    (@spec (((Ptr TranspileContext) (Ptr Emitter) String (List (Ptr SExpr))
+             (Option (Ptr SExpr)) String) -> Unit))
+    (@pre (!= ctx nil))
+    (@pre (!= em nil))
+    ;; Format: return_type function_name(param1_type param1_name, ...)suffix
+    ;; Build as single string to avoid newlines between parts
+    (let ((arena (. (deref ctx) arena))
+          (ret-str (match return-type
+                     ((some rt) (to-c-type ctx rt))
+                     ((none) "void")))
+          (c-name (to-qualified-name arena ctx name))
+          (params-str (build-params-string ctx params)))
+      (emit-line em (string-concat arena ret-str
+                      (string-concat arena " "
+                        (string-concat arena c-name
+                          (string-concat arena "("
+                            (string-concat arena params-str
+                              (string-concat arena ")" suffix)))))))))
+
+  (fn build-params-string ((ctx (Ptr TranspileContext)) (params (List (Ptr SExpr))))
+    (@intent "Build comma-separated parameter string")
+    (@spec (((Ptr TranspileContext) (List (Ptr SExpr))) -> String))
+    (@pre (!= ctx nil))
+    (let ((arena (. (deref ctx) arena))
+          (len (list-len params)))
+      (if (== len 0)
+        "void"
+        (let ((mut result ""))
+          (do
+            (for (i 0 len)
+              (match (list-get params i)
+                ((some param-expr)
+                  (let ((param-str (build-param-string ctx param-expr)))
+                    (if (== i 0)
+                      (set! result param-str)
+                      (set! result (string-concat arena result (string-concat arena ", " param-str))))))
+                ((none) (do))))
+            result)))))
+
+  (fn build-param-string ((ctx (Ptr TranspileContext)) (param (Ptr SExpr)))
+    (@intent "Build single parameter string: type name")
+    (@spec (((Ptr TranspileContext) (Ptr SExpr)) -> String))
+    (@pre (!= ctx nil))
+    (@pre (!= param nil))
+    (let ((arena (. (deref ctx) arena)))
+      (match (deref param)
+        ((list lst)
+          (let ((items (. lst items)))
+            (match (list-get items 0)
+              ((some name-expr)
+                (match (deref name-expr)
+                  ((symbol sym)
+                    (match (list-get items 1)
+                      ((some type-expr)
+                        (let ((c-type (to-c-type ctx type-expr))
+                              (c-name (to-c-name arena (. sym name))))
+                          (string-concat arena c-type (string-concat arena " " c-name))))
+                      ((none) "")))
+                  (_ "")))
+              ((none) ""))))
+        (_ ""))))
+
+  (fn emit-preconditions ((ctx (Ptr TranspileContext)) (em (Ptr Emitter))
+                          (preconditions (List (Ptr SExpr))))
+    (@intent "Emit SLOP_PRE checks for preconditions")
+    (@spec (((Ptr TranspileContext) (Ptr Emitter) (List (Ptr SExpr))) -> Unit))
+    (@pre (!= ctx nil))
+    (@pre (!= em nil))
+    (let ((arena (. (deref ctx) arena))
+          (len (list-len preconditions)))
+      (for (i 0 len)
+        (match (list-get preconditions i)
+          ((some cond-expr)
+            (let ((cond-c (transpile-expr ctx cond-expr (none)))
+                  (msg (pretty-print arena cond-expr)))
+              (emit-line em (string-concat arena "SLOP_PRE("
+                              (string-concat arena cond-c
+                                (string-concat arena ", \""
+                                  (string-concat arena msg "\");")))))))
+          ((none) (do))))))
+
+  (fn emit-postconditions ((ctx (Ptr TranspileContext)) (em (Ptr Emitter))
+                           (postconditions (List (Ptr SExpr)))
+                           (return-type (Option (Ptr SExpr))))
+    (@intent "Emit SLOP_POST checks for postconditions")
+    (@spec (((Ptr TranspileContext) (Ptr Emitter) (List (Ptr SExpr))
+             (Option (Ptr SExpr))) -> Unit))
+    (@pre (!= ctx nil))
+    (@pre (!= em nil))
+    ;; Postconditions reference $result which is the return value
+    ;; Only emit if there's a non-void return type and there are postconditions
+    (let ((len (list-len postconditions)))
+      (if (== len 0)
+        (do)
+        (match return-type
+          ((some rt)
+            (if (is-void-type rt)
+              (do)  ;; No postconditions for void functions
+              (let ((arena (. (deref ctx) arena)))
+                (for (i 0 len)
+                  (match (list-get postconditions i)
+                    ((some cond-expr)
+                      (let ((cond-c (transpile-expr ctx cond-expr (none)))
+                            (msg (pretty-print arena cond-expr)))
+                        (emit-line em (string-concat arena "SLOP_POST("
+                                        (string-concat arena cond-c
+                                          (string-concat arena ", \""
+                                            (string-concat arena msg "\");")))))))
+                    ((none) (do)))))))
+          ((none) (do))))))
+
+  (fn emit-function-body ((ctx (Ptr TranspileContext)) (em (Ptr Emitter))
+                          (body (List (Ptr SExpr))))
+    (@intent "Emit function body statements")
+    (@spec (((Ptr TranspileContext) (Ptr Emitter) (List (Ptr SExpr))) -> Unit))
+    (@pre (!= ctx nil))
+    (@pre (!= em nil))
+    (let ((len (list-len body)))
+      (for (i 0 len)
+        (match (list-get body i)
+          ((some stmt)
+            ;; Mark last statement for return
+            (let ((is-last (== i (- len 1))))
+              (transpile-stmt ctx em stmt is-last)))
+          ((none) (do))))))
+
+  (fn register-parameters ((ctx (Ptr TranspileContext)) (params (List (Ptr SExpr))))
+    (@intent "Register function parameters in current scope")
+    (@spec (((Ptr TranspileContext) (List (Ptr SExpr))) -> Unit))
+    (@pre (!= ctx nil))
+    (let ((len (list-len params)))
+      (for (i 0 len)
+        (match (list-get params i)
+          ((some param-expr)
+            ;; Each param is (name Type)
+            (match (deref param-expr)
+              ((list lst)
+                (let ((items (. lst items)))
+                  (match (list-get items 0)
+                    ((some name-expr)
+                      (match (deref name-expr)
+                        ((symbol sym)
+                          (match (list-get items 1)
+                            ((some type-expr)
+                              (let ((arena (. (deref ctx) arena))
+                                    (name (. sym name))
+                                    (c-name (to-c-name arena name))
+                                    (c-type (to-c-type ctx type-expr))
+                                    (is-ptr (is-pointer-type type-expr)))
+                                ;; Parameters are immutable by default
+                                (ctx-register-var ctx (VarEntry name c-name c-type is-ptr false))))
+                            ((none) (do))))
+                        (_ (do))))
+                    ((none) (do)))))
+              (_ (do))))
+          ((none) (do))))))
+
+  ;; ============================================================
+  ;; Contract Extraction
+  ;; ============================================================
+
+  (fn extract-return-type ((form (Ptr SExpr)))
+    (@intent "Extract return type from @spec annotation")
+    (@spec (((Ptr SExpr)) -> (Option (Ptr SExpr))))
+    (@pre (!= form nil))
+    (@pure)
+    ;; @spec has form: (@spec ((ParamTypes...) -> ReturnType))
+    ;; Return type is the last element after ->
+    ;; Search through form elements to find @spec
+    (match (deref form)
+      ((list lst)
+        (let ((items (. lst items))
+              (len (list-len items))
+              (mut result (none)))
+          (do
+            (for (i 0 len)
+              (match (list-get items i)
+                ((some elem)
+                  (if (is-form elem "@spec")
+                    ;; Found @spec, extract signature's last element
+                    (match (form-arg elem 0)
+                      ((some sig-expr)
+                        (match (deref sig-expr)
+                          ((list sig-lst)
+                            (let ((sig-items (. sig-lst items))
+                                  (sig-len (list-len sig-items)))
+                              (if (> sig-len 0)
+                                (set! result (list-get sig-items (- sig-len 1)))
+                                (do))))
+                          (_ (do))))
+                      ((none) (do)))
+                    (do)))
+                ((none) (do))))
+            result)))
+      (_ (none))))
+
+  (fn extract-contracts ((arena Arena) (form (Ptr SExpr)))
+    (@intent "Extract all contract annotations from function")
+    (@spec ((Arena (Ptr SExpr)) -> ContractInfo))
+    (@pre (!= form nil))
+    (@alloc arena)
+    (match (deref form)
+      ((list lst)
+        (let ((items (. lst items))
+              (len (list-len items))
+              (pre-list (list-new arena (Ptr SExpr)))
+              (post-list (list-new arena (Ptr SExpr)))
+              (mut intent-val (Option String) (none))
+              (mut pure-val false)
+              (mut alloc-val (Option String) (none)))
+          (do
+            ;; Iterate through form elements looking for contracts
+            (for (i 0 len)
+              (match (list-get items i)
+                ((some elem)
+                  (match (deref elem)
+                    ((list inner)
+                      (match (list-get (. inner items) 0)
+                        ((some head)
+                          (match (deref head)
+                            ((symbol s)
+                              (let ((name (. s name)))
+                                (cond
+                                  ((string-eq name "@pre")
+                                    (match (list-get (. inner items) 1)
+                                      ((some cond-expr) (list-push pre-list cond-expr))
+                                      ((none) (do))))
+                                  ((string-eq name "@post")
+                                    (match (list-get (. inner items) 1)
+                                      ((some cond-expr) (list-push post-list cond-expr))
+                                      ((none) (do))))
+                                  ((string-eq name "@intent")
+                                    (match (list-get (. inner items) 1)
+                                      ((some str-expr)
+                                        (match (deref str-expr)
+                                          ((string str) (set! intent-val (some (. str value))))
+                                          (_ (do))))
+                                      ((none) (do))))
+                                  ((string-eq name "@pure")
+                                    (set! pure-val true))
+                                  ((string-eq name "@alloc")
+                                    (match (list-get (. inner items) 1)
+                                      ((some alloc-expr)
+                                        (match (deref alloc-expr)
+                                          ((symbol sym) (set! alloc-val (some (. sym name))))
+                                          (_ (do))))
+                                      ((none) (do))))
+                                  (else (do)))))
+                            (_ (do))))
+                        ((none) (do))))
+                    (_ (do))))
+                ((none) (do))))
+            (ContractInfo pre-list post-list intent-val pure-val alloc-val))))
+      (_ (ContractInfo (list-new arena (Ptr SExpr)) (list-new arena (Ptr SExpr)) (none) false (none)))))
+
+  ;; ============================================================
+  ;; Function Extraction Helpers
+  ;; ============================================================
+
+  (fn get-function-name ((form (Ptr SExpr)))
+    (@intent "Extract function name from fn form")
+    (@spec (((Ptr SExpr)) -> String))
+    (@pre (!= form nil))
+    (@pure)
+    ;; (fn NAME ((params)) ...)
+    (match (deref form)
+      ((list lst)
+        (match (list-get (. lst items) 1)
+          ((some name-expr)
+            (match (deref name-expr)
+              ((symbol sym) (. sym name))
+              (_ "")))
+          ((none) "")))
+      (_ "")))
+
+  (fn get-function-params ((arena Arena) (form (Ptr SExpr)))
+    (@intent "Extract parameter list from fn form")
+    (@spec ((Arena (Ptr SExpr)) -> (List (Ptr SExpr))))
+    (@pre (!= form nil))
+    (@alloc arena)
+    ;; (fn name ((param1 Type1) (param2 Type2)) ...)
+    (match (deref form)
+      ((list lst)
+        (match (list-get (. lst items) 2)
+          ((some params-expr)
+            (match (deref params-expr)
+              ((list params-lst) (. params-lst items))
+              (_ (list-new arena (Ptr SExpr)))))
+          ((none) (list-new arena (Ptr SExpr)))))
+      (_ (list-new arena (Ptr SExpr)))))
+
+  (fn get-function-body ((arena Arena) (form (Ptr SExpr)))
+    (@intent "Extract body forms from fn form (after contracts)")
+    (@spec ((Arena (Ptr SExpr)) -> (List (Ptr SExpr))))
+    (@pre (!= form nil))
+    (@alloc arena)
+    ;; Skip name, params, and all @ annotations
+    (match (deref form)
+      ((list lst)
+        (let ((items (. lst items))
+              (len (list-len items))
+              (body-forms (list-new arena (Ptr SExpr))))
+          (do
+            (for (i 3 len)
+              (match (list-get items i)
+                ((some elem)
+                  (if (is-contract-form elem)
+                    (do)
+                    (list-push body-forms elem)))
+                ((none) (do))))
+            body-forms)))
+      (_ (list-new arena (Ptr SExpr)))))
+
+  ;; ============================================================
+  ;; Type Definition
+  ;; ============================================================
+
+  (fn transpile-type ((ctx (Ptr TranspileContext)) (em (Ptr Emitter))
+                      (form (Ptr SExpr)))
+    (@intent "Transpile type definition")
+    (@spec (((Ptr TranspileContext) (Ptr Emitter) (Ptr SExpr)) -> Unit))
+    (@pre (!= ctx nil))
+    (@pre (!= em nil))
+    (@pre (!= form nil))
+    (@pre (is-form form "type"))
+    ;; (type Name TypeExpr)
+    (let ((name (get-type-name form))
+          (type-expr (get-type-expr form)))
+      (cond
+        ((is-form type-expr "record")
+          (transpile-record ctx em name type-expr))
+        ((is-form type-expr "enum")
+          (transpile-enum ctx em name type-expr))
+        ((is-form type-expr "union")
+          (transpile-union ctx em name type-expr))
+        ;; Range type: (Int min .. max)
+        ((is-form type-expr "Int")
+          (transpile-range-type ctx em name type-expr))
+        ;; Type alias (for Option, Result, List, Map)
+        (else
+          (transpile-type-alias ctx em name type-expr)))))
+
+  (fn transpile-record ((ctx (Ptr TranspileContext)) (em (Ptr Emitter))
+                        (name String) (type-expr (Ptr SExpr)))
+    (@intent "Transpile record type to C struct")
+    (@spec (((Ptr TranspileContext) (Ptr Emitter) String (Ptr SExpr)) -> Unit))
+    (@pre (!= ctx nil))
+    (@pre (!= em nil))
+    (@pre (!= type-expr nil))
+    (let ((arena (. (deref ctx) arena))
+          (c-name (to-qualified-type-name arena ctx name)))
+      ;; struct name { fields }; typedef struct name name;
+      (do
+        (emit-line em (string-concat arena "typedef struct "
+                        (string-concat arena c-name " {"))))
+        (indent em)
+        ;; Emit each field: (field-name Type) -> Type field_name;
+        (match (deref type-expr)
+          ((list lst)
+            (let ((items (. lst items))
+                  (len (list-len items)))
+              (for (i 1 len)
+                (match (list-get items i)
+                  ((some field-form)
+                    (match (deref field-form)
+                      ((list field-lst)
+                        (let ((field-items (. field-lst items)))
+                          (match (list-get field-items 0)
+                            ((some field-name-expr)
+                              (match (deref field-name-expr)
+                                ((symbol sym)
+                                  (match (list-get field-items 1)
+                                    ((some field-type-expr)
+                                      (let ((field-c-type (to-c-type ctx field-type-expr))
+                                            (field-c-name (to-c-name arena (. sym name))))
+                                        (emit-line em (string-concat arena field-c-type
+                                                        (string-concat arena " "
+                                                          (string-concat arena field-c-name ";"))))))
+                                    ((none) (do))))
+                                (_ (do))))
+                            ((none) (do)))))
+                      (_ (do))))
+                  ((none) (do))))))
+          (_ (do)))
+        (dedent em)
+        (emit-line em (string-concat arena "} " (string-concat arena c-name ";")))
+        (emit-blank em)))
+
+  (fn transpile-enum ((ctx (Ptr TranspileContext)) (em (Ptr Emitter))
+                      (name String) (type-expr (Ptr SExpr)))
+    (@intent "Transpile simple enum type")
+    (@spec (((Ptr TranspileContext) (Ptr Emitter) String (Ptr SExpr)) -> Unit))
+    (@pre (!= ctx nil))
+    (@pre (!= em nil))
+    (@pre (!= type-expr nil))
+    (let ((arena (. (deref ctx) arena))
+          (c-name (to-qualified-type-name arena ctx name)))
+      ;; typedef enum { NAME_val1, NAME_val2, ... } Name;
+      (do
+        (emit-line em (string-concat arena "typedef enum " (string-concat arena c-name " {")))
+        (indent em)
+        (match (deref type-expr)
+          ((list lst)
+            (let ((items (. lst items))
+                  (len (list-len items)))
+              (for (i 1 len)
+                (match (list-get items i)
+                  ((some variant-expr)
+                    (match (deref variant-expr)
+                      ((symbol sym)
+                        (let ((variant-name (. sym name))
+                              (qualified (string-concat arena c-name
+                                            (string-concat arena "_"
+                                              (to-c-name arena variant-name)))))
+                          (do
+                            (ctx-register-enum-value ctx variant-name qualified)
+                            (emit-line em (string-concat arena qualified
+                                            (if (< i (- len 1)) "," ""))))))
+                      (_ (do))))
+                  ((none) (do))))))
+          (_ (do)))
+        (dedent em)
+        (emit-line em (string-concat arena "} " (string-concat arena c-name ";")))
+        (emit-blank em))))
+
+  (fn transpile-union ((ctx (Ptr TranspileContext)) (em (Ptr Emitter))
+                       (name String) (type-expr (Ptr SExpr)))
+    (@intent "Transpile tagged union type")
+    (@spec (((Ptr TranspileContext) (Ptr Emitter) String (Ptr SExpr)) -> Unit))
+    (@pre (!= ctx nil))
+    (@pre (!= em nil))
+    (@pre (!= type-expr nil))
+    (let ((arena (. (deref ctx) arena))
+          (c-name (to-qualified-type-name arena ctx name)))
+      ;; struct Name { enum { TAG_v1, TAG_v2 } tag; union { T1 v1; T2 v2; } data; };
+      (do
+        (emit-line em (string-concat arena "typedef struct " (string-concat arena c-name " {")))
+        (indent em)
+        ;; Emit tag enum
+        (emit-line em "enum {")
+        (indent em)
+        (match (deref type-expr)
+          ((list lst)
+            (let ((items (. lst items))
+                  (len (list-len items)))
+              (for (i 1 len)
+                (match (list-get items i)
+                  ((some variant-form)
+                    (match (deref variant-form)
+                      ((list vlist)
+                        (match (list-get (. vlist items) 0)
+                          ((some vname-expr)
+                            (match (deref vname-expr)
+                              ((symbol vsym)
+                                (let ((vname (. vsym name))
+                                      (tag (string-concat arena c-name
+                                              (string-concat arena "_TAG_" (to-c-name arena vname)))))
+                                  (emit-line em (string-concat arena tag
+                                                  (if (< i (- len 1)) "," "")))))
+                              (_ (do))))
+                          ((none) (do))))
+                      (_ (do))))
+                  ((none) (do))))))
+          (_ (do)))
+        (dedent em)
+        (emit-line em "} tag;")
+        ;; Emit data union
+        (emit-line em "union {")
+        (indent em)
+        (match (deref type-expr)
+          ((list lst)
+            (let ((items (. lst items))
+                  (len (list-len items)))
+              (for (i 1 len)
+                (match (list-get items i)
+                  ((some variant-form)
+                    (match (deref variant-form)
+                      ((list vlist)
+                        (let ((vitems (. vlist items)))
+                          (match (list-get vitems 0)
+                            ((some vname-expr)
+                              (match (deref vname-expr)
+                                ((symbol vsym)
+                                  (match (list-get vitems 1)
+                                    ((some vtype-expr)
+                                      (let ((vc-type (to-c-type ctx vtype-expr))
+                                            (vc-name (to-c-name arena (. vsym name))))
+                                        (emit-line em (string-concat arena vc-type
+                                                        (string-concat arena " "
+                                                          (string-concat arena vc-name ";"))))))
+                                    ((none) (do))))
+                                (_ (do))))
+                            ((none) (do)))))
+                      (_ (do))))
+                  ((none) (do))))))
+          (_ (do)))
+        (dedent em)
+        (emit-line em "} data;")
+        (dedent em)
+        (emit-line em (string-concat arena "} " (string-concat arena c-name ";")))
+        (emit-blank em))))
+
+  (fn transpile-range-type ((ctx (Ptr TranspileContext)) (em (Ptr Emitter))
+                            (name String) (type-expr (Ptr SExpr)))
+    (@intent "Transpile range type with bounds-checking constructor")
+    (@spec (((Ptr TranspileContext) (Ptr Emitter) String (Ptr SExpr)) -> Unit))
+    (@pre (!= ctx nil))
+    (@pre (!= em nil))
+    (@pre (!= type-expr nil))
+    (let ((arena (. (deref ctx) arena))
+          (bounds (get-range-bounds type-expr))
+          (c-base (select-int-type (. bounds has-min) (. bounds min-val)
+                                   (. bounds has-max) (. bounds max-val)))
+          (c-name (to-qualified-type-name arena ctx name)))
+      ;; typedef base_type Name;
+      (do
+        (emit-line em (string-concat arena "typedef " (string-concat arena c-base
+                        (string-concat arena " " (string-concat arena c-name ";")))))
+        (emit-blank em))))
+
+  (fn transpile-type-alias ((ctx (Ptr TranspileContext)) (em (Ptr Emitter))
+                            (name String) (type-expr (Ptr SExpr)))
+    (@intent "Transpile type alias (typedef)")
+    (@spec (((Ptr TranspileContext) (Ptr Emitter) String (Ptr SExpr)) -> Unit))
+    (@pre (!= ctx nil))
+    (@pre (!= em nil))
+    (@pre (!= type-expr nil))
+    (let ((arena (. (deref ctx) arena))
+          (c-name (to-qualified-type-name arena ctx name))
+          (c-type (to-c-type ctx type-expr)))
+      ;; Emit typedef and register
+      (do
+        (emit-line em (string-concat arena "typedef " (string-concat arena c-type
+                        (string-concat arena " " (string-concat arena c-name ";")))))
+        (emit-blank em))))
+
+  (fn get-type-name ((form (Ptr SExpr)))
+    (@intent "Extract type name from type form")
+    (@spec (((Ptr SExpr)) -> String))
+    (@pre (!= form nil))
+    (@pure)
+    ;; (type NAME expr)
+    (match (deref form)
+      ((list lst)
+        (match (list-get (. lst items) 1)
+          ((some name-expr)
+            (match (deref name-expr)
+              ((symbol sym) (. sym name))
+              (_ "")))
+          ((none) "")))
+      (_ "")))
+
+  (fn get-type-expr ((form (Ptr SExpr)))
+    (@intent "Extract type expression from type form")
+    (@spec (((Ptr SExpr)) -> (Ptr SExpr)))
+    (@pre (!= form nil))
+    (@pure)
+    ;; (type name EXPR)
+    (match (deref form)
+      ((list lst)
+        (match (list-get (. lst items) 2)
+          ((some expr) expr)
+          ((none) (cast (Ptr SExpr) nil))))
+      (_ (cast (Ptr SExpr) nil))))
+
+  ;; ============================================================
+  ;; Constant Definition
+  ;; ============================================================
+
+  (fn transpile-const ((ctx (Ptr TranspileContext)) (em (Ptr Emitter))
+                       (form (Ptr SExpr)))
+    (@intent "Transpile constant definition")
+    (@spec (((Ptr TranspileContext) (Ptr Emitter) (Ptr SExpr)) -> Unit))
+    (@pre (!= ctx nil))
+    (@pre (!= em nil))
+    (@pre (!= form nil))
+    (@pre (is-form form "const"))
+    ;; (const NAME Type value)
+    (let ((arena (. (deref ctx) arena))
+          (name (get-const-name form))
+          (type-expr (get-const-type form))
+          (value-expr (get-const-value form))
+          (c-name (to-c-name arena name))
+          (c-type (to-c-type ctx type-expr))
+          (c-value (transpile-expr ctx value-expr (none))))
+      ;; Use #define for integer constants, static const for others
+      (if (is-integer-type type-expr)
+        (emit-line em (string-concat arena "#define " (string-concat arena c-name
+                        (string-concat arena " (" (string-concat arena c-value ")")))))
+        (emit-line em (string-concat arena "static const " (string-concat arena c-type
+                        (string-concat arena " " (string-concat arena c-name
+                          (string-concat arena " = " (string-concat arena c-value ";"))))))))))
+
+  (fn get-const-name ((form (Ptr SExpr)))
+    (@intent "Extract constant name")
+    (@spec (((Ptr SExpr)) -> String))
+    (@pre (!= form nil))
+    (@pure)
+    (match (deref form)
+      ((list lst)
+        (match (list-get (. lst items) 1)
+          ((some name-expr)
+            (match (deref name-expr)
+              ((symbol sym) (. sym name))
+              (_ "")))
+          ((none) "")))
+      (_ "")))
+
+  (fn get-const-type ((form (Ptr SExpr)))
+    (@intent "Extract constant type expression")
+    (@spec (((Ptr SExpr)) -> (Ptr SExpr)))
+    (@pre (!= form nil))
+    (@pure)
+    (match (deref form)
+      ((list lst)
+        (match (list-get (. lst items) 2)
+          ((some expr) expr)
+          ((none) (cast (Ptr SExpr) nil))))
+      (_ (cast (Ptr SExpr) nil))))
+
+  (fn get-const-value ((form (Ptr SExpr)))
+    (@intent "Extract constant value expression")
+    (@spec (((Ptr SExpr)) -> (Ptr SExpr)))
+    (@pre (!= form nil))
+    (@pure)
+    (match (deref form)
+      ((list lst)
+        (match (list-get (. lst items) 3)
+          ((some expr) expr)
+          ((none) (cast (Ptr SExpr) nil))))
+      (_ (cast (Ptr SExpr) nil))))
+
+  ;; ============================================================
+  ;; FFI Registration
+  ;; ============================================================
+
+  (fn register-ffi ((ctx (Ptr TranspileContext)) (form (Ptr SExpr)))
+    (@intent "Register FFI function declarations (no code emitted)")
+    (@spec (((Ptr TranspileContext) (Ptr SExpr)) -> Unit))
+    (@pre (!= ctx nil))
+    (@pre (!= form nil))
+    (@pre (is-form form "ffi"))
+    ;; (ffi "header.h" (func ((param Type)) RetType) ...)
+    (match (deref form)
+      ((list lst)
+        (let ((items (. lst items))
+              (len (list-len items)))
+          ;; First arg is header string
+          (match (list-get items 1)
+            ((some header-expr)
+              (match (deref header-expr)
+                ((string str)
+                  (ctx-add-include ctx (. str value)))
+                (_ (do))))
+            ((none) (do)))
+          ;; Rest are function declarations - register each
+          (for (i 2 len)
+            (match (list-get items i)
+              ((some func-form)
+                ;; Each func-form is (func-name ((params)) RetType)
+                (do))  ;; FFI registration is complex - skip for now
+              ((none) (do))))))
+      (_ (do))))
+
+  (fn register-ffi-struct ((ctx (Ptr TranspileContext)) (form (Ptr SExpr)))
+    (@intent "Register FFI struct declaration (no code emitted)")
+    (@spec (((Ptr TranspileContext) (Ptr SExpr)) -> Unit))
+    (@pre (!= ctx nil))
+    (@pre (!= form nil))
+    (@pre (is-form form "ffi-struct"))
+    ;; (ffi-struct "header.h" name (field Type) ...)
+    ;; Just extract header and add include - full registration is complex
+    (match (form-arg form 0)
+      ((some header-expr)
+        (match (deref header-expr)
+          ((string str) (ctx-add-include ctx (. str value)))
+          (_ (do))))
+      ((none) (do)))))
+
+;; End of module

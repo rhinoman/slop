@@ -1,0 +1,43 @@
+;; Debug program to test parsing
+
+(module parse-debug
+  (export (main 0))
+
+  ;; Import SExpr and all variant types
+  (import parser (parse SExpr SExprList SExprSymbol SExprString SExprNumber is-form))
+
+  (fn main ()
+    (@intent "Parse a simple function and print AST info")
+    (@spec (() -> Int))
+    (with-arena 65536
+      (let ((source "(fn main () 0)"))
+        (match (parse arena source)
+          ((error e)
+            (do
+              (println "Parse error")
+              1))
+          ((ok ast)
+            (do
+              (print "AST length: ")
+              (println (list-len ast))
+              (match (list-get ast 0)
+                ((some form)
+                  (do
+                    (print "First form is-form fn: ")
+                    (println (if (is-form form "fn") 1 0))
+                    (match (deref form)
+                      ((list lst)
+                        (do
+                          (print "List items: ")
+                          (println (list-len (. lst items)))
+                          (match (list-get (. lst items) 1)
+                            ((some name-expr)
+                              (match (deref name-expr)
+                                ((symbol sym)
+                                  (do
+                                    (println "Name is a symbol")
+                                    0))
+                                (_ (do (println "Name is not a symbol") 1))))
+                            ((none) (do (println "No name") 1)))))
+                      (_ (do (println "Not a list") 1)))))
+                ((none) (do (println "AST empty") 1))))))))))

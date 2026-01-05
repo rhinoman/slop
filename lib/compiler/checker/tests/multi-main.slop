@@ -1,0 +1,21 @@
+;; Test: Main module that imports from multi_lib - should pass
+
+(module multi-main
+  (import multi-lib (Status User get-status validate-user))
+
+  (fn process-user ((user User))
+    (@intent "Process a user and return status code")
+    (@spec ((User) -> Int))
+    (if (validate-user user)
+      (match (get-status user)
+        ('active 1)
+        ('inactive 0)
+        ('pending 2))
+      -1))
+
+  (fn main ()
+    (@intent "Test multi-module type checking")
+    (@spec (() -> Int))
+    (let ((user (User 1 "test" 'active)))
+      (process-user user)))
+)

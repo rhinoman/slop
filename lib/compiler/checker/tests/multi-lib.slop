@@ -1,0 +1,22 @@
+;; Test: Library module for multi-module type checking
+
+(module multi-lib
+  (export Status User get-status validate-user)
+
+  (type Status (enum active inactive pending))
+
+  (type User (record
+    (id Int)
+    (name String)
+    (status Status)))
+
+  (fn get-status ((user User))
+    (@intent "Get user status")
+    (@spec ((User) -> Status))
+    user.status)
+
+  (fn validate-user ((user User))
+    (@intent "Check if user is valid")
+    (@spec ((User) -> Bool))
+    (and (> user.id 0) (== user.status 'active)))
+)

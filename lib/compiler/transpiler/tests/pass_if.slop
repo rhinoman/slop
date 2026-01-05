@@ -1,0 +1,6 @@
+;; Test: If expressions - should transpile ternary operator
+
+(fn main ()
+  (@intent "Test if expression")
+  (@spec (() -> Int))
+  (if (> 5 3) 100 0))

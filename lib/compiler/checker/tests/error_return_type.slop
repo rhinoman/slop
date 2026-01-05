@@ -1,0 +1,11 @@
+;; Test: Return type mismatch - should produce error
+;; Expected error: return value ... expected Int, got String
+
+(module error-return-type
+  (export returns-wrong)
+
+  (fn returns-wrong ()
+    (@intent "Return wrong type")
+    (@spec (() -> Int))
+    "not an int")
+)

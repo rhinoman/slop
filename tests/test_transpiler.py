@@ -789,6 +789,34 @@ class TestMapOperations:
         assert "slop_map_string_int_put" in c_code
         assert "&m" in c_code  # map passed by pointer
 
+    def test_map_keys_transpilation(self):
+        """map-keys should generate correct C code"""
+        source = """
+        (module test
+          (fn get-keys ((arena Arena))
+            (@intent "Get map keys")
+            (@spec ((Arena) -> (List String)))
+            (let ((m (map-new arena String Int)))
+              (map-keys m))))
+        """
+        c_code = transpile(source)
+        assert "slop_map_keys" in c_code
+
+    def test_map_remove_transpilation(self):
+        """map-remove should generate correct C code for string-keyed maps"""
+        source = """
+        (module test
+          (fn remove-key ((arena Arena))
+            (@intent "Remove from map")
+            (@spec ((Arena) -> Unit))
+            (let ((m (map-new arena String Int)))
+              (do
+                (map-put m "key" 42)
+                (map-remove m "key")))))
+        """
+        c_code = transpile(source)
+        assert "slop_map_remove" in c_code
+
 
 class TestMultiModuleTypes:
     """Test cross-module type resolution"""

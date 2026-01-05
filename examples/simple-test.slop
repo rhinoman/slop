@@ -1,0 +1,6 @@
+;; Simplest possible test
+
+(fn main ()
+  (@intent "Return zero")
+  (@spec (() -> Int))
+  0)
