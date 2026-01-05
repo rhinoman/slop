@@ -1,8 +1,9 @@
 ;; ============================================================
 ;; SLOP Transpiler CLI - Native transpiler binary entry point
 ;;
-;; Usage: slop-transpiler <file.slop> [-o output.c]
-;; Transpiles SLOP source to C code and writes to stdout or file.
+;; Usage: slop-transpiler <file1.slop> [file2.slop ...] [-o output.c]
+;; Transpiles SLOP source file(s) to C code and writes to stdout or file.
+;; Multiple files are merged and transpiled as a single unit.
 ;; ============================================================
 
 (module transpiler-cli
@@ -10,8 +11,8 @@
 
   (import file (FileMode FileError File
                 file-open file-close file-read-all file-write))
-  (import parser (ParseResult ParseError SExpr parse))
-  (import transpiler (TranspileResult TranspileError transpile))
+  (import parser (ParseResult ParseError SExpr SExprList parse))
+  (import transpiler (TranspileResult TranspileError transpile-ast))
   (import strlib (starts-with))
 
   ;; FFI for string operations
@@ -19,81 +20,143 @@
     (strlen ((s (Ptr U8))) U64))
 
   (fn main ((argc Int) (argv (Ptr (Ptr U8))))
-    (@intent "Transpile a SLOP file to C code")
+    (@intent "Transpile SLOP file(s) to C code")
     (@spec ((Int (Ptr (Ptr U8))) -> Int))
     (if (< argc 2)
       (do
-        (println "Usage: slop-transpiler <file.slop> [-o output.c]")
+        (println "Usage: slop-transpiler <file1.slop> [file2.slop ...] [-o output.c]")
         (println "")
         (println "Options:")
         (println "  -o FILE  Write output to FILE instead of stdout")
+        (println "")
+        (println "Multiple input files are merged and transpiled as a single unit.")
+        (println "Files should be listed in dependency order (dependencies first).")
         1)
-      (with-arena 4194304  ;; 4MB arena for transpiling
-        (let ((path (String (@ argv 1) (strlen (@ argv 1))))
+      (with-arena 134217728  ;; 128MB arena for multi-file transpiling
+        (let ((input-files (collect-input-files arena argc argv))
               (output-file (parse-output-arg arena argc argv)))
-          ;; Read source file
-          (match (file-open path 'read)
-            ((error e)
-              (do
-                (println "Error: Could not open input file")
-                1))
-            ((ok f)
-              (match (file-read-all arena (addr f))
+          (if (== (list-len input-files) 0)
+            (do
+              (println "Error: No input files specified")
+              1)
+            ;; Parse all input files and collect forms
+            (let ((all-forms (list-new arena (Ptr SExpr))))
+              (let ((mut success true)
+                    (mut i 0)
+                    (num-files (list-len input-files)))
+                (while (and success (< i num-files))
+                  (let ((path (get-input-file (addr input-files) i)))
+                    (match (parse-file arena path)
+                      ((ok forms)
+                        ;; Append all forms from this file
+                        (let ((mut j 0)
+                              (num-forms (list-len forms)))
+                          (while (< j num-forms)
+                            (list-push all-forms (@ (. forms data) j))
+                            (set! j (+ j 1)))))
+                      ((error msg)
+                        (do
+                          (print "Error parsing ")
+                          (println path)
+                          (print "  ")
+                          (println msg)
+                          (set! success false)))))
+                  (set! i (+ i 1)))
+                (if (not success)
+                  1
+                  ;; Transpile combined AST
+                  (match (transpile-ast arena all-forms)
+                    ((error e)
+                      (do
+                        (print "Transpile error at line ")
+                        (print (. e line))
+                        (print ", col ")
+                        (print (. e col))
+                        (print ": ")
+                        (println (. e message))
+                        1))
+                    ((ok c-code)
+                      ;; Output the C code
+                      (output-code arena c-code output-file)))))))))))
+
+  (fn collect-input-files ((arena Arena) (argc Int) (argv (Ptr (Ptr U8))))
+    (@intent "Collect input .slop files from argv, stopping at first flag")
+    (@spec ((Arena Int (Ptr (Ptr U8))) -> (List String)))
+    (@alloc arena)
+    (let ((files (list-new arena String))
+          (mut i 1))
+      (while (< i argc)
+        (let ((arg (String (@ argv i) (strlen (@ argv i)))))
+          (if (starts-with arg "-")
+            ;; Stop at first flag
+            (return files)
+            (list-push files arg)))
+        (set! i (+ i 1)))
+      files))
+
+  (fn get-input-file ((files (Ptr (List String))) (index Int))
+    (@intent "Get input file at index with proper String type")
+    (@spec (((Ptr (List String)) Int) -> String))
+    (@ (. (deref files) data) index))
+
+  (fn parse-file ((arena Arena) (path String))
+    (@intent "Read and parse a SLOP file")
+    (@spec ((Arena String) -> (Result (List (Ptr SExpr)) String)))
+    (@alloc arena)
+    (match (file-open path 'read)
+      ((error e)
+        (error "Could not open file"))
+      ((ok f)
+        (match (file-read-all arena (addr f))
+          ((error e)
+            (do
+              (file-close (addr f))
+              (error "Could not read file")))
+          ((ok source)
+            (do
+              (file-close (addr f))
+              (match (parse arena source)
+                ((ok ast) (ok ast))
+                ((error e)
+                  (error (. e message))))))))))
+
+  (fn output-code ((arena Arena) (c-code String) (output-file (Option String)))
+    (@intent "Write C code to file or stdout")
+    (@spec ((Arena String (Option String)) -> Int))
+    (match output-file
+      ((some out-path)
+        ;; Write to file
+        (match (file-open out-path 'write)
+          ((error e)
+            (do
+              (println "Error: Could not open output file")
+              1))
+          ((ok out-f)
+            (let ((bytes (Bytes (cast (Ptr U8) (. c-code data)) (. c-code len) (. c-code len))))
+              (match (file-write (addr out-f) bytes)
                 ((error e)
                   (do
-                    (file-close (addr f))
-                    (println "Error: Could not read input file")
+                    (file-close (addr out-f))
+                    (println "Error: Could not write output file")
                     1))
-                ((ok source)
+                ((ok _)
                   (do
-                    (file-close (addr f))
-                    ;; Transpile to C
-                    (match (transpile arena source)
-                      ((error e)
-                        (do
-                          (print "Transpile error at line ")
-                          (print (. e line))
-                          (print ", col ")
-                          (print (. e col))
-                          (print ": ")
-                          (println (. e message))
-                          1))
-                      ((ok c-code)
-                        ;; Output the C code
-                        (match output-file
-                          ((some out-path)
-                            ;; Write to file
-                            (match (file-open out-path 'write)
-                              ((error e)
-                                (do
-                                  (println "Error: Could not open output file")
-                                  1))
-                              ((ok out-f)
-                                (let ((bytes (Bytes (cast (Ptr U8) (. c-code data)) (. c-code len) (. c-code len))))
-                                  (match (file-write (addr out-f) bytes)
-                                    ((error e)
-                                      (do
-                                        (file-close (addr out-f))
-                                        (println "Error: Could not write output file")
-                                        1))
-                                    ((ok _)
-                                      (do
-                                        (file-close (addr out-f))
-                                        (print "Wrote ")
-                                        (println out-path)
-                                        0)))))))
-                          ((none)
-                            ;; Write to stdout
-                            (do
-                              (print c-code)
-                              0))))))))))))))
+                    (file-close (addr out-f))
+                    (print "Wrote ")
+                    (println out-path)
+                    0)))))))
+      ((none)
+        ;; Write to stdout
+        (do
+          (print c-code)
+          0))))
 
   (fn parse-output-arg ((arena Arena) (argc Int) (argv (Ptr (Ptr U8))))
     (@intent "Parse -o argument from command line")
     (@spec ((Arena Int (Ptr (Ptr U8))) -> (Option String)))
     (@alloc arena)
     ;; Look for -o flag
-    (let ((mut i 2))
+    (let ((mut i 1))
       (while (< i argc)
         (let ((arg (String (@ argv i) (strlen (@ argv i)))))
           (if (starts-with arg "-o")

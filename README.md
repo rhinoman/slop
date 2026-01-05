@@ -39,7 +39,7 @@ SLOP makes the spec the source of truth:
 
 ## Status
 
-Currently working on SLOP-native versions of the build chain in lib/compiler.  The parser, type checker, and transpiler are currently building and usable with the --native flag while building.  The Python 'bootstrapped' versions of these are still in src/slop but will be removed eventually.
+Currently working on SLOP-native versions of the build chain in lib/compiler.  The Python 'bootstrapped' versions of these are in src/slop and still the 'primary' build tools.
 
 ## Philosophy
 

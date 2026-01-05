@@ -113,7 +113,7 @@
     (@post (!= $result nil))
     (@example (arena) -> (!= nil))
     (@example (arena) -> (-> enable-prefixing false))
-    (let ((ctx (cast (Ptr TranspileContext) (arena-alloc arena 2048))))
+    (let ((ctx (cast (Ptr TranspileContext) (arena-alloc arena 8192))))
       (set! (deref ctx) (TranspileContext
         arena
         (none)                       ;; type-env (set by ctx-set-type-env)

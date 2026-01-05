@@ -457,7 +457,7 @@
             (let ((list-str (transpile-expr ctx list-expr (none)))
                   (val-str (transpile-expr ctx val-expr (none)))
                   (arena (. (deref ctx) arena)))
-              (string-concat arena "slop_list_push(&"
+              (string-concat arena "slop_list_push(arena, &"
                 (string-concat arena list-str
                   (string-concat arena ", "
                     (string-concat arena val-str ")"))))))
