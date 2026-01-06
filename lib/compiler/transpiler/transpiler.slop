@@ -1,41 +1,43 @@
 ;; ============================================================
-;; SLOP Transpiler - Main Driver
+;; SLOP Transpiler - Split Mode Driver
 ;;
-;; Orchestrates the multi-pass transpilation pipeline from
-;; SLOP source to C code.
+;; Transpiles SLOP modules to separate .h and .c files per module.
+;; Output is JSON: {"mod": {"header": "...", "impl": "..."}, ...}
 ;; ============================================================
 
 (module transpiler
   (export
-    ;; Main entry points
-    transpile transpile-ast
+    ;; Main entry point
+    transpile-modules
     ;; Error types
-    TranspileError UnfilledHoleError
-    ;; Result type
-    TranspileResult)
+    TranspileError
+    ;; Result types
+    TranspileResult ModuleOutput)
 
   (import parser (parse find-holes SExpr SExprList SExprSymbol is-form
                   sexpr-line sexpr-col))
   (import context (TranspileContext context-new
-                   ctx-add-include ctx-get-includes
-                   ctx-set-module ctx-set-prefixing
+                   ctx-add-include ctx-get-includes ctx-clear-includes
+                   ctx-set-module ctx-set-prefixing ctx-get-module
                    ctx-register-type ctx-register-function
+                   ctx-register-import ctx-clear-import-map ctx-register-type-def
+                   ctx-register-fn-module ctx-lookup-fn-module
+                   ctx-lookup-type-module
                    ctx-set-type-env))
-  ;; Import type checker for type inference
+  (import names (make-type-c-name to-c-name))
   (import env (TypeEnv env-new))
   (import collect (collect-module))
   (import transpiler-types (CTypeInfo FuncEntry))
-  (import emit (Emitter emitter-new emitter-output emitter-line-count
+  (import emit (Emitter emitter-new emitter-output
                 emit-line emit-blank emit-include emit-comment))
   (import defn (transpile-function transpile-type transpile-const
                 register-ffi register-ffi-struct emit-forward-decl
                 extract-return-type))
   (import generic (emit-generated-types emit-all-types-sorted))
   (import ctype (to-c-type))
-  (import names (to-c-name to-qualified-name))
 
   ;; ============================================================
-  ;; Error Types
+  ;; Types
   ;; ============================================================
 
   (type TranspileError (record
@@ -43,19 +45,17 @@
     (line (Int 0 ..))
     (col (Int 0 ..))))
 
-  (type UnfilledHoleError (record
-    (count (Int 1 ..))
-    (first-line (Int 0 ..))
-    (first-col (Int 0 ..))))
+  (type ModuleOutput (record
+    (name String)
+    (header String)
+    (impl String)))
 
-  (type TranspileResult (Result String TranspileError))
+  (type TranspileResult (Result (List ModuleOutput) TranspileError))
 
-  ;; ============================================================
-  ;; Form Categories
-  ;; ============================================================
-
-  (type FormCategories (record
-    (modules (List (Ptr SExpr)))
+  ;; Per-module form categories
+  (type ModuleForms (record
+    (name String)
+    (imports (List (Ptr SExpr)))
     (ffis (List (Ptr SExpr)))
     (ffi-structs (List (Ptr SExpr)))
     (constants (List (Ptr SExpr)))
@@ -66,332 +66,317 @@
   ;; Main Entry Point
   ;; ============================================================
 
-  (fn transpile ((arena Arena) (source String))
-    (@intent "Transpile SLOP source code to C code")
-    (@spec ((Arena String) -> TranspileResult))
+  (fn transpile-modules ((arena Arena) (module-asts (List (List (Ptr SExpr)))))
+    (@intent "Transpile multiple modules to separate header/impl pairs")
+    (@spec ((Arena (List (List (Ptr SExpr)))) -> TranspileResult))
     (@alloc arena)
-    ;; 1. Parse source to AST
-    (match (parse arena source)
-      ((error e)
-        (error (TranspileError (. e message) (. e line) (. e col))))
-      ((ok ast)
-        ;; 2. Check for unfilled holes
-        (let ((holes (collect-all-holes arena ast)))
-          (if (> (list-len holes) 0)
-            ;; Report first unfilled hole
-            (match (list-get holes 0)
-              ((some first-hole)
-                (error (TranspileError "Unfilled hole" (sexpr-line first-hole) (sexpr-col first-hole))))
-              ((none)
-                (error (TranspileError "No holes found" 0 0))))
-            ;; 3. Transpile AST
-            (transpile-ast arena ast))))))
-
-  (fn transpile-ast ((arena Arena) (ast (List (Ptr SExpr))))
-    (@intent "Transpile parsed AST to C code")
-    (@spec ((Arena (List (Ptr SExpr))) -> TranspileResult))
-    (@alloc arena)
-    (@pre (> (list-len ast) 0))
+    ;; module-asts is a list of ASTs, one per module file, in dependency order
     (let ((ctx (context-new arena))
-          (em (emitter-new arena))
-          ;; Create type environment and run type checker
-          (type-env (env-new arena)))
-      ;; Collect types and functions into type environment
-      (collect-module type-env ast)
-      ;; Make type environment available to transpiler
+          (results (list-new arena ModuleOutput))
+          (type-env (env-new arena))
+          (mut had-error false)
+          (mut error-result (TranspileError "" 0 0)))
+
+      ;; First pass: collect all types/functions into type environment
+      (for-each (ast module-asts)
+        (collect-module type-env ast))
       (ctx-set-type-env ctx type-env)
 
-      ;; ========================================
-      ;; Pass 0: Categorize forms (with module expansion)
-      ;; ========================================
-      (let ((forms (categorize-forms-with-modules arena ctx ast)))
+      ;; Second pass: extract per-module forms
+      (let ((all-modules (list-new arena ModuleForms)))
+        (for-each (ast module-asts)
+          (let ((mod-forms (extract-module-forms arena ast)))
+            (when (> (string-len (. mod-forms name)) 0)
+              (list-push all-modules mod-forms))))
 
-        ;; ========================================
-        ;; Pass 1: Register FFI declarations
-        ;; ========================================
-        (for-each (ffi-form (. forms ffis))
-          (register-ffi ctx ffi-form))
-        (for-each (ffi-struct-form (. forms ffi-structs))
-          (register-ffi-struct ctx ffi-struct-form))
+        ;; Third pass: process each module in order
+        (for-each (mod-forms all-modules)
+          (when (not had-error)
+            ;; Set up module context
+            (ctx-set-module ctx (some (. mod-forms name)))
+            (ctx-set-prefixing ctx true)
+            (ctx-clear-includes ctx)
 
-        ;; ========================================
-        ;; Pass 2: Emit header
-        ;; ========================================
-        (emit-comment em "Generated by SLOP transpiler")
-        (emit-comment em "Do not edit - regenerate from .slop source")
-        (emit-blank em)
+            ;; Register imports for this module
+            (for-each (import-form (. mod-forms imports))
+              (process-import ctx arena import-form))
 
-        ;; FFI includes
-        (for-each (header (ctx-get-includes ctx))
-          (emit-include em header true))
+            ;; Register FFI
+            (for-each (ffi-form (. mod-forms ffis))
+              (register-ffi ctx ffi-form))
+            (for-each (ffi-struct-form (. mod-forms ffi-structs))
+              (register-ffi-struct ctx ffi-struct-form))
 
-        ;; Standard includes
-        (emit-include em "stdint.h" true)
-        (emit-include em "stdbool.h" true)
-        (emit-include em "stddef.h" true)
+            ;; Register type and function module mappings
+            (for-each (type-form (. mod-forms types))
+              (register-type-module ctx arena type-form (. mod-forms name)))
+            (for-each (fn-form (. mod-forms functions))
+              (ctx-register-fn-module ctx arena (cast Int fn-form) (. mod-forms name)))
 
-        ;; Runtime include
-        (emit-include em "slop_runtime.h" false)
-        (emit-blank em)
+            ;; Pre-scan types for generic registration
+            (for-each (type-form (. mod-forms types))
+              (scan-type-for-generics ctx type-form))
 
-        ;; ========================================
-        ;; Pass 3: Emit constants
-        ;; ========================================
-        (when (> (list-len (. forms constants)) 0)
-          (emit-comment em "Constants")
-          (for-each (const-form (. forms constants))
-            (transpile-const ctx em const-form))
-          (emit-blank em))
+            ;; Pre-scan functions for return types
+            (for-each (fn-form (. mod-forms functions))
+              (scan-function-signature ctx fn-form))
 
-        ;; ========================================
-        ;; Pass 4: Pre-scan types for generic registration
-        ;; ========================================
-        (for-each (type-form (. forms types))
-          (scan-type-for-generics ctx type-form))
+            ;; Generate header
+            (let ((header (generate-header arena ctx mod-forms all-modules)))
+              ;; Generate implementation
+              (let ((impl (generate-impl arena ctx mod-forms)))
+                ;; Add to results
+                (list-push results (ModuleOutput (. mod-forms name) header impl)))))))
 
-        ;; ========================================
-        ;; Pass 5: Pre-scan functions for return types
-        ;; ========================================
-        (for-each (fn-form (. forms functions))
-          (scan-function-signature ctx fn-form))
-
-        ;; ========================================
-        ;; Pass 6: Emit ALL types in topologically sorted order
-        ;; This handles mutual dependencies between records and generated types
-        ;; ========================================
-        (emit-all-types-sorted ctx em (. forms types))
-
-        ;; ========================================
-        ;; Pass 7: Emit forward declarations
-        ;; ========================================
-        (when (> (list-len (. forms functions)) 0)
-          (emit-comment em "Forward declarations")
-          (for-each (fn-form (. forms functions))
-            (emit-forward-decl ctx em fn-form))
-          (emit-blank em))
-
-        ;; ========================================
-        ;; Pass 8: Emit function implementations
-        ;; ========================================
-        (when (> (list-len (. forms functions)) 0)
-          (emit-comment em "Function implementations")
-          (for-each (fn-form (. forms functions))
-            (transpile-function ctx em fn-form))))
-
-      ;; Return generated C code
-      (ok (emitter-output em))))
+      (if had-error
+        (error error-result)
+        (ok results))))
 
   ;; ============================================================
-  ;; Form Categorization
+  ;; Module Form Extraction
   ;; ============================================================
 
-  (fn categorize-forms ((arena Arena) (ast (List (Ptr SExpr))))
-    (@intent "Categorize AST forms by type for ordered processing")
-    (@spec ((Arena (List (Ptr SExpr))) -> FormCategories))
+  (fn extract-module-forms ((arena Arena) (ast (List (Ptr SExpr))))
+    (@intent "Extract forms from a module AST")
+    (@spec ((Arena (List (Ptr SExpr))) -> ModuleForms))
     (@alloc arena)
-    (@pure)
-    (let ((modules (list-new arena (Ptr SExpr)))
+    (let ((name "")
+          (imports (list-new arena (Ptr SExpr)))
           (ffis (list-new arena (Ptr SExpr)))
           (ffi-structs (list-new arena (Ptr SExpr)))
           (constants (list-new arena (Ptr SExpr)))
           (types (list-new arena (Ptr SExpr)))
           (functions (list-new arena (Ptr SExpr))))
+      ;; Find the module form
       (for-each (form ast)
-        (cond
-          ((is-form form "module")
-            (list-push modules form))
-          ((is-form form "ffi")
-            (list-push ffis form))
-          ((is-form form "ffi-struct")
-            (list-push ffi-structs form))
-          ((is-form form "const")
-            (list-push constants form))
-          ((is-form form "type")
-            (list-push types form))
-          ((is-form form "fn")
-            (list-push functions form))
-          (else
-            ;; Ignore other forms (imports handled at module level)
-            (do))))
-      (FormCategories modules ffis ffi-structs constants types functions)))
+        (when (is-form form "module")
+          (match (deref form)
+            ((list mod-lst)
+              ;; Extract module name
+              (match (list-get (. mod-lst items) 1)
+                ((some name-expr)
+                  (match (deref name-expr)
+                    ((symbol sym) (set! name (. sym name)))
+                    (_ (do))))
+                ((none) (do)))
+              ;; Extract body forms
+              (let ((items (. mod-lst items))
+                    (len (list-len items)))
+                (for (i 2 len)
+                  (match (list-get items i)
+                    ((some f)
+                      (cond
+                        ((is-form f "import") (list-push imports f))
+                        ((is-form f "export") (do))  ;; Skip exports
+                        ((is-form f "ffi") (list-push ffis f))
+                        ((is-form f "ffi-struct") (list-push ffi-structs f))
+                        ((is-form f "const") (list-push constants f))
+                        ((is-form f "type") (list-push types f))
+                        ((is-form f "fn") (list-push functions f))
+                        (else (do))))
+                    ((none) (do))))))
+            (_ (do)))))
+      (ModuleForms name imports ffis ffi-structs constants types functions)))
 
   ;; ============================================================
-  ;; Form Categorization with Module Expansion
+  ;; Import Processing
   ;; ============================================================
 
-  (fn categorize-forms-with-modules ((arena Arena) (ctx (Ptr TranspileContext))
-                                     (ast (List (Ptr SExpr))))
-    (@intent "Categorize forms, expanding module bodies into the main categories")
-    (@spec ((Arena (Ptr TranspileContext) (List (Ptr SExpr))) -> FormCategories))
-    (@alloc arena)
-    ;; First do basic categorization
-    (let ((initial (categorize-forms arena ast)))
-      ;; If there are modules, expand their contents
-      (if (> (list-len (. initial modules)) 0)
-        ;; Process each module and merge its forms
-        (let ((ffis (list-new arena (Ptr SExpr)))
-              (ffi-structs (list-new arena (Ptr SExpr)))
-              (constants (list-new arena (Ptr SExpr)))
-              (types (list-new arena (Ptr SExpr)))
-              (functions (list-new arena (Ptr SExpr))))
-          (do
-            ;; Copy any top-level forms (outside modules)
-            (for-each (f (. initial ffis)) (list-push ffis f))
-            (for-each (f (. initial ffi-structs)) (list-push ffi-structs f))
-            (for-each (f (. initial constants)) (list-push constants f))
-            (for-each (f (. initial types)) (list-push types f))
-            (for-each (f (. initial functions)) (list-push functions f))
-            ;; Process each module
-            (for-each (mod-form (. initial modules))
-              (match (deref mod-form)
-                ((list mod-lst)
-                  ;; Extract module name and set context
-                  (match (list-get (. mod-lst items) 1)
-                    ((some name-expr)
-                      (match (deref name-expr)
-                        ((symbol sym)
-                          (do
-                            (ctx-set-module ctx (some (. sym name)))
-                            (ctx-set-prefixing ctx true)))
-                        (_ (do))))
-                    ((none) (do)))
-                  ;; Extract body forms (skip: module, name, export)
-                  (let ((body (extract-module-body arena mod-form)))
-                    ;; Categorize module body and merge
-                    (let ((mod-forms (categorize-forms arena body)))
-                      (do
-                        (for-each (f (. mod-forms ffis)) (list-push ffis f))
-                        (for-each (f (. mod-forms ffi-structs)) (list-push ffi-structs f))
-                        (for-each (f (. mod-forms constants)) (list-push constants f))
-                        (for-each (f (. mod-forms types)) (list-push types f))
-                        (for-each (f (. mod-forms functions)) (list-push functions f))))))
+  (fn process-import ((ctx (Ptr TranspileContext)) (arena Arena) (import-form (Ptr SExpr)))
+    (@intent "Process import statement and register imported names")
+    (@spec (((Ptr TranspileContext) Arena (Ptr SExpr)) -> Unit))
+    (match (deref import-form)
+      ((list import-lst)
+        (let ((items (. import-lst items)))
+          ;; Get module name from index 1
+          (match (list-get items 1)
+            ((some mod-name-expr)
+              (match (deref mod-name-expr)
+                ((symbol mod-sym)
+                  (let ((mod-name (. mod-sym name))
+                        (mod-c-name (to-c-name arena mod-name)))
+                    ;; Get symbols list from index 2
+                    (match (list-get items 2)
+                      ((some syms-expr)
+                        (match (deref syms-expr)
+                          ((list syms-lst)
+                            (let ((syms-items (. syms-lst items))
+                                  (syms-len (list-len syms-items)))
+                              (for (si 0 syms-len)
+                                (match (list-get syms-items si)
+                                  ((some sym-ptr)
+                                    (match (deref sym-ptr)
+                                      ((symbol s)
+                                        (let ((local-name (. s name))
+                                              (qualified (string-concat arena
+                                                           (string-concat arena mod-c-name "_")
+                                                           (to-c-name arena local-name))))
+                                          (ctx-register-import ctx local-name qualified)))
+                                      (_ (do))))
+                                  ((none) (do))))))
+                          (_ (do))))
+                      ((none) (do)))))
                 (_ (do))))
-            ;; Return merged categories (modules list left empty since processed)
-            (FormCategories (list-new arena (Ptr SExpr)) ffis ffi-structs
-                           constants types functions)))
-        ;; No modules, return as-is
-        initial)))
+            ((none) (do)))))
+      (_ (do))))
 
-  (fn extract-module-body ((arena Arena) (mod-form (Ptr SExpr)))
-    (@intent "Extract body forms from a module, skipping name, export, and import")
-    (@spec ((Arena (Ptr SExpr)) -> (List (Ptr SExpr))))
+  ;; ============================================================
+  ;; Header Generation
+  ;; ============================================================
+
+  (fn generate-header ((arena Arena) (ctx (Ptr TranspileContext))
+                       (mod ModuleForms) (all-modules (List ModuleForms)))
+    (@intent "Generate header file for a module")
+    (@spec ((Arena (Ptr TranspileContext) ModuleForms (List ModuleForms)) -> String))
     (@alloc arena)
-    (@pre (!= mod-form nil))
-    (let ((body (list-new arena (Ptr SExpr))))
-      (match (deref mod-form)
-        ((list mod-lst)
-          (let ((items (. mod-lst items))
-                (len (list-len items)))
-            ;; Iterate from index 2 onwards (skip 'module' and name)
-            ;; Collect all forms except export and import
-            (for (i 2 len)
-              (match (list-get items i)
-                ((some form)
-                  (when (not (or (is-form form "export") (is-form form "import")))
-                    (list-push body form)))
-                ((none) (do))))))
-        (_ (do)))
-      body))
+    (let ((em (emitter-new arena))
+          (c-mod-name (to-c-name arena (. mod name)))
+          (guard-name (string-concat arena "SLOP_"
+                        (string-concat arena (string-to-upper arena c-mod-name) "_H"))))
+      ;; Include guard
+      (emit-line em (string-concat arena "#ifndef " guard-name))
+      (emit-line em (string-concat arena "#define " guard-name))
+      (emit-blank em)
+
+      ;; Standard includes
+      (emit-include em "slop_runtime.h" false)
+      (emit-include em "stdint.h" true)
+      (emit-include em "stdbool.h" true)
+
+      ;; FFI includes
+      (for-each (header (ctx-get-includes ctx))
+        (emit-include em header true))
+
+      ;; Dependency headers
+      (for-each (import-form (. mod imports))
+        (match (deref import-form)
+          ((list import-lst)
+            (match (list-get (. import-lst items) 1)
+              ((some mod-name-expr)
+                (match (deref mod-name-expr)
+                  ((symbol mod-sym)
+                    (let ((dep-c-name (to-c-name arena (. mod-sym name))))
+                      (emit-line em (string-concat arena "#include \"slop_"
+                                      (string-concat arena dep-c-name ".h\"")))))
+                  (_ (do))))
+              ((none) (do))))
+          (_ (do))))
+
+      (emit-blank em)
+
+      ;; Type definitions (forward decls, enums, records, unions)
+      (when (> (list-len (. mod types)) 0)
+        (emit-all-types-sorted ctx em (. mod types))
+        (emit-blank em))
+
+      ;; Constants
+      (when (> (list-len (. mod constants)) 0)
+        (for-each (const-form (. mod constants))
+          (transpile-const ctx em const-form))
+        (emit-blank em))
+
+      ;; Function declarations
+      (when (> (list-len (. mod functions)) 0)
+        (for-each (fn-form (. mod functions))
+          (emit-forward-decl ctx em fn-form))
+        (emit-blank em))
+
+      ;; End include guard
+      (emit-line em (string-concat arena "#endif // " guard-name))
+
+      (emitter-output em)))
 
   ;; ============================================================
-  ;; Hole Collection
+  ;; Implementation Generation
   ;; ============================================================
 
-  (fn collect-all-holes ((arena Arena) (ast (List (Ptr SExpr))))
-    (@intent "Collect all unfilled holes from entire AST")
-    (@spec ((Arena (List (Ptr SExpr))) -> (List (Ptr SExpr))))
+  (fn generate-impl ((arena Arena) (ctx (Ptr TranspileContext)) (mod ModuleForms))
+    (@intent "Generate implementation file for a module")
+    (@spec ((Arena (Ptr TranspileContext) ModuleForms) -> String))
     (@alloc arena)
-    (@pure)
-    (let ((all-holes (list-new arena (Ptr SExpr))))
-      (for-each (form ast)
-        (let ((form-holes (find-holes arena form)))
-          (for-each (h form-holes)
-            (list-push all-holes h))))
-      all-holes))
+    (let ((em (emitter-new arena))
+          (c-mod-name (to-c-name arena (. mod name))))
+      ;; Include own header
+      (emit-line em (string-concat arena "#include \"slop_"
+                      (string-concat arena c-mod-name ".h\"")))
+      (emit-blank em)
+
+      ;; Function implementations
+      (when (> (list-len (. mod functions)) 0)
+        (for-each (fn-form (. mod functions))
+          (transpile-function ctx em fn-form)))
+
+      (emitter-output em)))
 
   ;; ============================================================
-  ;; Type Scanning (for generic type registration)
+  ;; Type Registration
   ;; ============================================================
 
-  (fn scan-type-for-generics ((ctx (Ptr TranspileContext)) (form (Ptr SExpr)))
-    (@intent "Scan type definition to register any generic types used")
-    (@spec (((Ptr TranspileContext) (Ptr SExpr)) -> Unit))
-    (@pre (!= ctx nil))
-    (@pre (!= form nil))
-    ;; This traverses the type expression looking for Option, Result,
-    ;; List, Map types and registers them for later emission
-    (when (is-form form "type")
-      (match (deref form)
-        ((list lst)
-          (match (list-get (. lst items) 2)
-            ((some type-expr)
-              (do
-                (to-c-type ctx type-expr)
-                (do)))
-            ((none) (do))))
-        (_ (do)))))
-
-  ;; ============================================================
-  ;; Function Signature Scanning
-  ;; ============================================================
-
-  (fn scan-function-signature ((ctx (Ptr TranspileContext)) (form (Ptr SExpr)))
-    (@intent "Pre-scan function to register signature for call resolution")
-    (@spec (((Ptr TranspileContext) (Ptr SExpr)) -> Unit))
-    (@pre (!= ctx nil))
-    (@pre (!= form nil))
-    (match (deref form)
+  (fn register-type-module ((ctx (Ptr TranspileContext)) (arena Arena)
+                            (type-form (Ptr SExpr)) (mod-name String))
+    (@intent "Register a type with its module")
+    (@spec (((Ptr TranspileContext) Arena (Ptr SExpr) String) -> Unit))
+    (match (deref type-form)
       ((list lst)
         (match (list-get (. lst items) 1)
           ((some name-expr)
             (match (deref name-expr)
               ((symbol sym)
-                (let ((fn-name (. sym name))
-                      (return-type-opt (extract-return-type form))
-                      (arena (. (deref ctx) arena)))
-                  (match return-type-opt
-                    ((some return-type-expr)
-                      (let ((c-return-type (to-c-type ctx return-type-expr))
-                            (c-name (to-qualified-name arena ctx fn-name)))
-                        (ctx-register-function ctx
-                          (FuncEntry fn-name c-name c-return-type false false false))))
-                    ((none) (do)))))
+                (let ((type-name (. sym name))
+                      (c-name (make-type-c-name arena type-name mod-name)))
+                  (ctx-register-type-def ctx arena (cast Int type-form) c-name mod-name)))
               (_ (do))))
           ((none) (do))))
       (_ (do))))
 
   ;; ============================================================
-  ;; Module Handling
+  ;; Type Scanning for Generics
   ;; ============================================================
 
-  (fn transpile-module ((ctx (Ptr TranspileContext)) (em (Ptr Emitter))
-                        (form (Ptr SExpr)))
-    (@intent "Transpile module definition")
-    (@spec (((Ptr TranspileContext) (Ptr Emitter) (Ptr SExpr)) -> Unit))
-    (@pre (!= ctx nil))
-    (@pre (!= em nil))
-    (@pre (!= form nil))
-    (@pre (is-form form "module"))
-    ;; (module name (export ...) forms...)
-    ;; Sets module context and enables prefixing
-    (match (deref form)
+  (fn scan-type-for-generics ((ctx (Ptr TranspileContext)) (type-form (Ptr SExpr)))
+    (@intent "Pre-scan type to register any generic types it uses")
+    (@spec (((Ptr TranspileContext) (Ptr SExpr)) -> Unit))
+    ;; Extract type expression from (type Name TypeExpr)
+    (match (deref type-form)
       ((list lst)
-        (match (list-get (. lst items) 1)
-          ((some name-expr)
-            (match (deref name-expr)
-              ((symbol sym)
-                (do
-                  (ctx-set-module ctx (some (. sym name)))
-                  (ctx-set-prefixing ctx true)
-                  (let ((arena (. (deref ctx) arena))
-                        (items (. lst items))
-                        (body (list-new arena (Ptr SExpr))))
-                    (for (i 3 (list-len items))
-                      (match (list-get items i)
-                        ((some form-item) (list-push body form-item))
-                        ((none) (do))))
-                    (let ((_ (categorize-forms arena body)))
-                      (do)))))
-              (_ (do))))
+        (match (list-get (. lst items) 2)
+          ((some type-expr)
+            ;; Call to-c-type to trigger generic registration
+            (to-c-type ctx type-expr)
+            (do))
           ((none) (do))))
-      (_ (do)))))
+      (_ (do))))
+
+  ;; ============================================================
+  ;; Function Signature Scanning
+  ;; ============================================================
+
+  (fn scan-function-signature ((ctx (Ptr TranspileContext)) (fn-form (Ptr SExpr)))
+    (@intent "Pre-scan function to register return type")
+    (@spec (((Ptr TranspileContext) (Ptr SExpr)) -> Unit))
+    (match (extract-return-type fn-form)
+      ((some ret-type)
+        ;; Call to-c-type to trigger generic registration
+        (to-c-type ctx ret-type)
+        (do))
+      ((none) (do))))
+
+  ;; ============================================================
+  ;; String Utilities
+  ;; ============================================================
+
+  (fn string-to-upper ((arena Arena) (s String))
+    (@intent "Convert string to uppercase")
+    (@spec ((Arena String) -> String))
+    (@alloc arena)
+    (let ((len (string-len s))
+          (buf (arena-alloc arena (+ len 1))))
+      (for (i 0 (cast Int len))
+        (let ((c (cast Int (@ (. s data) i))))
+          (if (and (>= c 97) (<= c 122))
+            (set! (@ buf i) (cast U8 (- c 32)))
+            (set! (@ buf i) (cast U8 c)))))
+      (set! (@ buf (cast Int len)) (cast U8 0))
+      (String (cast (Ptr U8) buf) (cast U64 len))))
+
+)

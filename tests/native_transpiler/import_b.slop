@@ -1,0 +1,15 @@
+;; Test case: Module that imports types and uses them in fields
+;; Tests that imported type names are correctly resolved to qualified C names
+
+(module import-b
+  (import import-a (Foo Token))
+  (export Bar Container)
+
+  ;; Bar has a field of imported type Foo
+  ;; The C code should use import_a_Foo, not import_b_Foo
+  (type Bar (record (my-foo Foo)))
+
+  ;; Container has a generic List of imported type Token
+  ;; The C code should generate slop_list_import_a_Token, not slop_list_import_b_Token
+  (type Container (record (tokens (List Token))))
+)

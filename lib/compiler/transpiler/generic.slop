@@ -17,9 +17,13 @@
   (import context (TranspileContext ResultTypeInfo MapTypeInfo
                    ctx-get-options ctx-get-results
                    ctx-get-lists ctx-get-maps
-                   ctx-is-emitted ctx-mark-emitted))
+                   ctx-is-emitted ctx-mark-emitted
+                   ctx-lookup-type-def ctx-lookup-type-module
+                   ctx-set-module ctx-set-prefixing
+                   ctx-register-enum-value ctx-register-fields))
+  (import transpiler-types (CFieldInfo))
   (import emit (Emitter emit-line emit-blank emit-guard-start emit-guard-end indent dedent))
-  (import names (type-to-identifier to-qualified-type-name))
+  (import names (type-to-identifier to-qualified-type-name to-c-name))
   (import ctype (to-c-type is-pointer-type))
   (import parser (SExpr SExprList SExprSymbol is-form))
   (import strlib (to-upper starts-with))
@@ -35,7 +39,9 @@
     kind-list
     kind-map
     kind-record
-    kind-union))
+    kind-union
+    kind-enum
+    kind-range))
 
   ;; Entry for topological sort - holds type info and dependencies
   (type TypeEntry (record
@@ -47,7 +53,9 @@
     (ok-type (Option String))          ;; For Result: ok type
     (err-type (Option String))         ;; For Result: err type
     (key-type (Option String))         ;; For Map: key type
-    (val-type (Option String))))
+    (val-type (Option String))         ;; For Map: value type
+    (module-name (Option String))
+    (base-type (Option String))))
 
   ;; ============================================================
   ;; Runtime Predefined Types
@@ -312,17 +320,19 @@
     (@spec (((Ptr Emitter) String String String) -> Unit))
     (@pre (!= em nil))
     (let ((guard (make-guard-name type-name))
-          (arena (. (deref em) arena)))
+          (arena (. (deref em) arena))
+          (is-string-key (or (string-eq key-type "slop_string")
+                             (string-eq key-type "char*")
+                             (string-eq key-type "String"))))
       ;; For string keys, use SLOP_STRING_MAP_DEFINE macro
       ;; For other keys, emit custom struct
       (do
         (emit-guard-start em guard)
-        (if (string-eq key-type "char*")
+        (if is-string-key
+          ;; Use SLOP_STRING_MAP_DEFINE(ValType, MapName, OptName)
+          ;; For now, just typedef to slop_map since the macro generates typed accessors
           (emit-line em
-            (string-concat arena "SLOP_STRING_MAP_DEFINE("
-              (string-concat arena type-name
-                (string-concat arena ", "
-                  (string-concat arena val-type ")")))))
+            (string-concat arena "typedef slop_map " (string-concat arena type-name ";")))
           (emit-line em
             (string-concat arena "typedef struct { "
               (string-concat arena key-type
@@ -389,6 +399,60 @@
       (if (> len 0)
         (== (@ (. c-type data) (- len 1)) (cast U8 42))  ;; '*' = 42
         false)))
+
+  ;; ============================================================
+  ;; Range Type Base Type Determination
+  ;; ============================================================
+
+  (fn get-range-base-type ((ctx (Ptr TranspileContext)) (arena Arena) (type-expr (Ptr SExpr)))
+    (@intent "Determine C base type for range type like (Int 0 .. 127)")
+    (@spec (((Ptr TranspileContext) Arena (Ptr SExpr)) -> String))
+    (@pure)
+    (match (deref type-expr)
+      ((list lst)
+        (let ((items (. lst items))
+              (len (list-len items)))
+          ;; Parse (Int min .. max) or just (Int)
+          (if (< len 1)
+            "int64_t"
+            (match (list-get items 0)
+              ((some head-expr)
+                (match (deref head-expr)
+                  ((symbol base-sym)
+                    (let ((base-name (. base-sym name)))
+                      (cond
+                        ((string-eq base-name "Int") "int64_t")
+                        ((string-eq base-name "Float") "double")
+                        ((string-eq base-name "Bool") "bool")
+                        ((string-eq base-name "U8") "uint8_t")
+                        ((string-eq base-name "U16") "uint16_t")
+                        ((string-eq base-name "U32") "uint32_t")
+                        ((string-eq base-name "U64") "uint64_t")
+                        ((string-eq base-name "I8") "int8_t")
+                        ((string-eq base-name "I16") "int16_t")
+                        ((string-eq base-name "I32") "int32_t")
+                        ((string-eq base-name "I64") "int64_t")
+                        ;; Type alias case - convert via to-c-type
+                        (else (to-c-type ctx type-expr)))))
+                  (_ "int64_t")))
+              ((none) "int64_t")))))
+      ((symbol sym)
+        ;; Simple alias like (type Foo Int)
+        (let ((name (. sym name)))
+          (cond
+            ((string-eq name "Int") "int64_t")
+            ((string-eq name "Float") "double")
+            ((string-eq name "Bool") "bool")
+            ((string-eq name "U8") "uint8_t")
+            ((string-eq name "U16") "uint16_t")
+            ((string-eq name "U32") "uint32_t")
+            ((string-eq name "U64") "uint64_t")
+            ((string-eq name "I8") "int8_t")
+            ((string-eq name "I16") "int16_t")
+            ((string-eq name "I32") "int32_t")
+            ((string-eq name "I64") "int64_t")
+            (else (to-c-type ctx type-expr)))))
+      (_ "int64_t")))
 
   ;; ============================================================
   ;; Dependency Extraction
@@ -500,23 +564,87 @@
                     ((symbol sym)
                       (match (list-get items 2)
                         ((some type-expr)
-                          (let ((c-name (to-qualified-type-name arena ctx (. sym name)))
+                          ;; Look up this form's registered C name
+                          (let ((c-name (match (ctx-lookup-type-def ctx arena (cast Int form))
+                                          ((some registered-name) registered-name)
+                                          ((none)
+                                           ;; Fallback: use context's current module
+                                           (to-qualified-type-name arena ctx (. sym name)))))
                                 (is-record (is-form type-expr "record"))
-                                (is-union (is-form type-expr "union")))
-                            (when (or is-record is-union)
-                              (let ((deps (get-record-field-deps ctx arena type-expr))
-                                    (kind (if is-record 'kind-record 'kind-union))
-                                    (entry (TypeEntry
-                                             c-name
-                                             kind
-                                             deps
-                                             (some form)
-                                             (none)
-                                             (none)
-                                             (none)
-                                             (none)
-                                             (none))))
-                                (list-push entries entry)))))
+                                (is-union (is-form type-expr "union"))
+                                (is-enum (is-form type-expr "enum")))
+                            (cond
+                              ((or is-record is-union)
+                                ;; Set module context for this type before getting deps
+                                ;; This ensures field types are resolved with correct prefixes
+                                (do
+                                  (match (ctx-lookup-type-module ctx arena (cast Int form))
+                                    ((some mod-name)
+                                      (ctx-set-module ctx (some mod-name))
+                                      (ctx-set-prefixing ctx true))
+                                    ((none) ()))
+                                  (let ((deps (get-record-field-deps ctx arena type-expr))
+                                        (kind (if is-record 'kind-record 'kind-union))
+                                        (entry (TypeEntry
+                                                 c-name
+                                                 kind
+                                                 deps
+                                                 (some form)
+                                                 (none)
+                                                 (none)
+                                                 (none)
+                                                 (none)
+                                                 (none)
+                                                 (none)
+                                                 (none))))
+                                    (list-push entries entry))))
+                              (is-enum
+                                ;; Enums have no dependencies - emit first
+                                (let ((entry (TypeEntry
+                                               c-name
+                                               'kind-enum
+                                               (list-new arena String)  ;; no deps
+                                               (some form)
+                                               (none)
+                                               (none)
+                                               (none)
+                                               (none)
+                                               (none)
+                                               (none)
+                                               (none))))
+                                  (list-push entries entry)))
+                              (else
+                                ;; Range type or simple alias - e.g., (type AsciiChar (Int 0 .. 127))
+                                ;; Set module context for this type before processing
+                                (do
+                                  (match (ctx-lookup-type-module ctx arena (cast Int form))
+                                    ((some mod-name)
+                                      (ctx-set-module ctx (some mod-name))
+                                      (ctx-set-prefixing ctx true))
+                                    ((none) ()))
+                                  (let ((base-c-type (get-range-base-type ctx arena type-expr))
+                                        ;; Check if base type is a generated type (Option/Result/List/Map)
+                                        ;; If so, add it as a dependency
+                                        (deps (let ((d (list-new arena String)))
+                                                (when (or (starts-with base-c-type "slop_result_")
+                                                          (starts-with base-c-type "slop_option_")
+                                                          (starts-with base-c-type "slop_list_")
+                                                          (starts-with base-c-type "slop_map_"))
+                                                  (list-push d base-c-type))
+                                                d))
+                                        (entry (TypeEntry
+                                                 c-name
+                                                 'kind-range
+                                                 deps
+                                                 (some form)
+                                                 (none)
+                                                 (none)
+                                                 (none)
+                                                 (none)
+                                                 (none)
+                                                 (none)
+                                                 (some base-c-type))))
+                                    (list-push entries entry)))))))
                         ((none) ())))
                     (_ ())))
                 ((none) ()))))
@@ -537,6 +665,8 @@
                                  deps
                                  (none)
                                  (some inner-type)
+                                 (none)
+                                 (none)
                                  (none)
                                  (none)
                                  (none)
@@ -562,6 +692,8 @@
                                  (some (. info ok))
                                  (some (. info err))
                                  (none)
+                                 (none)
+                                 (none)
                                  (none))))
                     (list-push entries entry)))
                 ((none) ()))))))
@@ -581,6 +713,8 @@
                                  deps
                                  (none)
                                  (some elem-type)
+                                 (none)
+                                 (none)
                                  (none)
                                  (none)
                                  (none)
@@ -606,7 +740,9 @@
                                  (none)
                                  (none)
                                  (some (. info key))
-                                 (some (. info val)))))
+                                 (some (. info val))
+                                 (none)
+                                 (none))))
                     (list-push entries entry)))
                 ((none) ()))))))
 
@@ -766,21 +902,59 @@
         ('kind-record
           (match (. entry ast)
             ((some form)
-              ;; Emit record - delegate to transpile-record-inline
-              (emit-record-type ctx em form))
+              ;; Set module context before emitting for correct field type prefixing
+              (match (ctx-lookup-type-module ctx arena (cast Int form))
+                ((some mod-name)
+                  (ctx-set-module ctx (some mod-name))
+                  (ctx-set-prefixing ctx true))
+                ((none) ()))
+              ;; Emit record - pass correct c-name from entry
+              (emit-record-type ctx em form (. entry name)))
             ((none) ())))
 
         ('kind-union
           (match (. entry ast)
             ((some form)
-              ;; Emit union - delegate to transpile-union-inline
-              (emit-union-type ctx em form))
+              ;; Set module context before emitting for correct field type prefixing
+              (match (ctx-lookup-type-module ctx arena (cast Int form))
+                ((some mod-name)
+                  (ctx-set-module ctx (some mod-name))
+                  (ctx-set-prefixing ctx true))
+                ((none) ()))
+              ;; Emit union - pass correct c-name from entry
+              (emit-union-type ctx em form (. entry name)))
+            ((none) ())))
+
+        ('kind-enum
+          (match (. entry ast)
+            ((some form)
+              ;; Enums don't have field types, but set context for consistency
+              (match (ctx-lookup-type-module ctx arena (cast Int form))
+                ((some mod-name)
+                  (ctx-set-module ctx (some mod-name))
+                  (ctx-set-prefixing ctx true))
+                ((none) ()))
+              ;; Emit enum - pass correct c-name from entry
+              (emit-enum-type ctx em form (. entry name)))
+            ((none) ())))
+
+        ('kind-range
+          ;; Range type: emit typedef to base C type
+          (match (. entry base-type)
+            ((some base)
+              (emit-line em (string-concat arena "typedef "
+                              (string-concat arena base
+                                (string-concat arena " "
+                                  (string-concat arena (. entry name) ";")))))
+              (emit-blank em)
+              (ctx-mark-emitted ctx (. entry name)))
             ((none) ()))))))
 
-  (fn emit-record-type ((ctx (Ptr TranspileContext)) (em (Ptr Emitter)) (form (Ptr SExpr)))
+  (fn emit-record-type ((ctx (Ptr TranspileContext)) (em (Ptr Emitter)) (form (Ptr SExpr)) (c-name String))
     (@intent "Emit record type definition inline")
-    (@spec (((Ptr TranspileContext) (Ptr Emitter) (Ptr SExpr)) -> Unit))
-    (let ((arena (. (deref ctx) arena)))
+    (@spec (((Ptr TranspileContext) (Ptr Emitter) (Ptr SExpr) String) -> Unit))
+    (let ((arena (. (deref ctx) arena))
+          (field-infos (list-new arena CFieldInfo)))
       (match (deref form)
         ((list lst)
           (let ((items (. lst items)))
@@ -788,13 +962,13 @@
               ((some name-expr)
                 (match (deref name-expr)
                   ((symbol sym)
-                    (let ((c-name (to-qualified-type-name arena ctx (. sym name))))
+                    ;; Use provided c-name instead of recomputing
                       (match (list-get items 2)
                         ((some type-expr)
                           (emit-line em (string-concat arena "typedef struct "
                                           (string-concat arena c-name " {")))
                           (indent em)
-                          ;; Emit fields
+                          ;; Emit fields and collect field info
                           (match (deref type-expr)
                             ((list type-lst)
                               (let ((type-items (. type-lst items))
@@ -812,11 +986,15 @@
                                                     (match (list-get field-items 1)
                                                       ((some ftype-expr)
                                                         (let ((field-c-type (to-c-type ctx ftype-expr))
-                                                              (field-c-name (type-to-identifier arena (. fsym name))))
-                                                          (emit-line em (string-concat arena "    "
-                                                                          (string-concat arena field-c-type
-                                                                            (string-concat arena " "
-                                                                              (string-concat arena field-c-name ";")))))))
+                                                              (field-c-name (to-c-name arena (. fsym name)))
+                                                              (is-ptr (is-pointer-type ftype-expr)))
+                                                          (do
+                                                            ;; Register field for positional construction
+                                                            (list-push field-infos (CFieldInfo (. fsym name) field-c-name field-c-type is-ptr))
+                                                            (emit-line em (string-concat arena "    "
+                                                                            (string-concat arena field-c-type
+                                                                              (string-concat arena " "
+                                                                                (string-concat arena field-c-name ";"))))))))
                                                       ((none) ())))
                                                   (_ ())))
                                               ((none) ()))))
@@ -825,15 +1003,17 @@
                             (_ ()))
                           (dedent em)
                           (emit-line em (string-concat arena "} " (string-concat arena c-name ";")))
-                          (emit-blank em))
-                        ((none) ()))))
+                          (emit-blank em)
+                          ;; Register fields for positional construction
+                          (ctx-register-fields ctx c-name field-infos))
+                        ((none) ())))
                   (_ ())))
               ((none) ()))))
         (_ ()))))
 
-  (fn emit-union-type ((ctx (Ptr TranspileContext)) (em (Ptr Emitter)) (form (Ptr SExpr)))
+  (fn emit-union-type ((ctx (Ptr TranspileContext)) (em (Ptr Emitter)) (form (Ptr SExpr)) (c-name String))
     (@intent "Emit union type definition inline")
-    (@spec (((Ptr TranspileContext) (Ptr Emitter) (Ptr SExpr)) -> Unit))
+    (@spec (((Ptr TranspileContext) (Ptr Emitter) (Ptr SExpr) String) -> Unit))
     (let ((arena (. (deref ctx) arena)))
       (match (deref form)
         ((list lst)
@@ -842,13 +1022,14 @@
               ((some name-expr)
                 (match (deref name-expr)
                   ((symbol sym)
-                    (let ((c-name (to-qualified-type-name arena ctx (. sym name))))
+                    ;; Use provided c-name instead of recomputing
                       (match (list-get items 2)
                         ((some type-expr)
-                          (emit-line em (string-concat arena "typedef struct " (string-concat arena c-name " {")))
+                          ;; struct Name { uint8_t tag; union { ... } data; };
+                          (emit-line em (string-concat arena "struct " (string-concat arena c-name " {")))
                           (indent em)
-                          (emit-line em "    int tag;")
-                          (emit-line em "    union {")
+                          (emit-line em "uint8_t tag;")
+                          (emit-line em "union {")
                           (indent em)
                           ;; Emit variants
                           (match (deref type-expr)
@@ -868,11 +1049,10 @@
                                                     (match (list-get variant-items 1)
                                                       ((some vtype-expr)
                                                         (let ((variant-c-type (to-c-type ctx vtype-expr))
-                                                              (variant-c-name (type-to-identifier arena (. vsym name))))
-                                                          (emit-line em (string-concat arena "        "
-                                                                          (string-concat arena variant-c-type
-                                                                            (string-concat arena " "
-                                                                              (string-concat arena variant-c-name ";")))))))
+                                                              (variant-c-name (to-c-name arena (. vsym name))))
+                                                          (emit-line em (string-concat arena variant-c-type
+                                                                          (string-concat arena " "
+                                                                            (string-concat arena variant-c-name ";"))))))
                                                       ((none) ())))
                                                   (_ ())))
                                               ((none) ()))))
@@ -880,11 +1060,96 @@
                                     ((none) ())))))
                             (_ ()))
                           (dedent em)
-                          (emit-line em "    };")
+                          (emit-line em "} data;")
+                          (dedent em)
+                          (emit-line em "};")
+                          ;; typedef struct Name Name;
+                          (emit-line em (string-concat arena "typedef struct "
+                                          (string-concat arena c-name
+                                            (string-concat arena " " (string-concat arena c-name ";")))))
+                          (emit-blank em)
+                          ;; Emit tag #defines
+                          (emit-union-tag-defines em arena c-name type-expr))
+                        ((none) ())))
+                  (_ ())))
+              ((none) ()))))
+        (_ ()))))
+
+  ;; Helper to emit union tag #defines
+  (fn emit-union-tag-defines ((em (Ptr Emitter)) (arena Arena) (c-name String) (type-expr (Ptr SExpr)))
+    (@intent "Emit #define Type_variant_TAG n for each union variant")
+    (@spec (((Ptr Emitter) Arena String (Ptr SExpr)) -> Unit))
+    (match (deref type-expr)
+      ((list type-lst)
+        (let ((type-items (. type-lst items))
+              (type-len (list-len type-items))
+              (mut idx 0))
+          (for (i 1 type-len)
+            (match (list-get type-items i)
+              ((some variant-form)
+                (match (deref variant-form)
+                  ((list variant-lst)
+                    (match (list-get (. variant-lst items) 0)
+                      ((some vname-expr)
+                        (match (deref vname-expr)
+                          ((symbol vsym)
+                            (let ((vname (. vsym name))
+                                  (tag (string-concat arena c-name
+                                          (string-concat arena "_"
+                                            (string-concat arena (to-c-name arena vname) "_TAG")))))
+                              (emit-line em (string-concat arena "#define "
+                                              (string-concat arena tag
+                                                (string-concat arena " " (int-to-string arena idx)))))
+                              (set! idx (+ idx 1))))
+                          (_ ())))
+                      ((none) ())))
+                  (_ ())))
+              ((none) ())))))
+      (_ ()))
+    (emit-blank em))
+
+  (fn emit-enum-type ((ctx (Ptr TranspileContext)) (em (Ptr Emitter)) (form (Ptr SExpr)) (c-name String))
+    (@intent "Emit enum type definition inline")
+    (@spec (((Ptr TranspileContext) (Ptr Emitter) (Ptr SExpr) String) -> Unit))
+    (let ((arena (. (deref ctx) arena)))
+      (match (deref form)
+        ((list lst)
+          (let ((items (. lst items)))
+            (match (list-get items 1)
+              ((some name-expr)
+                (match (deref name-expr)
+                  ((symbol sym)
+                    ;; Use provided c-name instead of recomputing
+                      (match (list-get items 2)
+                        ((some type-expr)
+                          ;; typedef enum NAME { NAME_val1, NAME_val2, ... } NAME;
+                          (emit-line em (string-concat arena "typedef enum " (string-concat arena c-name " {")))
+                          (indent em)
+                          (match (deref type-expr)
+                            ((list type-lst)
+                              (let ((type-items (. type-lst items))
+                                    (type-len (list-len type-items)))
+                                (for (i 1 type-len)
+                                  (match (list-get type-items i)
+                                    ((some variant-expr)
+                                      (match (deref variant-expr)
+                                        ((symbol vsym)
+                                          (let ((variant-name (. vsym name))
+                                                (qualified (string-concat arena c-name
+                                                              (string-concat arena "_"
+                                                                (to-c-name arena variant-name)))))
+                                            ;; Register enum value for later lookup
+                                            (ctx-register-enum-value ctx variant-name qualified)
+                                            (emit-line em (string-concat arena "    "
+                                                            (string-concat arena qualified
+                                                              (if (< i (- type-len 1)) "," ""))))))
+                                        (_ ())))
+                                    ((none) ())))))
+                            (_ ()))
                           (dedent em)
                           (emit-line em (string-concat arena "} " (string-concat arena c-name ";")))
                           (emit-blank em))
-                        ((none) ()))))
+                        ((none) ())))
                   (_ ())))
               ((none) ()))))
         (_ ()))))
@@ -898,13 +1163,54 @@
         (when (> (list-len entries) 0)
           ;; Sort topologically
           (let ((sorted-indices (topological-sort-types arena entries)))
-            ;; Emit in sorted order
+
+            ;; First emit range types and enums WITHOUT dependencies - these are self-contained
+            ;; primitives and must come before anything that might reference them
+            ;; Note: Type aliases like (Result T E) have dependencies and are emitted later
+            (emit-line em "/* ===== Primitive Type Aliases and Enums ===== */")
+            (emit-blank em)
+            (for-each (idx sorted-indices)
+              (match (list-get entries idx)
+                ((some entry)
+                  (let ((kind (. entry kind))
+                        (has-deps (> (list-len (. entry deps)) 0)))
+                    ;; Only emit range/enum types that have NO dependencies here
+                    (when (and (or (== kind 'kind-range) (== kind 'kind-enum))
+                               (not has-deps))
+                      (emit-type-entry ctx em entry))))
+                ((none) ())))
+            (emit-blank em)
+
+            ;; Emit forward declarations for all records and unions
+            ;; This allows pointers to be used before full definitions
+            (emit-line em "/* ===== Forward Declarations ===== */")
+            (emit-blank em)
+            (for-each (idx sorted-indices)
+              (match (list-get entries idx)
+                ((some entry)
+                  (let ((kind (. entry kind)))
+                    (when (or (== kind 'kind-record) (== kind 'kind-union))
+                      (emit-line em (string-concat arena "typedef struct "
+                                      (string-concat arena (. entry name)
+                                        (string-concat arena " "
+                                          (string-concat arena (. entry name) ";"))))))))
+                ((none) ())))
+            (emit-blank em)
+
+            ;; Emit full type definitions in sorted order
+            ;; Skip enums and ranges WITHOUT dependencies (already emitted above)
+            ;; Include enums and ranges WITH dependencies (e.g., type aliases to Result types)
             (emit-line em "/* ===== Type Definitions (Topologically Sorted) ===== */")
             (emit-blank em)
             (for-each (idx sorted-indices)
               (match (list-get entries idx)
                 ((some entry)
-                  (emit-type-entry ctx em entry))
+                  (let ((kind (. entry kind))
+                        (has-deps (> (list-len (. entry deps)) 0)))
+                    ;; Emit if: not a range/enum, OR is a range/enum WITH deps
+                    (when (or (and (!= kind 'kind-range) (!= kind 'kind-enum))
+                              has-deps)
+                      (emit-type-entry ctx em entry))))
                 ((none) ()))))))))
 
 )

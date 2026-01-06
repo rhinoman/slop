@@ -1,0 +1,13 @@
+;; Test case: Inline record types
+;; This tests that inline records in generic types are handled correctly
+
+(module inline-record
+  (export make-pair)
+
+  ;; Function returning inline record type
+  ;; This should NOT generate "slop_list_record"
+  (fn make-pair ()
+    (@intent "Return a pair")
+    (@spec (() -> (record (x Int) (y Int))))
+    (record-new (record (x Int) (y Int)) (x 1) (y 2)))
+)

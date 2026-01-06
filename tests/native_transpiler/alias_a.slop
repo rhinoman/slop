@@ -1,0 +1,17 @@
+;; Test case: Module with type alias to Result type
+;; Tests that Result-based type aliases are emitted in correct order
+
+(module alias-a
+  (export MyError MyResult parse-something)
+
+  (type MyError (enum parse-error invalid-input))
+
+  ;; Type alias to a Result type
+  ;; The underlying slop_result_... type must be defined before this typedef
+  (type MyResult (Result String MyError))
+
+  (fn parse-something ((s String))
+    (@intent "Parse something and return result")
+    (@spec ((String) -> MyResult))
+    (ok s))
+)

@@ -16,7 +16,7 @@
   (import parser (SExpr SExprList SExprSymbol SExprNumber is-form))
   (import context
     (TranspileContext ctx-lookup-type ctx-register-option ctx-register-result ctx-register-list ctx-register-map))
-  (import names (to-c-type-name type-to-identifier))
+  (import names (to-c-type-name to-qualified-type-name type-to-identifier))
 
   (type ResultTypePair (record (ok (Ptr SExpr)) (err (Ptr SExpr))))
 
@@ -74,9 +74,8 @@
             (match (lookup-builtin-type name)
               ((some c-type) c-type)
               ((none)
-                (match (ctx-lookup-type ctx name)
-                  ((some info) (to-c-type-name arena name))
-                  ((none) (to-c-type-name arena name)))))))
+                ;; User-defined type - use qualified name with module prefix
+                (to-qualified-type-name arena ctx name)))))
         ((list lst)
           (let ((items (. lst items)))
             (match (list-get items 0)

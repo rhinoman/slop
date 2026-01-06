@@ -9,6 +9,7 @@
   (export
     to-c-name to-c-type-name
     to-qualified-name to-qualified-type-name
+    make-type-c-name
     type-to-identifier
     is-c-keyword is-runtime-builtin)
 
@@ -155,13 +156,28 @@
         ((string-eq name "Ptr") base-name)
         ((string-eq name "Void") base-name)
         (else
-         ;; If prefixing enabled and in module, prefix with module_
-         (if (ctx-get-prefixing ctx)
-           (match (ctx-get-module ctx)
-             ((some mod-name)
-              (string-concat arena (string-concat arena (to-c-type-name arena mod-name) "_") base-name))
-             ((none) base-name))
-           base-name)))))
+         ;; First check if this is an imported type - use its qualified name
+         (match (ctx-lookup-import ctx name)
+           ((some qualified) qualified)
+           ((none)
+             ;; If prefixing enabled and in module, prefix with current module_
+             (if (ctx-get-prefixing ctx)
+               (match (ctx-get-module ctx)
+                 ((some mod-name)
+                  (string-concat arena (string-concat arena (to-c-type-name arena mod-name) "_") base-name))
+                 ((none) base-name))
+               base-name)))))))
+
+  (fn make-type-c-name ((arena Arena) (type-name String) (mod-name String))
+    (@intent "Compute qualified C type name directly from module name (for type definitions)")
+    (@spec ((Arena String String) -> String))
+    (@pure)
+    (@pre (> (string-len type-name) 0))
+    (@pre (> (string-len mod-name) 0))
+    ;; For defining a type, we compute mod_name directly without checking import map
+    (let ((base-name (to-c-type-name arena type-name))
+          (mod-c-name (to-c-type-name arena mod-name)))
+      (string-concat arena mod-c-name (string-concat arena "_" base-name))))
 
   ;; ============================================================
   ;; Type to Identifier Conversion

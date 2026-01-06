@@ -1,0 +1,19 @@
+;; Test case: Type alias to Result type
+;; The typedef for MyResult must come AFTER the slop_result_... definition
+;; Bug: Type aliases are emitted in "Primitive Type Aliases" section
+;; before the generated Result types they depend on
+
+(module result-alias
+  (export MyError MyResult parse)
+
+  (type MyError (enum parse-error invalid))
+
+  ;; This type alias depends on slop_result_string_result_alias_MyError
+  ;; which must be defined first
+  (type MyResult (Result String MyError))
+
+  (fn parse ((s String))
+    (@intent "Parse and return result")
+    (@spec ((String) -> MyResult))
+    (ok s))
+)

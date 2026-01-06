@@ -13,7 +13,8 @@
   (import parser (SExpr SExprList SExprSymbol is-form
                   sexpr-line sexpr-col))
   (import context (TranspileContext ctx-push-scope ctx-pop-scope
-                   ctx-register-var ctx-lookup-var ctx-mark-pointer))
+                   ctx-register-var ctx-lookup-var ctx-mark-pointer
+                   ctx-get-return-type))
   (import transpiler-types (VarEntry))
   (import emit (Emitter emit-line emit-blank indent dedent))
   (import expr (transpile-expr is-pointer-expr infer-expr-c-type))
@@ -100,8 +101,12 @@
     (@pre (!= em nil))
     (@pre (!= expr nil))
     (let ((expr-str (transpile-expr ctx expr (none)))
-          (arena (. (deref em) arena)))
-      (if is-return
+          (arena (. (deref em) arena))
+          (ret-type (ctx-get-return-type ctx))
+          (is-void (match ret-type
+                     ((some t) (string-eq t "void"))
+                     ((none) true))))
+      (if (and is-return (not is-void))
         (emit-line em (string-concat arena "return " (string-concat arena expr-str ";")))
         (emit-line em (string-concat arena expr-str ";")))))
 
@@ -141,50 +146,90 @@
                                   (let ((var-name (. var-sym name))
                                         (is-mut (string-eq var-name "mut")))
                                     (if is-mut
-                                      ;; (mut name init) - mutable binding
-                                      (match (list-get (. binding-lst items) 1)
-                                        ((some real-name-expr)
-                                          (match (deref real-name-expr)
-                                            ((symbol real-name-sym)
-                                              (let ((real-name (. real-name-sym name))
-                                                    (c-name (to-c-name arena real-name)))
-                                                (match (list-get (. binding-lst items) 2)
-                                                  ((some init-expr)
-                                                    (let ((init-code (transpile-expr ctx init-expr (none)))
-                                                          (is-ptr (is-pointer-expr ctx init-expr))
-                                                          (inferred-type (match (infer-expr-c-type ctx init-expr)
-                                                                           ((some t) t)
-                                                                           ((none) "auto"))))
-                                                      (do
-                                                        (emit-line em (string-concat arena inferred-type
+                                      ;; (mut name init) or (mut name type init) - mutable binding
+                                      (let ((binding-len (list-len (. binding-lst items))))
+                                        (match (list-get (. binding-lst items) 1)
+                                          ((some real-name-expr)
+                                            (match (deref real-name-expr)
+                                              ((symbol real-name-sym)
+                                                (let ((real-name (. real-name-sym name))
+                                                      (c-name (to-c-name arena real-name)))
+                                                  (if (== binding-len 4)
+                                                    ;; (mut name type init) - has explicit type annotation
+                                                    (match (list-get (. binding-lst items) 2)
+                                                      ((some type-expr)
+                                                        (match (list-get (. binding-lst items) 3)
+                                                          ((some init-expr)
+                                                            (let ((init-code (transpile-expr ctx init-expr (none)))
+                                                                  (is-ptr (is-pointer-type type-expr))
+                                                                  (explicit-type (to-c-type ctx type-expr)))
+                                                              (do
+                                                                (emit-line em (string-concat arena explicit-type
+                                                                  (string-concat arena " "
+                                                                    (string-concat arena c-name
+                                                                      (string-concat arena " = "
+                                                                        (string-concat arena init-code ";"))))))
+                                                                (ctx-register-var ctx (VarEntry real-name c-name explicit-type is-ptr true))
+                                                                (when is-ptr (ctx-mark-pointer ctx c-name)))))
+                                                          ((none) (do))))
+                                                      ((none) (do)))
+                                                    ;; (mut name init) - use __auto_type for type inference
+                                                    (match (list-get (. binding-lst items) 2)
+                                                      ((some init-expr)
+                                                        (let ((init-code (transpile-expr ctx init-expr (none)))
+                                                              (is-ptr (is-pointer-expr ctx init-expr))
+                                                              (inferred-type (match (infer-expr-c-type ctx init-expr)
+                                                                               ((some t) t)
+                                                                               ((none) "auto"))))
+                                                          (do
+                                                            (emit-line em (string-concat arena "__auto_type "
+                                                              (string-concat arena c-name
+                                                                (string-concat arena " = "
+                                                                  (string-concat arena init-code ";")))))
+                                                            (ctx-register-var ctx (VarEntry real-name c-name inferred-type is-ptr true))
+                                                            (when is-ptr (ctx-mark-pointer ctx c-name)))))
+                                                      ((none) (do))))))
+                                              (_ (do))))
+                                          ((none) (do))))
+                                      ;; (name init) or (name type init) - immutable binding
+                                      (let ((c-name (to-c-name arena var-name))
+                                            (binding-len (list-len (. binding-lst items))))
+                                        (if (== binding-len 3)
+                                          ;; (name type init) - has explicit type annotation
+                                          (match (list-get (. binding-lst items) 1)
+                                            ((some type-expr)
+                                              (match (list-get (. binding-lst items) 2)
+                                                ((some init-expr)
+                                                  (let ((init-code (transpile-expr ctx init-expr (none)))
+                                                        (is-ptr (is-pointer-type type-expr))
+                                                        (explicit-type (to-c-type ctx type-expr)))
+                                                    (do
+                                                      (emit-line em (string-concat arena "const "
+                                                        (string-concat arena explicit-type
                                                           (string-concat arena " "
                                                             (string-concat arena c-name
                                                               (string-concat arena " = "
-                                                                (string-concat arena init-code ";"))))))
-                                                        (ctx-register-var ctx (VarEntry real-name c-name inferred-type is-ptr true))
-                                                        (when is-ptr (ctx-mark-pointer ctx c-name)))))
-                                                  ((none) (do)))))
-                                            (_ (do))))
-                                        ((none) (do)))
-                                      ;; (name init) - immutable binding
-                                      (let ((c-name (to-c-name arena var-name)))
-                                        (match (list-get (. binding-lst items) 1)
-                                          ((some init-expr)
-                                            (let ((init-code (transpile-expr ctx init-expr (none)))
-                                                  (is-ptr (is-pointer-expr ctx init-expr))
-                                                  (inferred-type (match (infer-expr-c-type ctx init-expr)
-                                                                   ((some t) t)
-                                                                   ((none) "auto"))))
-                                              (do
-                                                (emit-line em (string-concat arena "const "
-                                                  (string-concat arena inferred-type
-                                                    (string-concat arena " "
-                                                      (string-concat arena c-name
-                                                        (string-concat arena " = "
-                                                          (string-concat arena init-code ";")))))))
-                                                (ctx-register-var ctx (VarEntry var-name c-name inferred-type is-ptr false))
-                                                (when is-ptr (ctx-mark-pointer ctx c-name)))))
-                                          ((none) (do)))))))
+                                                                (string-concat arena init-code ";")))))))
+                                                      (ctx-register-var ctx (VarEntry var-name c-name explicit-type is-ptr false))
+                                                      (when is-ptr (ctx-mark-pointer ctx c-name)))))
+                                                ((none) (do))))
+                                            ((none) (do)))
+                                          ;; (name init) - use __auto_type for type inference
+                                          (match (list-get (. binding-lst items) 1)
+                                            ((some init-expr)
+                                              (let ((init-code (transpile-expr ctx init-expr (none)))
+                                                    (is-ptr (is-pointer-expr ctx init-expr))
+                                                    (inferred-type (match (infer-expr-c-type ctx init-expr)
+                                                                     ((some t) t)
+                                                                     ((none) "auto"))))
+                                                (do
+                                                  (emit-line em (string-concat arena "__auto_type "
+                                                    (string-concat arena c-name
+                                                      (string-concat arena " = "
+                                                        (string-concat arena init-code ";")))))
+                                                  (ctx-register-var ctx (VarEntry var-name c-name inferred-type is-ptr false))
+                                                  (when is-ptr (ctx-mark-pointer ctx c-name)))))
+                                            ((none) (do))))))))
                                 (_ (do))))
                             ((none) (do))))
                         (_ (do))))
@@ -493,6 +538,7 @@
     (match (list-get (. lst items) 1)
       ((some target-expr)
         (let ((target-code (transpile-expr ctx target-expr (none)))
+              (target-type (infer-expr-c-type ctx target-expr))
               (arena (. (deref em) arena))
               (clauses (list-new arena (Ptr SExpr)))
               (len (list-len (. lst items))))
@@ -526,9 +572,9 @@
                                         ((string-eq head-name "error")
                                           (transpile-result-match ctx em target-code clauses is-return))
                                         ((string-eq head-name "list")
-                                          (transpile-union-match ctx em target-code clauses is-return))
+                                          (transpile-union-match ctx em target-code target-type clauses is-return))
                                         ((string-eq head-name "symbol")
-                                          (transpile-union-match ctx em target-code clauses is-return))
+                                          (transpile-union-match ctx em target-code target-type clauses is-return))
                                         (else
                                           (transpile-enum-match ctx em target-code clauses is-return)))))
                                   (_ (transpile-enum-match ctx em target-code clauses is-return))))
@@ -594,8 +640,11 @@
             ((none) (do)))
           (set! i (+ i 1)))
 
-        ;; Emit if/else structure
-        (emit-line em (string-concat arena "if (" (string-concat arena target-code ".has_value) {")))
+        ;; Emit if/else structure - evaluate target once to avoid C2x issues
+        ;; with anonymous structs in statement expressions
+        (emit-line em "{ __auto_type _match_opt = ")
+        (emit-line em (string-concat arena target-code ";"))
+        (emit-line em "if (_match_opt.has_value) {")
         (indent em)
         (match some-clause
           ((some some-c)
@@ -604,11 +653,9 @@
               (when (> (string-len some-binding) 0)
                 (let ((binding-c-name (to-c-name arena some-binding)))
                   (do
-                    (emit-line em (string-concat arena "auto "
-                      (string-concat arena binding-c-name
-                        (string-concat arena " = "
-                          (string-concat arena target-code ".value;")))))
-                    (ctx-register-var ctx (VarEntry some-binding binding-c-name "auto" false false)))))
+                    (emit-line em (string-concat arena "__auto_type "
+                      (string-concat arena binding-c-name " = _match_opt.value;")))
+                    (ctx-register-var ctx (VarEntry some-binding binding-c-name "__auto_type" false false)))))
               (match (deref some-c)
                 ((list some-lst)
                   (match (list-get (. some-lst items) 1)
@@ -630,7 +677,7 @@
               (_ (do))))
           ((none) (do)))
         (dedent em)
-        (emit-line em "}"))))
+        (emit-line em "} }"))))  ;; Close else and outer block
 
   (fn transpile-result-match ((ctx (Ptr TranspileContext)) (em (Ptr Emitter))
                               (target-code String) (clauses (List (Ptr SExpr)))
@@ -695,8 +742,10 @@
             ((none) (do)))
           (set! i (+ i 1)))
 
-        ;; Emit if/else structure
-        (emit-line em (string-concat arena "if (" (string-concat arena target-code ".is_ok) {")))
+        ;; Emit if/else structure - evaluate target once to avoid C2x issues
+        (emit-line em "{ __auto_type _match_res = ")
+        (emit-line em (string-concat arena target-code ";"))
+        (emit-line em "if (_match_res.is_ok) {")
         (indent em)
         (match ok-clause
           ((some ok-c)
@@ -705,11 +754,9 @@
               (when (> (string-len ok-binding) 0)
                 (let ((binding-c-name (to-c-name arena ok-binding)))
                   (do
-                    (emit-line em (string-concat arena "auto "
-                      (string-concat arena binding-c-name
-                        (string-concat arena " = "
-                          (string-concat arena target-code ".data.ok;")))))
-                    (ctx-register-var ctx (VarEntry ok-binding binding-c-name "auto" false false)))))
+                    (emit-line em (string-concat arena "__auto_type "
+                      (string-concat arena binding-c-name " = _match_res.data.ok;")))
+                    (ctx-register-var ctx (VarEntry ok-binding binding-c-name "__auto_type" false false)))))
               (match (deref ok-c)
                 ((list ok-lst)
                   (match (list-get (. ok-lst items) 1)
@@ -728,11 +775,9 @@
               (when (> (string-len err-binding) 0)
                 (let ((binding-c-name (to-c-name arena err-binding)))
                   (do
-                    (emit-line em (string-concat arena "auto "
-                      (string-concat arena binding-c-name
-                        (string-concat arena " = "
-                          (string-concat arena target-code ".data.err;")))))
-                    (ctx-register-var ctx (VarEntry err-binding binding-c-name "auto" false false)))))
+                    (emit-line em (string-concat arena "__auto_type "
+                      (string-concat arena binding-c-name " = _match_res.data.err;")))
+                    (ctx-register-var ctx (VarEntry err-binding binding-c-name "__auto_type" false false)))))
               (match (deref err-c)
                 ((list err-lst)
                   (match (list-get (. err-lst items) 1)
@@ -742,7 +787,7 @@
               (ctx-pop-scope ctx)))
           ((none) (do)))
         (dedent em)
-        (emit-line em "}"))))
+        (emit-line em "} }"))))  ;; Close else and outer block
 
   (fn transpile-enum-match ((ctx (Ptr TranspileContext)) (em (Ptr Emitter))
                             (target-code String) (clauses (List (Ptr SExpr)))
@@ -799,15 +844,18 @@
         (emit-line em "}"))))
 
   (fn transpile-union-match ((ctx (Ptr TranspileContext)) (em (Ptr Emitter))
-                             (target-code String) (clauses (List (Ptr SExpr)))
-                             (is-return Bool))
+                             (target-code String) (union-type (Option String))
+                             (clauses (List (Ptr SExpr))) (is-return Bool))
     (@intent "Transpile match on tagged union")
-    (@spec (((Ptr TranspileContext) (Ptr Emitter) String (List (Ptr SExpr)) Bool) -> Unit))
+    (@spec (((Ptr TranspileContext) (Ptr Emitter) String (Option String) (List (Ptr SExpr)) Bool) -> Unit))
     (@pre (!= ctx nil))
     (@pre (!= em nil))
     ;; switch (target.tag) { case TAG_variant: binding = target.data.variant; ... }
     (let ((arena (. (deref em) arena))
           (len (list-len clauses))
+          (type-prefix (match union-type
+                         ((some t) t)
+                         ((none) "")))
           (mut i 0))
       (do
         (emit-line em (string-concat arena "switch (" (string-concat arena target-code ".tag) {")))
@@ -834,7 +882,10 @@
                               (dedent em)
                               (emit-line em "}"))
                             (let ((tag-name (to-c-name arena (. pat-sym name))))
-                              (emit-line em (string-concat arena "case " (string-concat arena tag-name "_TAG: {")))
+                              (emit-line em (string-concat arena "case "
+                                (string-concat arena type-prefix
+                                  (string-concat arena "_"
+                                    (string-concat arena tag-name "_TAG: {")))))
                               (indent em)
                               (ctx-push-scope ctx)
                               (match (list-get (. clause-lst items) 1)
@@ -850,7 +901,10 @@
                               (match (deref variant-expr)
                                 ((symbol variant-sym)
                                   (let ((tag-name (to-c-name arena (. variant-sym name))))
-                                    (emit-line em (string-concat arena "case " (string-concat arena tag-name "_TAG: {")))
+                                    (emit-line em (string-concat arena "case "
+                                      (string-concat arena type-prefix
+                                        (string-concat arena "_"
+                                          (string-concat arena tag-name "_TAG: {")))))
                                     (indent em)
                                     (ctx-push-scope ctx)
                                     ;; Extract binding if present
@@ -891,7 +945,7 @@
 
   (fn transpile-set ((ctx (Ptr TranspileContext)) (em (Ptr Emitter))
                      (lst SExprList))
-    (@intent "Transpile set!: (set! target value)")
+    (@intent "Transpile set!: (set! target value) or (set! target field value)")
     (@spec (((Ptr TranspileContext) (Ptr Emitter) SExprList) -> Unit))
     (@pre (!= ctx nil))
     (@pre (!= em nil))
@@ -901,18 +955,52 @@
     ;; - Field: (set! (. obj field) value) -> obj.field = value
     ;; - Index: (set! (@ arr i) value) -> arr[i] = value
     ;; - Deref: (set! (deref ptr) value) -> *ptr = value
-    (match (list-get (. lst items) 1)
-      ((some target-expr)
-        (match (list-get (. lst items) 2)
-          ((some value-expr)
-            (let ((target-code (transpile-expr ctx target-expr (none)))
-                  (value-code (transpile-expr ctx value-expr (none)))
-                  (arena (. (deref em) arena)))
-              (emit-line em (string-concat arena target-code
-                (string-concat arena " = "
-                  (string-concat arena value-code ";"))))))
-          ((none) (emit-line em "/* set!: missing value */"))))
-      ((none) (emit-line em "/* set!: missing target */"))))
+    ;; - Field on target: (set! target field value) -> target->field = value or target.field = value
+    (let ((items (. lst items))
+          (len (list-len items))
+          (arena (. (deref em) arena)))
+      (if (== len 4)
+        ;; (set! target field value) - field mutation
+        (match (list-get items 1)
+          ((some target-expr)
+            (match (list-get items 2)
+              ((some field-expr)
+                (match (deref field-expr)
+                  ((symbol field-sym)
+                    (match (list-get items 3)
+                      ((some value-expr)
+                        (let ((target-code (transpile-expr ctx target-expr (none)))
+                              (field-name (to-c-name arena (. field-sym name)))
+                              (value-code (transpile-expr ctx value-expr (none))))
+                          ;; Use -> for pointers, . for values
+                          (if (is-pointer-expr ctx target-expr)
+                            (emit-line em (string-concat arena target-code
+                              (string-concat arena "->"
+                                (string-concat arena field-name
+                                  (string-concat arena " = "
+                                    (string-concat arena value-code ";"))))))
+                            (emit-line em (string-concat arena "("
+                              (string-concat arena target-code
+                                (string-concat arena ")."
+                                  (string-concat arena field-name
+                                    (string-concat arena " = "
+                                      (string-concat arena value-code ";"))))))))))
+                      ((none) (emit-line em "/* set!: missing value */"))))
+                  (_ (emit-line em "/* set!: field must be a symbol */"))))
+              ((none) (emit-line em "/* set!: missing field */"))))
+          ((none) (emit-line em "/* set!: missing target */")))
+        ;; (set! target value) - simple assignment
+        (match (list-get items 1)
+          ((some target-expr)
+            (match (list-get items 2)
+              ((some value-expr)
+                (let ((target-code (transpile-expr ctx target-expr (none)))
+                      (value-code (transpile-expr ctx value-expr (none))))
+                  (emit-line em (string-concat arena target-code
+                    (string-concat arena " = "
+                      (string-concat arena value-code ";"))))))
+              ((none) (emit-line em "/* set!: missing value */"))))
+          ((none) (emit-line em "/* set!: missing target */"))))))
 
   ;; ============================================================
   ;; Sequencing and Scopes
@@ -934,7 +1022,7 @@
     (@pre (!= ctx nil))
     (@pre (!= em nil))
     (@pre (>= (list-len (. lst items)) 3))
-    ;; Emit: { slop_arena* arena = slop_arena_new(size); ... slop_arena_free(arena); }
+    ;; Emit: { slop_arena _arena = slop_arena_new(size); slop_arena* arena = &_arena; ... slop_arena_free(arena); }
     (match (list-get (. lst items) 1)
       ((some size-expr)
         (let ((size-code (transpile-expr ctx size-expr (none)))
@@ -942,7 +1030,8 @@
           (do
             (emit-line em "{")
             (indent em)
-            (emit-line em (string-concat arena "slop_arena* arena = slop_arena_new(" (string-concat arena size-code ");")))
+            (emit-line em (string-concat arena "slop_arena _arena = slop_arena_new(" (string-concat arena size-code ");")))
+            (emit-line em "slop_arena* arena = &_arena;")
             (ctx-push-scope ctx)
             (ctx-register-var ctx (VarEntry "arena" "arena" "slop_arena*" true false))
             (transpile-body ctx em lst 2 is-return)

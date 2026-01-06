@@ -1,0 +1,22 @@
+;; Test case: Primitive type constructor
+;; Tests that (String data len) generates C struct literal, not function call
+;;
+;; Expected C: ((slop_string){.data = data, .len = len})
+;; Bug produces: strlib_String(data, len) (function call)
+
+(module string-constructor-test
+  (export main)
+
+  (ffi "string.h"
+    (strlen ((s (Ptr U8))) U64))
+
+  (fn make-string ((data (Ptr U8)) (len U64))
+    (@intent "Create a string from data and length")
+    (@spec (((Ptr U8) U64) -> String))
+    (String data len))
+
+  (fn main ()
+    (@intent "Test string constructor")
+    (@spec (() -> Int))
+    0)
+)

@@ -1809,11 +1809,30 @@ def cmd_build(args):
 
             # Transpile all modules to separate files
             print("  Transpiling to C...")
-            from slop.transpiler import transpile_multi_split
             import tempfile
             import subprocess
+            import json
 
-            results = transpile_multi_split(graph.modules, order)
+            results = {}
+            if native_transpiler_bin:
+                # Use native transpiler - it outputs JSON with per-module header/impl
+                source_files = [str(graph.modules[name].path) for name in order]
+                cmd = [native_transpiler_bin] + source_files
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    print(f"Native transpiler failed:\n{result.stderr}")
+                    return 1
+                try:
+                    results = json.loads(result.stdout)
+                    # Convert from {"mod": {"header": ..., "impl": ...}} to {"mod": (header, impl)}
+                    results = {name: (data['header'], data['impl']) for name, data in results.items()}
+                except json.JSONDecodeError as e:
+                    print(f"Failed to parse native transpiler output: {e}")
+                    return 1
+            else:
+                # Fall back to Python transpiler
+                from slop.transpiler import transpile_multi_split
+                results = transpile_multi_split(graph.modules, order)
 
             # Write to temp directory and compile
             runtime_path = _get_runtime_path()

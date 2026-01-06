@@ -8,5 +8,6 @@ include = [
     "transpiler",
     "common",
     "checker",
-    "../../lib/std/strlib"
+    "../../lib/std/strlib",
+    "../../lib/std/io"
 ]

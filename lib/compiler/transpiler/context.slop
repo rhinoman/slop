@@ -29,11 +29,13 @@
     ;; FFI registry
     ctx-register-ffi-func ctx-lookup-ffi-func
     ctx-register-ffi-struct ctx-lookup-ffi-struct
-    ctx-add-include ctx-get-includes
+    ctx-add-include ctx-get-includes ctx-clear-includes
     ;; Module context
     ctx-set-module ctx-get-module
     ctx-set-prefixing ctx-get-prefixing
-    ctx-register-import ctx-lookup-import
+    ctx-register-import ctx-lookup-import ctx-clear-import-map
+    ctx-register-type-def ctx-lookup-type-def ctx-lookup-type-module
+    ctx-register-fn-module ctx-lookup-fn-module
     ;; Generic type tracking
     ctx-register-option ctx-register-result
     ctx-register-list ctx-register-map
@@ -95,6 +97,9 @@
     (current-module (Option String))
     (enable-prefixing Bool)
     (import-map (Map String String))      ;; local -> qualified
+    (type-defs (Map String String))       ;; ptr-str -> c-name for type definitions
+    (type-modules (Map String String))    ;; ptr-str -> module-name
+    (fn-modules (Map String String))      ;; ptr-str -> module-name for functions
     ;; Generic type tracking
     (generated-options (Map String String))  ;; type_name -> inner_type
     (generated-results (Map String ResultTypeInfo))
@@ -113,7 +118,9 @@
     (@post (!= $result nil))
     (@example (arena) -> (!= nil))
     (@example (arena) -> (-> enable-prefixing false))
-    (let ((ctx (cast (Ptr TranspileContext) (arena-alloc arena 8192))))
+    ;; TranspileContext contains 14 Maps (~10-20KB each) = ~200KB+
+    ;; Allocate 512KB to be safe
+    (let ((ctx (cast (Ptr TranspileContext) (arena-alloc arena 524288))))
       (set! (deref ctx) (TranspileContext
         arena
         (none)                       ;; type-env (set by ctx-set-type-env)
@@ -131,6 +138,9 @@
         (none)                       ;; current-module
         false                        ;; enable-prefixing
         (map-new arena)              ;; import-map
+        (map-new arena)              ;; type-defs
+        (map-new arena)              ;; type-modules
+        (map-new arena)              ;; fn-modules
         (map-new arena)              ;; generated-options
         (map-new arena)              ;; generated-results
         (map-new arena)              ;; generated-lists
@@ -237,15 +247,18 @@
     (@pure)
     ;; Search scopes from top (innermost) to bottom (outermost)
     (let ((scopes (. (deref ctx) var-scopes))
-          (len (list-len scopes))
-          (mut i (- len 1)))
-      (while (>= i 0)
-        (let ((scope (@ scopes i)))
-          (match (map-get scope name)
-            ((some entry) (return (some entry)))
-            (_ (none))))
-        (set! i (- i 1)))
-      (none)))
+          (len (list-len scopes)))
+      ;; Check for empty scopes BEFORE computing index to avoid unsigned underflow
+      (if (== len 0)
+        (none)
+        (let ((mut i (cast Int (- len 1))))
+          (while (>= i 0)
+            (let ((scope (@ scopes (cast U64 i))))
+              (match (map-get scope name)
+                ((some entry) (return (some entry)))
+                (_ (none))))
+            (set! i (- i 1)))
+          (none)))))
 
   (fn ctx-mark-pointer ((ctx (Ptr TranspileContext)) (name String))
     (@intent "Mark a variable as being a pointer")
@@ -345,6 +358,13 @@
     (@pure)
     (. (deref ctx) ffi-includes))
 
+  (fn ctx-clear-includes ((ctx (Ptr TranspileContext)))
+    (@intent "Clear FFI include headers for new module")
+    (@spec (((Ptr TranspileContext)) -> Unit))
+    (@pre (!= ctx nil))
+    ;; Reset length to 0 (keeps capacity)
+    (set! (. (. (deref ctx) ffi-includes) len) 0))
+
   ;; ============================================================
   ;; Module Context
   ;; ============================================================
@@ -388,6 +408,58 @@
     (@pre (!= ctx nil))
     (@pure)
     (map-get (. (deref ctx) import-map) local))
+
+  (fn ctx-clear-import-map ((ctx (Ptr TranspileContext)))
+    (@intent "Clear import map for fresh module context")
+    (@spec (((Ptr TranspileContext)) -> Unit))
+    (@pre (!= ctx nil))
+    (set! (. (deref ctx) import-map) (map-new (. (deref ctx) arena))))
+
+  (fn ctx-register-type-def ((ctx (Ptr TranspileContext)) (arena Arena)
+                             (form-ptr Int) (c-name String) (mod-name String))
+    (@intent "Register type form's C name and module by pointer address")
+    (@spec (((Ptr TranspileContext) Arena Int String String) -> Unit))
+    (@pre (!= ctx nil))
+    ;; Key is pointer address as string
+    (let ((key (int-to-string arena form-ptr)))
+      (do
+        (map-put (. (deref ctx) type-defs) key c-name)
+        (map-put (. (deref ctx) type-modules) key mod-name))))
+
+  (fn ctx-lookup-type-def ((ctx (Ptr TranspileContext)) (arena Arena)
+                           (form-ptr Int))
+    (@intent "Look up C name for a type by form pointer")
+    (@spec (((Ptr TranspileContext) Arena Int) -> (Option String)))
+    (@pre (!= ctx nil))
+    (@pure)
+    (let ((key (int-to-string arena form-ptr)))
+      (map-get (. (deref ctx) type-defs) key)))
+
+  (fn ctx-lookup-type-module ((ctx (Ptr TranspileContext)) (arena Arena)
+                              (form-ptr Int))
+    (@intent "Look up module name for a type by form pointer")
+    (@spec (((Ptr TranspileContext) Arena Int) -> (Option String)))
+    (@pre (!= ctx nil))
+    (@pure)
+    (let ((key (int-to-string arena form-ptr)))
+      (map-get (. (deref ctx) type-modules) key)))
+
+  (fn ctx-register-fn-module ((ctx (Ptr TranspileContext)) (arena Arena)
+                              (form-ptr Int) (mod-name String))
+    (@intent "Register function form's module by pointer address")
+    (@spec (((Ptr TranspileContext) Arena Int String) -> Unit))
+    (@pre (!= ctx nil))
+    (let ((key (int-to-string arena form-ptr)))
+      (map-put (. (deref ctx) fn-modules) key mod-name)))
+
+  (fn ctx-lookup-fn-module ((ctx (Ptr TranspileContext)) (arena Arena)
+                            (form-ptr Int))
+    (@intent "Look up module name for a function by form pointer")
+    (@spec (((Ptr TranspileContext) Arena Int) -> (Option String)))
+    (@pre (!= ctx nil))
+    (@pure)
+    (let ((key (int-to-string arena form-ptr)))
+      (map-get (. (deref ctx) fn-modules) key)))
 
   ;; ============================================================
   ;; Generic Type Tracking
