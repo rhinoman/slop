@@ -50,6 +50,8 @@
     ctx-add-import ctx-get-imports
     ;; Type conversion with prefixing
     to-c-type-prefixed
+    ;; Gensym for unique variable names
+    ctx-gensym
     ;; Hash helper
     simple-hash)
 
@@ -136,7 +138,9 @@
       ;; Type aliases to Result types (for ok/error expression type tracking)
       (result-type-aliases (List ResultTypeAlias))
       ;; Inline record types (anonymous struct types)
-      (inline-records (List InlineRecord))))
+      (inline-records (List InlineRecord))
+      ;; Gensym counter for unique variable names
+      (gensym-counter Int)))
 
   (type EnumVariant (record
     (variant-name String)
@@ -201,6 +205,7 @@
       (set! (deref ctx) list-types (list-new arena ListType))
       (set! (deref ctx) result-type-aliases (list-new arena ResultTypeAlias))
       (set! (deref ctx) inline-records (list-new arena InlineRecord))
+      (set! (deref ctx) gensym-counter 0)
       ctx))
 
   (fn ctx-reset-for-new-module ((ctx (Ptr TranspileContext)) (mod-name String))
@@ -1054,5 +1059,20 @@
               ;; Not a symbol head
               (_ "void*")))
           ((none) "void*")))))
+
+  ;; ============================================================
+  ;; Gensym for Unique Variable Names
+  ;; ============================================================
+
+  (fn ctx-gensym ((ctx (Ptr TranspileContext)) (prefix String))
+    (@intent "Generate a unique variable name with the given prefix")
+    (@spec (((Ptr TranspileContext) String) -> String))
+    (@pre {ctx != nil})
+    (let ((arena (. (deref ctx) arena))
+          (counter (. (deref ctx) gensym-counter)))
+      ;; Increment counter
+      (set! (deref ctx) gensym-counter (+ counter 1))
+      ;; Generate name: prefix_N
+      (ctx-str3 ctx prefix "_" (int-to-string arena counter))))
 
 ) ;; end module

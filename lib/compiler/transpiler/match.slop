@@ -16,7 +16,7 @@
   (import types (SExpr SExprList SExprSymbol SExprString SExprNumber))
   (import context (TranspileContext ctx-emit ctx-indent ctx-dedent ctx-push-scope ctx-pop-scope
                    ctx-bind-var ctx-str ctx-str3 ctx-str4 ctx-str5 VarEntry
-                   ctx-lookup-enum-variant ctx-get-current-return-type))
+                   ctx-lookup-enum-variant ctx-get-current-return-type ctx-gensym))
   (import strlib (starts-with char-at))
   (import ctype (to-c-name to-c-type))
   (import expr (transpile-expr))
@@ -187,7 +187,7 @@
                     (let ((scrutinee-c (transpile-expr ctx scrutinee))
                           (patterns (collect-patterns ctx items))
                           ;; Generate unique variable name for the scrutinee
-                          (scrutinee-var (ctx-str ctx "_match_val" "")))
+                          (scrutinee-var (ctx-gensym ctx "_mv")))
                       ;; Store scrutinee in a variable first (avoids multiple evaluation)
                       (ctx-emit ctx (ctx-str4 ctx "__auto_type " scrutinee-var " = " (ctx-str ctx scrutinee-c ";")))
                       ;; Dispatch based on pattern types
