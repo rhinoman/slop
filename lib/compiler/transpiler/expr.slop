@@ -1976,6 +1976,13 @@
                             (match (list-get items (- (list-len items) 1))
                               ((some body) (infer-expr-c-type ctx body))
                               ((none) "int64_t"))))
+                        ;; do expression - infer from last subexpression
+                        ((string-eq op "do")
+                          (if (< (list-len items) 2)
+                            "void"
+                            (match (list-get items (- (list-len items) 1))
+                              ((some last-expr) (infer-expr-c-type ctx last-expr))
+                              ((none) "void"))))
                         ;; Cond expression - infer from first clause's body
                         ((string-eq op "cond")
                           (infer-cond-result-c-type ctx items))
@@ -2018,6 +2025,7 @@
                               (let ((ret-type (. func-entry return-type)))
                                 (cond
                                   ((. func-entry returns-string) "slop_string")
+                                  ((string-eq ret-type "void") "void")
                                   ((> (string-len ret-type) 0) ret-type)
                                   (else "int64_t"))))
                             ((none) "int64_t"))))))
@@ -2031,6 +2039,7 @@
     (@pre {ctx != nil})
     (let ((arena (. (deref ctx) arena))
           (len (list-len items))
+          (result-type (infer-match-result-c-type ctx items))
           (mut ok-body "0")
           (mut err-body "0")
           (mut ok-binding "")
@@ -2071,7 +2080,7 @@
           ((none) (do)))
         (set! i (+ i 1)))
       ;; Build GCC statement expression with if/else
-      ;; ({ __auto_type _mv = scrutinee; __auto_type _mr;
+      ;; ({ __auto_type _mv = scrutinee; <type> _mr;
       ;;    if (_mv.is_ok) { ok_bind _mr = ok_body; } else { err_bind _mr = err_body; } _mr; })
       (let ((ok-bind (if (string-eq ok-binding "")
                         ""
@@ -2079,16 +2088,27 @@
             (err-bind (if (string-eq err-binding "")
                          ""
                          (ctx-str3 ctx "__auto_type " (to-c-name arena err-binding) " = _mv.data.err; "))))
-        (ctx-str ctx
-          (ctx-str ctx "({ __auto_type _mv = " scrutinee-c)
-          (ctx-str ctx "; int64_t _mr; if (_mv.is_ok) { "
-            (ctx-str ctx ok-bind
-              (ctx-str ctx "_mr = "
+        (if (string-eq result-type "void")
+          ;; Void match - execute branches for side effects only
+          (ctx-str ctx
+            (ctx-str ctx "({ __auto_type _mv = " scrutinee-c)
+            (ctx-str ctx "; if (_mv.is_ok) { "
+              (ctx-str ctx ok-bind
                 (ctx-str ctx ok-body
                   (ctx-str ctx "; } else { "
                     (ctx-str ctx err-bind
-                      (ctx-str ctx "_mr = "
-                        (ctx-str ctx err-body "; } _mr; })"))))))))))))
+                      (ctx-str ctx err-body "; } (void)0; })"))))))))
+          ;; Normal match with result variable using inferred type
+          (ctx-str ctx
+            (ctx-str ctx "({ __auto_type _mv = " scrutinee-c)
+            (ctx-str ctx (ctx-str3 ctx "; " result-type " _mr; if (_mv.is_ok) { ")
+              (ctx-str ctx ok-bind
+                (ctx-str ctx "_mr = "
+                  (ctx-str ctx ok-body
+                    (ctx-str ctx "; } else { "
+                      (ctx-str ctx err-bind
+                        (ctx-str ctx "_mr = "
+                          (ctx-str ctx err-body "; } _mr; })"))))))))))))
 
   (fn build-union-match-expr ((ctx (Ptr TranspileContext)) (scrutinee-c String) (items (List (Ptr SExpr))))
     (@intent "Build union (tagged union) match as GCC statement expression with switch")
