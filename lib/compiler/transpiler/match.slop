@@ -669,6 +669,9 @@
                           ;; when - conditional execution
                           ((string-eq op "when")
                             (emit-inline-when ctx items))
+                          ;; cond - chained conditionals
+                          ((string-eq op "cond")
+                            (emit-inline-cond ctx items is-return is-last))
                           ;; match - nested match (recurse)
                           ((string-eq op "match")
                             (transpile-match ctx body-expr is-return))
@@ -1070,6 +1073,80 @@
               (set! i (+ i 1))))
           (ctx-dedent ctx)
           (ctx-emit ctx "}")))))
+
+  (fn emit-inline-cond ((ctx (Ptr TranspileContext)) (items (List (Ptr SExpr))) (is-return Bool) (is-last Bool))
+    (@intent "Emit inline cond statement (to avoid circular dep with stmt)")
+    (@spec (((Ptr TranspileContext) (List (Ptr SExpr)) Bool Bool) -> Unit))
+    (@pre {ctx != nil})
+    ;; (cond (test1 body1...) (test2 body2...) (else body...))
+    (let ((arena (. (deref ctx) arena))
+          (len (list-len items))
+          (mut i 1)
+          (mut first true))
+      (while (< i len)
+        (match (list-get items i)
+          ((some clause-expr)
+            (match (deref clause-expr)
+              ((list clause-lst)
+                (let ((clause-items (. clause-lst items))
+                      (clause-len (list-len clause-items)))
+                  (if (< clause-len 1)
+                    (ctx-emit ctx "/* invalid cond clause */")
+                    (match (list-get clause-items 0)
+                      ((some test-expr)
+                        (match (deref test-expr)
+                          ;; Check for 'else' keyword
+                          ((symbol sym)
+                            (if (string-eq (. sym name) "else")
+                              (do
+                                ;; else clause
+                                (ctx-emit ctx "} else {")
+                                (ctx-indent ctx)
+                                (emit-inline-cond-body ctx clause-items 1 is-return is-last)
+                                (ctx-dedent ctx))
+                              (do
+                                ;; Regular test clause with symbol condition
+                                (let ((cond-c (transpile-expr ctx test-expr)))
+                                  (if first
+                                    (do
+                                      (ctx-emit ctx (ctx-str3 ctx "if (" cond-c ") {"))
+                                      (set! first false))
+                                    (ctx-emit ctx (ctx-str3 ctx "} else if (" cond-c ") {")))
+                                  (ctx-indent ctx)
+                                  (emit-inline-cond-body ctx clause-items 1 is-return is-last)
+                                  (ctx-dedent ctx)))))
+                          ;; Non-symbol test - evaluate as expression
+                          (else
+                            (let ((cond-c (transpile-expr ctx test-expr)))
+                              (if first
+                                (do
+                                  (ctx-emit ctx (ctx-str3 ctx "if (" cond-c ") {"))
+                                  (set! first false))
+                                (ctx-emit ctx (ctx-str3 ctx "} else if (" cond-c ") {")))
+                              (ctx-indent ctx)
+                              (emit-inline-cond-body ctx clause-items 1 is-return is-last)
+                              (ctx-dedent ctx)))))
+                      ((none) (ctx-emit ctx "/* missing test */"))))))
+              (else (ctx-emit ctx "/* cond clause must be list */"))))
+          ((none) (do)))
+        (set! i (+ i 1)))
+      ;; Close final brace
+      (when (not first)
+        (ctx-emit ctx "}"))))
+
+  (fn emit-inline-cond-body ((ctx (Ptr TranspileContext)) (items (List (Ptr SExpr))) (start Int) (is-return Bool) (is-last Bool))
+    (@intent "Emit body statements of a cond clause inline")
+    (@spec (((Ptr TranspileContext) (List (Ptr SExpr)) Int Bool Bool) -> Unit))
+    (@pre {ctx != nil})
+    (let ((len (list-len items))
+          (mut i start))
+      (while (< i len)
+        (match (list-get items i)
+          ((some body-expr)
+            (let ((body-is-last (== i (- len 1))))
+              (emit-branch-body-item ctx body-expr is-return (and is-last body-is-last))))
+          ((none) (do)))
+        (set! i (+ i 1)))))
 
   ;; ============================================================
   ;; Helper for typed none in returns

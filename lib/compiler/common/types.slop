@@ -257,8 +257,8 @@
     (@pure)
     (let ((new-has-min (and (. a has-min) (. b has-min)))
           (new-has-max (and (. a has-max) (. b has-max)))
-          (new-min-val (if (and (. a has-min) (. b has-min)) (min (. a min-val) (. b min-val)) 0))
-          (new-max-val (if (and (. a has-max) (. b has-max)) (max (. a max-val) (. b max-val)) 0)))
+          (new-min-val (if (and (. a has-min) (. b has-min)) (min (. a min-val) (. b min-val)) (. a min-val)))
+          (new-max-val (if (and (. a has-max) (. b has-max)) (max (. a max-val) (. b max-val)) (. a max-val))))
       (RangeBounds new-has-min new-has-max new-min-val new-max-val)))
 
   ;; ============================================================

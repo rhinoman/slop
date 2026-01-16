@@ -261,11 +261,11 @@
 
         ;; (set! var expr) - infer expr for error checking, returns Unit
         ((string-eq op "set!")
-          (when (>= len 3)
-            (match (list-get items 2)
-              ((some val-expr) (let ((_ (infer-expr env val-expr))) (do)))
-              ((none) (do))))
-          (env-get-unit-type env))
+          (do (when (>= len 3)
+                (match (list-get items 2)
+                  ((some val-expr) (let ((_ (infer-expr env val-expr))) (do)))
+                  ((none) (do))))
+              (env-get-unit-type env)))
 
         ;; (return expr) - type of expr
         ((string-eq op "return")
@@ -367,8 +367,8 @@
         (else
           (match (env-lookup-function env op)
             ((some sig)
-              (check-fn-call-args env sig expr line col)
-              (. (deref sig) return-type))
+              (do (check-fn-call-args env sig expr line col)
+                  (. (deref sig) return-type)))
             ;; Not a function - check if it's a type constructor or builtin
             ((none)
               (match (env-lookup-type env op)
@@ -818,14 +818,14 @@
     (@spec (((Ptr TypeEnv) (Ptr SExpr)) -> (Ptr ResolvedType)))
     (@pre (!= env nil))
     (if (< (sexpr-list-len type-expr) 2)
-      nil
+      (env-get-int-type env)
       (match (sexpr-list-get type-expr 1)
         ((some inner-expr)
           (let ((inner-name (sexpr-get-symbol-name inner-expr)))
             (if (string-eq inner-name "")
-              nil
+              (env-get-int-type env)
               (resolve-simple-type env inner-name))))
-        ((none) nil))))
+        ((none) (env-get-int-type env)))))
 
   (fn resolve-simple-type ((env (Ptr TypeEnv)) (type-name String))
     (@intent "Resolve a simple type by name")
@@ -838,7 +838,7 @@
           ((string-eq type-name "Int") (env-get-int-type env))
           ((string-eq type-name "Bool") (env-get-bool-type env))
           ((string-eq type-name "String") (env-get-string-type env))
-          (else nil)))))
+          (else (env-get-int-type env))))))
 
   ;; ============================================================
   ;; Let Binding Support

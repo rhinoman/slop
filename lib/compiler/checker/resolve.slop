@@ -58,7 +58,7 @@
                                         (let ((local-name (. name-sym name))
                                               (qualified-name (string-concat arena (. mod-sym name)
                                                                 (string-concat arena ":" local-name))))
-                                          (do (env-add-import env local-name qualified-name) 0)))
+                                          (do (env-add-import env local-name qualified-name))))
                                       (_ (do))))
                                   ((none) (do))))))
                           (_ (do))))
