@@ -39,7 +39,7 @@ SLOP makes the spec the source of truth:
 
 ## Status
 
-Currently working on SLOP-native versions of the build chain in lib/compiler.  The Python 'bootstrapped' versions of these are in src/slop and still the 'primary' build tools.  Using the --native flag with slop build will using the slop native tools.  Currently, the parser, type checker, and transpiler are self-hosting.  
+The SLOP toolchain is **self-hosting**: the parser, type checker, and transpiler are all written in SLOP and compile themselves. The Python bootstrap implementations in `src/slop/` remain available as fallbacks. Use `--native` with any command to use the SLOP-native tools from `bin/`.
 
 ## Philosophy
 
@@ -101,31 +101,49 @@ AcquireResult acquire(Limiter* limiter) {
 
 ```
 slop/
+├── bin/                     Native compiler binaries (build artifacts)
+│   ├── slop-parser          Native S-expression parser
+│   ├── slop-checker         Native type checker
+│   └── slop-transpiler      Native SLOP-to-C transpiler
+├── lib/
+│   ├── compiler/            Self-hosted compiler (written in SLOP)
+│   │   ├── parser/          Native parser source
+│   │   ├── checker/         Native type checker source
+│   │   ├── transpiler/      Native transpiler source
+│   │   └── common/          Shared compiler utilities
+│   └── std/                 Standard library modules
+│       ├── io/              File I/O
+│       ├── strlib/          String manipulation
+│       ├── math/            Math utilities
+│       └── os/              OS interface (env vars, etc.)
 ├── spec/                    Language specifications
 │   ├── LANGUAGE.md          Grammar, types, semantics
 │   ├── HYBRID_PIPELINE.md   Generation architecture
 │   └── REFERENCE.md         Quick reference
-├── src/slop/
+├── src/slop/                Python bootstrap toolchain
 │   ├── runtime/
 │   │   └── slop_runtime.h   Minimal C runtime (~400 lines)
 │   ├── parser.py            S-expression parser
 │   ├── transpiler.py        SLOP → C transpiler (with type flow analysis)
 │   ├── type_checker.py      Type inference with range propagation
+│   ├── verifier.py          Contract verification via Z3
 │   ├── hole_filler.py       LLM integration with tiered routing
 │   ├── providers.py         LLM providers (Ollama, OpenAI, etc.)
 │   ├── schema_converter.py  JSON Schema → SLOP types
 │   └── cli.py               Command-line interface
-├── examples/
-│   ├── rate-limiter.slop    Complete example
-│   └── hello.slop           Minimal example
+├── examples/                Example SLOP programs
+│   ├── rate-limiter.slop    Token bucket rate limiter
+│   ├── hello.slop           Minimal example
+│   ├── fibonacci.slop       Fibonacci sequence
+│   └── ...                  Additional examples
 └── tests/                   Test suite
 ```
 
 ## Usage
 
 ```bash
-# Install
-pip install -e .
+# Install (using uv)
+uv pip install -e .
 
 # Parse and inspect
 slop parse examples/rate-limiter.slop
@@ -178,14 +196,17 @@ slop check examples/rate-limiter.slop --native
 
 # Use native components for full build (parser, transpiler)
 slop build examples/rate-limiter.slop --native
+
+# Build the native toolchain from source
+./build_native_py.sh
 ```
 
-Native components are located in `lib/compiler/`:
+Native component sources are in `lib/compiler/`:
 - `lib/compiler/parser/` - Native S-expression parser
 - `lib/compiler/checker/` - Native type checker
 - `lib/compiler/transpiler/` - Native SLOP-to-C transpiler
 
-When `--native` is specified, the CLI looks for pre-built binaries (`slop-parser`, `slop-checker`, `slop-transpiler`). If a native component isn't found, it falls back to the Python implementation.
+Pre-built binaries are installed to `bin/` at the project root. When `--native` is specified, the CLI looks for these binaries. If a native component isn't found, it falls back to the Python implementation.
 
 ## Project Configuration
 
@@ -366,13 +387,15 @@ Arena allocation handles 90% of cases:
 ; Arena freed by caller
 ```
 
-## Status
+## Implementation Status
 
 **Implemented:**
 - ✓ Language specification
 - ✓ S-expression parser with pretty-printing
 - ✓ SLOP → C transpiler with type flow analysis
 - ✓ Type checker with range inference and path-sensitive analysis
+- ✓ Self-hosting compiler (parser, checker, transpiler written in SLOP)
+- ✓ Standard library (`lib/std/`: strlib, io, math, os)
 - ✓ Hole extraction, classification, and tiered model routing
 - ✓ LLM providers (Ollama, OpenAI-compatible, Interactive, Multi-provider)
 - ✓ Hole filler with quality scoring and pattern library

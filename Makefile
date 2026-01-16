@@ -34,7 +34,7 @@ help:
 	@echo "  native-parser Build native parser only"
 	@echo "  clean-native  Remove native binaries"
 	@echo ""
-	@echo "Native binaries are installed to src/slop/bin/"
+	@echo "Native binaries are installed to bin/"
 	@echo "Use 'slop --native' to use native components where available"
 
 install:
@@ -95,7 +95,7 @@ example-rate-limiter:
 # with the --native flag for improved performance.
 
 # Directory where native binaries are installed for CLI use
-NATIVE_BIN_DIR = src/slop/bin
+NATIVE_BIN_DIR = bin
 
 # Native component binaries
 NATIVE_PARSER = $(NATIVE_BIN_DIR)/slop-parser

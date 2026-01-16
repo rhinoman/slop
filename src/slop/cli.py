@@ -86,8 +86,10 @@ def find_native_component(name: str):
     from pathlib import Path
 
     binary_name = f"slop-{name}"
+    # Project root bin/ directory (cli.py is at src/slop/cli.py)
+    project_root = Path(__file__).parent.parent.parent
     locations = [
-        Path(__file__).parent / "bin" / binary_name,
+        project_root / "bin" / binary_name,
         Path.cwd() / binary_name,
         Path.cwd() / "build" / binary_name,
         # Native components built in lib/compiler/{name}/

@@ -5,14 +5,14 @@
 # Build the parser
 cd lib/compiler/parser
 slop build --native
-cp ./slop-parser ../../../src/slop/bin
+mv ./slop-parser ../../../bin
 
 ## Build the checker
 cd ../checker
 slop build --native
-cp ./slop-checker ../../../src/slop/bin
+mv ./slop-checker ../../../bin
 
 ## Build the transpiler
 cd ../transpiler
 slop build --native
-cp ./slop-transpiler ../../../src/slop/bin
+mv ./slop-transpiler ../../../bin
