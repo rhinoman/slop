@@ -1,0 +1,8 @@
+(module result-alias-main
+  (import result-alias (MyResult parse))
+
+  (fn main ()
+    (@intent "Test result alias")
+    (@spec (() -> Int))
+    0)
+)

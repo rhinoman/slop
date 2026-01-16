@@ -1,0 +1,355 @@
+;; ============================================================
+;; Exhaustive with-arena Tests
+;;
+;; Tests all patterns of with-arena usage to verify the
+;; native transpiler handles them correctly.
+;; ============================================================
+
+(module test-with-arena
+
+  ;; ============================================================
+  ;; Test 1: Basic with-arena with literal size
+  ;; ============================================================
+  (fn test-basic-arena ()
+    (@intent "Basic arena creation with literal size")
+    (@spec (() -> Int))
+    (with-arena 1024
+      42))
+
+  ;; ============================================================
+  ;; Test 2: with-arena with expression size
+  ;; ============================================================
+  (fn test-arena-expr-size ()
+    (@intent "Arena with computed size")
+    (@spec (() -> Int))
+    (let ((size 2048))
+      (with-arena (* size 2)
+        100)))
+
+  ;; ============================================================
+  ;; Test 3: with-arena with let binding using arena
+  ;; ============================================================
+  (fn test-arena-let ()
+    (@intent "Arena with let binding that uses arena")
+    (@spec (() -> Int))
+    (with-arena 1024
+      (let ((buf (arena-alloc arena 256)))
+        (if (== buf nil)
+          -1
+          0))))
+
+  ;; ============================================================
+  ;; Test 4: with-arena with multiple let bindings
+  ;; ============================================================
+  (fn test-arena-multi-let ()
+    (@intent "Arena with multiple allocations")
+    (@spec (() -> Int))
+    (with-arena 4096
+      (let ((buf1 (arena-alloc arena 100))
+            (buf2 (arena-alloc arena 200)))
+        (if (and (!= buf1 nil) (!= buf2 nil))
+          1
+          0))))
+
+  ;; ============================================================
+  ;; Test 5: with-arena with nested let
+  ;; ============================================================
+  (fn test-arena-nested-let ()
+    (@intent "Arena with nested let bindings")
+    (@spec (() -> Int))
+    (with-arena 1024
+      (let ((x 10))
+        (let ((y 20))
+          (+ x y)))))
+
+  ;; ============================================================
+  ;; Test 6: with-arena with multiple body statements
+  ;; ============================================================
+  (fn test-arena-multi-stmt ()
+    (@intent "Arena with multiple statements in body")
+    (@spec (() -> Int))
+    (with-arena 1024
+      (println "starting")
+      (println "working")
+      (println "done")
+      0))
+
+  ;; ============================================================
+  ;; Test 7: with-arena with if statement
+  ;; ============================================================
+  (fn test-arena-if ()
+    (@intent "Arena with if statement in body")
+    (@spec (() -> Int))
+    (with-arena 1024
+      (if true
+        42
+        0)))
+
+  ;; ============================================================
+  ;; Test 8: with-arena with while loop
+  ;; ============================================================
+  (fn test-arena-while ()
+    (@intent "Arena with while loop")
+    (@spec (() -> Int))
+    (with-arena 1024
+      (let ((mut i 0)
+            (mut sum 0))
+        (while (< i 10)
+          (set! sum (+ sum i))
+          (set! i (+ i 1)))
+        sum)))
+
+  ;; ============================================================
+  ;; Test 9: with-arena with match
+  ;; ============================================================
+  (fn test-arena-match ()
+    (@intent "Arena with match expression")
+    (@spec (() -> Int))
+    (with-arena 1024
+      (let ((opt (Option Int) (some 42)))
+        (match opt
+          ((some x) x)
+          ((none) 0)))))
+
+  ;; ============================================================
+  ;; Test 10: with-arena returning void (no return value)
+  ;; ============================================================
+  (fn test-arena-void ()
+    (@intent "Arena with void return - just side effects")
+    (@spec (() -> Unit))
+    (with-arena 1024
+      (println "hello")
+      (println "world")))
+
+  ;; ============================================================
+  ;; Test 11: Nested with-arena
+  ;; ============================================================
+  (fn test-nested-arena ()
+    (@intent "Nested arena scopes")
+    (@spec (() -> Int))
+    (with-arena 1024
+      (let ((outer-buf (arena-alloc arena 100)))
+        (with-arena 512
+          (let ((inner-buf (arena-alloc arena 50)))
+            (if (and (!= outer-buf nil) (!= inner-buf nil))
+              1
+              0))))))
+
+  ;; ============================================================
+  ;; Test 12: with-arena with do block
+  ;; ============================================================
+  (fn test-arena-do ()
+    (@intent "Arena with explicit do block")
+    (@spec (() -> Int))
+    (with-arena 1024
+      (do
+        (println "in do block")
+        42)))
+
+  ;; ============================================================
+  ;; Test 13: with-arena with cond
+  ;; ============================================================
+  (fn test-arena-cond ()
+    (@intent "Arena with cond expression")
+    (@spec (() -> Int))
+    (with-arena 1024
+      (let ((x 5))
+        (cond
+          ((< x 0) -1)
+          ((== x 0) 0)
+          (else 1)))))
+
+  ;; ============================================================
+  ;; Test 14: with-arena with string operations
+  ;; ============================================================
+  (fn test-arena-string ()
+    (@intent "Arena with string concatenation")
+    (@spec (() -> Int))
+    (with-arena 4096
+      (let ((s (string-concat arena "hello" " world")))
+        (if (string-eq s "hello world")
+          1
+          0))))
+
+  ;; ============================================================
+  ;; Test 15: with-arena in function return position
+  ;; ============================================================
+  (fn test-arena-return ()
+    (@intent "Arena where entire body is return value")
+    (@spec (() -> Int))
+    (with-arena 1024
+      (let ((result (+ 10 20)))
+        result)))
+
+  ;; ============================================================
+  ;; Test 16: with-arena with early return
+  ;; ============================================================
+  (fn test-arena-early-return ()
+    (@intent "Arena with early return from nested scope")
+    (@spec (() -> Int))
+    (with-arena 1024
+      (let ((buf (arena-alloc arena 100)))
+        (if (== buf nil)
+          (return -1)
+          (do))
+        1)))
+
+  ;; ============================================================
+  ;; Test 17: with-arena passing arena to function
+  ;; ============================================================
+  (fn helper-alloc ((a Arena))
+    (@intent "Helper that takes arena parameter")
+    (@spec ((Arena) -> (Ptr U8)))
+    (arena-alloc a 100))
+
+  (fn test-arena-pass ()
+    (@intent "Pass arena to another function")
+    (@spec (() -> Int))
+    (with-arena 1024
+      (let ((buf (helper-alloc arena)))
+        (if (!= buf nil) 1 0))))
+
+  ;; ============================================================
+  ;; Test 18: with-arena with list operations
+  ;; ============================================================
+  (fn test-arena-list ()
+    (@intent "Arena with list creation and operations")
+    (@spec (() -> Int))
+    (with-arena 4096
+      (let ((nums (list-new arena Int)))
+        (list-push nums 1)
+        (list-push nums 2)
+        (list-push nums 3)
+        (list-len nums))))
+
+  ;; ============================================================
+  ;; Test 19: with-arena large allocation
+  ;; ============================================================
+  (fn test-arena-large ()
+    (@intent "Arena with large size")
+    (@spec (() -> Int))
+    (with-arena 1048576  ;; 1MB
+      (let ((big-buf (arena-alloc arena 524288)))  ;; 512KB
+        (if (!= big-buf nil) 1 0))))
+
+  ;; ============================================================
+  ;; Test 20: with-arena computed from parameter
+  ;; ============================================================
+  (fn test-arena-param-size ((multiplier Int))
+    (@intent "Arena size computed from function parameter")
+    (@spec ((Int) -> Int))
+    (with-arena (* 1024 multiplier)
+      42))
+
+  ;; ============================================================
+  ;; Main test runner
+  ;; ============================================================
+  (fn main ()
+    (@intent "Run all with-arena tests")
+    (@spec (() -> Int))
+    (do
+      (println "Running with-arena tests...")
+
+      ;; Test basic
+      (if (== (test-basic-arena) 42)
+        (println "Test 1 (basic): PASS")
+        (println "Test 1 (basic): FAIL"))
+
+      ;; Test expr size
+      (if (== (test-arena-expr-size) 100)
+        (println "Test 2 (expr size): PASS")
+        (println "Test 2 (expr size): FAIL"))
+
+      ;; Test let
+      (if (== (test-arena-let) 0)
+        (println "Test 3 (let): PASS")
+        (println "Test 3 (let): FAIL"))
+
+      ;; Test multi-let
+      (if (== (test-arena-multi-let) 1)
+        (println "Test 4 (multi-let): PASS")
+        (println "Test 4 (multi-let): FAIL"))
+
+      ;; Test nested-let
+      (if (== (test-arena-nested-let) 30)
+        (println "Test 5 (nested-let): PASS")
+        (println "Test 5 (nested-let): FAIL"))
+
+      ;; Test multi-stmt
+      (if (== (test-arena-multi-stmt) 0)
+        (println "Test 6 (multi-stmt): PASS")
+        (println "Test 6 (multi-stmt): FAIL"))
+
+      ;; Test if
+      (if (== (test-arena-if) 42)
+        (println "Test 7 (if): PASS")
+        (println "Test 7 (if): FAIL"))
+
+      ;; Test while
+      (if (== (test-arena-while) 45)
+        (println "Test 8 (while): PASS")
+        (println "Test 8 (while): FAIL"))
+
+      ;; Test match
+      (if (== (test-arena-match) 42)
+        (println "Test 9 (match): PASS")
+        (println "Test 9 (match): FAIL"))
+
+      ;; Test void
+      (test-arena-void)
+      (println "Test 10 (void): PASS")
+
+      ;; Test nested arena
+      (if (== (test-nested-arena) 1)
+        (println "Test 11 (nested): PASS")
+        (println "Test 11 (nested): FAIL"))
+
+      ;; Test do
+      (if (== (test-arena-do) 42)
+        (println "Test 12 (do): PASS")
+        (println "Test 12 (do): FAIL"))
+
+      ;; Test cond
+      (if (== (test-arena-cond) 1)
+        (println "Test 13 (cond): PASS")
+        (println "Test 13 (cond): FAIL"))
+
+      ;; Test string
+      (if (== (test-arena-string) 1)
+        (println "Test 14 (string): PASS")
+        (println "Test 14 (string): FAIL"))
+
+      ;; Test return
+      (if (== (test-arena-return) 30)
+        (println "Test 15 (return): PASS")
+        (println "Test 15 (return): FAIL"))
+
+      ;; Test early return - harder to test directly
+      (if (>= (test-arena-early-return) 0)
+        (println "Test 16 (early return): PASS")
+        (println "Test 16 (early return): FAIL"))
+
+      ;; Test pass arena
+      (if (== (test-arena-pass) 1)
+        (println "Test 17 (pass arena): PASS")
+        (println "Test 17 (pass arena): FAIL"))
+
+      ;; Test list
+      (if (== (test-arena-list) 3)
+        (println "Test 18 (list): PASS")
+        (println "Test 18 (list): FAIL"))
+
+      ;; Test large
+      (if (== (test-arena-large) 1)
+        (println "Test 19 (large): PASS")
+        (println "Test 19 (large): FAIL"))
+
+      ;; Test param size
+      (if (== (test-arena-param-size 4) 42)
+        (println "Test 20 (param size): PASS")
+        (println "Test 20 (param size): FAIL"))
+
+      (println "All tests complete!")
+      0))
+
+) ;; end module

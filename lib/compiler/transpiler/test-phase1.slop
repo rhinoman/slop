@@ -1,0 +1,40 @@
+;; ============================================================
+;; Phase 1 & 2 Test Driver
+;;
+;; Simple test to verify all transpiler modules compile together.
+;; ============================================================
+
+(module test-phase1
+
+  (import types (SExpr SExprSymbol))
+  (import context (TranspileContext context-new ctx-emit ctx-str ctx-get-output))
+  (import ctype (to-c-type to-c-name builtin-type-c))
+  (import emit (emit-standard-includes emit-block-open emit-block-close))
+  (import infer (is-int-type is-float-type))
+  (import expr (transpile-expr is-binop is-comparison-op))
+  (import stmt (transpile-stmt is-stmt-form))
+  (import defn (transpile-type transpile-function))
+  (import match (transpile-match is-option-match))
+  (import transpiler (transpile-module transpile-file))
+
+  (fn main ()
+    (@intent "Test Phase 1 modules")
+    (@spec (() -> Int))
+    (do
+      (with-arena 4096
+        ;; Test ctype
+        (let ((c-name (to-c-name arena "foo-bar")))
+          (println c-name))
+        ;; Test builtin lookup
+        (match (builtin-type-c arena "Int")
+          ((some c-type) (println c-type))
+          ((none) (println "not found")))
+        ;; Test type predicates
+        (if (is-int-type "int64_t")
+          (println "int64_t is integer type")
+          (println "error"))
+        ;; Test context creation
+        (let ((ctx (context-new arena)))
+          (ctx-emit ctx "// test")
+          (println (ctx-str ctx "hello " "world"))))
+      0)))

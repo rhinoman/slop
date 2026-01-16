@@ -1,0 +1,216 @@
+;; ============================================================
+;; SLOP Native Transpiler - Type Inference Module
+;;
+;; Simple type inference for pointer/string detection and
+;; basic expression type analysis.
+;; ============================================================
+
+(module infer
+  (export
+    ;; Pointer/string detection
+    is-pointer-expr is-string-expr
+    ;; Basic type inference
+    infer-literal-type
+    ;; Type predicates
+    is-int-type is-float-type is-bool-type)
+
+  (import types (SExpr SExprList SExprSymbol SExprString SExprNumber))
+  (import context (TranspileContext ctx-is-pointer-var ctx-lookup-var ctx-lookup-func VarEntry FuncEntry))
+  (import strlib (starts-with ends-with))
+
+  ;; ============================================================
+  ;; Type Predicates
+  ;; ============================================================
+
+  (fn is-int-type ((type-name String))
+    (@intent "Check if type name is an integer type")
+    (@spec ((String) -> Bool))
+    (@example ("Int") -> true)
+    (@example ("int64_t") -> true)
+    (@example ("String") -> false)
+    (or (string-eq type-name "Int")
+        (string-eq type-name "I8")
+        (string-eq type-name "I16")
+        (string-eq type-name "I32")
+        (string-eq type-name "I64")
+        (string-eq type-name "U8")
+        (string-eq type-name "U16")
+        (string-eq type-name "U32")
+        (string-eq type-name "U64")
+        (string-eq type-name "int64_t")
+        (string-eq type-name "int32_t")
+        (string-eq type-name "int16_t")
+        (string-eq type-name "int8_t")
+        (string-eq type-name "uint64_t")
+        (string-eq type-name "uint32_t")
+        (string-eq type-name "uint16_t")
+        (string-eq type-name "uint8_t")))
+
+  (fn is-float-type ((type-name String))
+    (@intent "Check if type name is a floating point type")
+    (@spec ((String) -> Bool))
+    (@example ("Float") -> true)
+    (@example ("double") -> true)
+    (or (string-eq type-name "Float")
+        (string-eq type-name "F32")
+        (string-eq type-name "double")
+        (string-eq type-name "float")))
+
+  (fn is-bool-type ((type-name String))
+    (@intent "Check if type name is a boolean type")
+    (@spec ((String) -> Bool))
+    (or (string-eq type-name "Bool")
+        (string-eq type-name "uint8_t")))
+
+  ;; ============================================================
+  ;; Pointer Detection
+  ;; ============================================================
+
+  (fn is-pointer-expr ((ctx (Ptr TranspileContext)) (expr (Ptr SExpr)))
+    (@intent "Check if an expression is known to return a pointer")
+    (@spec (((Ptr TranspileContext) (Ptr SExpr)) -> Bool))
+    (@pre {ctx != nil})
+    (@pre {expr != nil})
+    (match (deref expr)
+      ;; Symbol: check if it's a known pointer variable
+      ((symbol sym)
+        (let ((name (. sym name)))
+          ;; Check explicit pointer tracking
+          (if (ctx-is-pointer-var ctx name)
+            true
+            ;; Check variable's type
+            (match (ctx-lookup-var ctx name)
+              ((some entry)
+                (. entry is-pointer))
+              ((none) false)))))
+      ;; List expression: check for pointer-returning forms
+      ((list lst)
+        (is-pointer-expr-list ctx (. lst items)))
+      ;; Literals are never pointers
+      ((string _) false)
+      ((number _) false)))
+
+  (fn is-pointer-expr-list ((ctx (Ptr TranspileContext)) (items (List (Ptr SExpr))))
+    (@intent "Check if a list expression returns a pointer")
+    (@spec (((Ptr TranspileContext) (List (Ptr SExpr))) -> Bool))
+    (@pre {ctx != nil})
+    (if (< (list-len items) 1)
+      false
+      (match (list-get items 0)
+        ((some head-expr)
+          (match (deref head-expr)
+            ((symbol head-sym)
+              (let ((op (. head-sym name)))
+                (cond
+                  ;; arena-alloc always returns a pointer
+                  ((string-eq op "arena-alloc") true)
+                  ;; addr yields a pointer
+                  ((string-eq op "addr") true)
+                  ;; deref yields a value, not a pointer
+                  ((string-eq op "deref") false)
+                  ;; cast to pointer type
+                  ((string-eq op "cast")
+                    (if (< (list-len items) 2)
+                      false
+                      (match (list-get items 1)
+                        ((some type-expr)
+                          (match (deref type-expr)
+                            ((list type-lst)
+                              (is-ptr-type-list (. type-lst items)))
+                            (_ false)))
+                        ((none) false))))
+                  ;; Function call: check if function returns a pointer
+                  (else
+                    (match (ctx-lookup-func ctx op)
+                      ((some entry) (. entry returns-pointer))
+                      ((none) false))))))
+            (_ false)))
+        ((none) false))))
+
+  (fn is-ptr-type-list ((items (List (Ptr SExpr))))
+    (@intent "Check if type list is a Ptr type")
+    (@spec (((List (Ptr SExpr))) -> Bool))
+    (if (< (list-len items) 1)
+      false
+      (match (list-get items 0)
+        ((some head-expr)
+          (match (deref head-expr)
+            ((symbol sym) (string-eq (. sym name) "Ptr"))
+            (_ false)))
+        ((none) false))))
+
+  ;; ============================================================
+  ;; String Detection
+  ;; ============================================================
+
+  (fn is-string-expr ((ctx (Ptr TranspileContext)) (expr (Ptr SExpr)))
+    (@intent "Check if an expression is known to return a string")
+    (@spec (((Ptr TranspileContext) (Ptr SExpr)) -> Bool))
+    (@pre {ctx != nil})
+    (@pre {expr != nil})
+    (match (deref expr)
+      ;; String literal is always a string
+      ((string _) true)
+      ;; Symbol: check variable type
+      ((symbol sym)
+        (let ((name (. sym name)))
+          (match (ctx-lookup-var ctx name)
+            ((some entry)
+              (or (string-eq (. entry c-type) "slop_string")
+                  (string-eq (. entry c-type) "String")))
+            ((none) false))))
+      ;; List expression: check for string-returning forms
+      ((list lst)
+        (is-string-expr-list ctx (. lst items)))
+      ;; Numbers are not strings
+      ((number _) false)))
+
+  (fn is-string-expr-list ((ctx (Ptr TranspileContext)) (items (List (Ptr SExpr))))
+    (@intent "Check if a list expression returns a string")
+    (@spec (((Ptr TranspileContext) (List (Ptr SExpr))) -> Bool))
+    (@pre {ctx != nil})
+    (if (< (list-len items) 1)
+      false
+      (match (list-get items 0)
+        ((some head-expr)
+          (match (deref head-expr)
+            ((symbol head-sym)
+              (let ((op (. head-sym name)))
+                (cond
+                  ;; String operations
+                  ((string-eq op "string-concat") true)
+                  ((string-eq op "string-new") true)
+                  ((string-eq op "string-slice") true)
+                  ((string-eq op "int-to-string") true)
+                  ;; Function call: check if function returns string
+                  (else
+                    (match (ctx-lookup-func ctx op)
+                      ((some entry) (. entry returns-string))
+                      ((none) false))))))
+            (_ false)))
+        ((none) false))))
+
+  ;; ============================================================
+  ;; Literal Type Inference
+  ;; ============================================================
+
+  (fn infer-literal-type ((expr (Ptr SExpr)))
+    (@intent "Infer C type for a literal expression")
+    (@spec (((Ptr SExpr)) -> (Option String)))
+    (@pre {expr != nil})
+    (match (deref expr)
+      ((number num)
+        (if (. num is-float)
+          (some "double")
+          (some "int64_t")))
+      ((string _) (some "slop_string"))
+      ((symbol sym)
+        (let ((name (. sym name)))
+          (cond
+            ((string-eq name "true") (some "uint8_t"))
+            ((string-eq name "false") (some "uint8_t"))
+            ((string-eq name "none") (some "slop_option"))  ;; Generic option
+            (else none))))
+      ((list _) none)))
+
+) ;; end module

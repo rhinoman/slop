@@ -1,9 +1,0 @@
-;; Test: Nested let bindings - should transpile properly scoped variables
-
-(fn main ()
-  (@intent "Test nested let bindings")
-  (@spec (() -> Int))
-  (let ((x 10))
-    (let ((y 20))
-      (let ((z 12))
-        (+ x (+ y z))))))

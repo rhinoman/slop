@@ -1,167 +1,299 @@
 ;; ============================================================
-;; SLOP Transpiler CLI - Native transpiler binary entry point
+;; SLOP Native Transpiler - CLI Entry Point
 ;;
-;; Usage: slop-transpiler <file1.slop> [file2.slop ...] [-o output.c]
-;; Transpiles SLOP source file(s) to C code and writes to stdout or file.
-;; Multiple files are merged and transpiled as a single unit.
+;; Command-line interface for the native SLOP transpiler.
+;; Reads SLOP source, parses it, and outputs C code as JSON.
 ;; ============================================================
 
-(module transpiler-cli
-  (export (main 2))
+(module transpiler-main
+  (import types (SExpr SExprList SExprSymbol))
+  (import parser (parse ParseResult))
+  (import context (TranspileContext context-new ctx-reset-for-new-module ctx-get-output ctx-get-header ctx-set-prefixing ctx-set-module))
+  (import transpiler (transpile-file generate-c-output))
+  (import strlib (replace-all))
 
-  (import file (FileMode FileError File
-                file-open file-close file-read-all file-write))
-  (import parser (ParseResult ParseError SExpr SExprList parse))
-  (import transpiler (TranspileResult TranspileError transpile-ast))
-  (import strlib (starts-with))
+  ;; FFI for file I/O and command-line arguments
+  (ffi "stdio.h"
+    (fopen ((filename (Ptr Char)) (mode (Ptr Char))) (Ptr Void))
+    (fclose ((file (Ptr Void))) Int)
+    (fread ((ptr (Ptr Void)) (size Int) (count Int) (stream (Ptr Void))) Int)
+    (fseek ((stream (Ptr Void)) (offset Int) (whence Int)) Int)
+    (ftell ((stream (Ptr Void))) Int)
+    (putchar ((c Int)) Int)
+    (puts ((s (Ptr Char))) Int))
 
-  ;; FFI for string operations
-  (ffi "string.h"
-    (strlen ((s (Ptr U8))) U64))
+  (ffi "stdlib.h"
+    (exit ((code Int)) Unit))
 
-  (fn main ((argc Int) (argv (Ptr (Ptr U8))))
-    (@intent "Transpile SLOP file(s) to C code")
-    (@spec ((Int (Ptr (Ptr U8))) -> Int))
+  ;; Seek constants
+  (const SEEK_SET Int 0)
+  (const SEEK_END Int 2)
+
+  ;; ============================================================
+  ;; File Reading
+  ;; ============================================================
+
+  (fn read-file ((arena Arena) (filename (Ptr Char)))
+    (@intent "Read entire file contents into arena-allocated string")
+    (@spec ((Arena (Ptr Char)) -> (Option String)))
+    (@alloc arena)
+    (let ((file (fopen filename (cast (Ptr Char) "rb"))))
+      (if (== file nil)
+        none
+        (do
+          ;; Get file size
+          (fseek file 0 SEEK_END)
+          (let ((size (ftell file)))
+            (fseek file 0 SEEK_SET)
+            ;; Allocate buffer
+            (let ((buf (cast (Ptr U8) (arena-alloc arena (+ size 1)))))
+              ;; Read file
+              (fread (cast (Ptr Void) buf) 1 size file)
+              (set! (@ buf size) 0)  ;; null terminate
+              (fclose file)
+              (some (String buf (cast U64 size)))))))))
+
+  ;; ============================================================
+  ;; JSON Output Helpers
+  ;; ============================================================
+
+  (fn print-str ((s (Ptr Char)))
+    (@intent "Print string to stdout")
+    (@spec (((Ptr Char)) -> Unit))
+    (let ((mut i 0))
+      (while (!= (@ s i) 0)
+        (putchar (cast Int (@ s i)))
+        (set! i (+ i 1))))
+    (do))
+
+  (fn print-string ((s String))
+    (@intent "Print String to stdout")
+    (@spec ((String) -> Unit))
+    (let ((len (cast Int (. s len)))
+          (data (. s data))
+          (mut i 0))
+      (while (< i len)
+        (putchar (cast Int (@ data i)))
+        (set! i (+ i 1))))
+    (do))
+
+  (fn print-json-string ((arena Arena) (s String))
+    (@intent "Print JSON-escaped string with quotes")
+    (@spec ((Arena String) -> Unit))
+    ;; Print opening quote
+    (putchar 34)  ;; "
+    ;; Escape and print content
+    (let ((len (cast Int (. s len)))
+          (data (. s data))
+          (mut i 0))
+      (while (< i len)
+        (let ((c (cast Int (@ data i))))
+          (cond
+            ((== c 34)   ;; " -> \"
+              (putchar 92)
+              (putchar 34))
+            ((== c 92)   ;; \ -> \\
+              (putchar 92)
+              (putchar 92))
+            ((== c 10)   ;; \n -> \n
+              (putchar 92)
+              (putchar 110))
+            ((== c 13)   ;; \r -> \r
+              (putchar 92)
+              (putchar 114))
+            ((== c 9)    ;; \t -> \t
+              (putchar 92)
+              (putchar 116))
+            (else
+              (putchar c))))
+        (set! i (+ i 1))))
+    ;; Print closing quote
+    (putchar 34)
+    (do))
+
+  (fn lines-to-string ((arena Arena) (lines (List String)))
+    (@intent "Concatenate list of lines into single string with newlines")
+    (@spec ((Arena (List String)) -> String))
+    (let ((len (list-len lines)))
+      (if (== len 0)
+        ""
+        ;; Calculate total size
+        (let ((mut total 0)
+              (mut i 0))
+          (while (< i len)
+            (match (list-get lines i)
+              ((some line)
+                (set! total (+ total (+ (cast Int (. line len)) 1))))  ;; +1 for newline
+              ((none) (do)))
+            (set! i (+ i 1)))
+          ;; Allocate buffer
+          (let ((buf (arena-alloc arena (+ total 1)))
+                (mut pos 0)
+                (mut j 0))
+            (while (< j len)
+              (match (list-get lines j)
+                ((some line)
+                  (let ((line-len (cast Int (. line len)))
+                        (line-data (. line data))
+                        (mut k 0))
+                    (while (< k line-len)
+                      (set! (@ buf pos) (@ line-data k))
+                      (set! pos (+ pos 1))
+                      (set! k (+ k 1)))
+                    ;; Add newline
+                    (set! (@ buf pos) 10)
+                    (set! pos (+ pos 1))))
+                ((none) (do)))
+              (set! j (+ j 1)))
+            (set! (@ buf pos) 0)  ;; null terminate
+            (String buf (cast U64 pos)))))))
+
+  ;; ============================================================
+  ;; Module Name Extraction
+  ;; ============================================================
+
+  (fn extract-module-name ((exprs (List (Ptr SExpr))))
+    (@intent "Extract module name from parsed expressions")
+    (@spec (((List (Ptr SExpr))) -> String))
+    ;; Look for (module name ...) in first expression
+    (if (< (list-len exprs) 1)
+      "unknown"
+      (match (list-get exprs 0)
+        ((some first-expr)
+          (match (deref first-expr)
+            ((list lst)
+              (let ((items (. lst items)))
+                (if (< (list-len items) 2)
+                  "unknown"
+                  (match (list-get items 0)
+                    ((some head)
+                      (match (deref head)
+                        ((symbol sym)
+                          (if (string-eq (. sym name) "module")
+                            (match (list-get items 1)
+                              ((some name-expr)
+                                (match (deref name-expr)
+                                  ((symbol name-sym) (. name-sym name))
+                                  (else "unknown")))
+                              ((none) "unknown"))
+                            "unknown"))
+                        (else "unknown")))
+                    ((none) "unknown")))))
+            (else "unknown")))
+        ((none) "unknown"))))
+
+  ;; ============================================================
+  ;; Main Entry Point
+  ;; ============================================================
+
+  (fn main ((argc Int) (argv (Ptr (Ptr Char))))
+    (@intent "Main entry point - transpile SLOP files to JSON")
+    (@spec ((Int (Ptr (Ptr Char))) -> Int))
+    ;; Check arguments
     (if (< argc 2)
       (do
-        (println "Usage: slop-transpiler <file1.slop> [file2.slop ...] [-o output.c]")
-        (println "")
-        (println "Options:")
-        (println "  -o FILE  Write output to FILE instead of stdout")
-        (println "")
-        (println "Multiple input files are merged and transpiled as a single unit.")
-        (println "Files should be listed in dependency order (dependencies first).")
+        (print-str (cast (Ptr Char) "Usage: slop-transpiler <input.slop> [input2.slop ...]\n"))
         1)
-      (with-arena 134217728  ;; 128MB arena for multi-file transpiling
-        (let ((input-files (collect-input-files arena argc argv))
-              (output-file (parse-output-arg arena argc argv)))
-          (if (== (list-len input-files) 0)
-            (do
-              (println "Error: No input files specified")
-              1)
-            ;; Parse all input files and collect forms
-            (let ((all-forms (list-new arena (Ptr SExpr))))
-              (let ((mut success true)
-                    (mut i 0)
-                    (num-files (list-len input-files)))
-                (while (and success (< i num-files))
-                  (let ((path (get-input-file (addr input-files) i)))
-                    (match (parse-file arena path)
-                      ((ok forms)
-                        ;; Append all forms from this file
-                        (let ((mut j 0)
-                              (num-forms (list-len forms)))
-                          (while (< j num-forms)
-                            (list-push all-forms (@ (. forms data) j))
-                            (set! j (+ j 1)))))
-                      ((error msg)
-                        (do
-                          (print "Error parsing ")
-                          (println path)
-                          (print "  ")
-                          (println msg)
-                          (set! success false)))))
-                  (set! i (+ i 1)))
-                (if (not success)
-                  1
-                  ;; Transpile combined AST
-                  (match (transpile-ast arena all-forms)
-                    ((error e)
-                      (do
-                        (print "Transpile error at line ")
-                        (print (. e line))
-                        (print ", col ")
-                        (print (. e col))
-                        (print ": ")
-                        (println (. e message))
-                        1))
-                    ((ok c-code)
-                      ;; Output the C code
-                      (output-code arena c-code output-file)))))))))))
-
-  (fn collect-input-files ((arena Arena) (argc Int) (argv (Ptr (Ptr U8))))
-    (@intent "Collect input .slop files from argv, stopping at first flag")
-    (@spec ((Arena Int (Ptr (Ptr U8))) -> (List String)))
-    (@alloc arena)
-    (let ((files (list-new arena String))
-          (mut i 1))
-      (while (< i argc)
-        (let ((arg (String (@ argv i) (strlen (@ argv i)))))
-          (if (starts-with arg "-")
-            ;; Stop at first flag
-            (return files)
-            (list-push files arg)))
-        (set! i (+ i 1)))
-      files))
-
-  (fn get-input-file ((files (Ptr (List String))) (index Int))
-    (@intent "Get input file at index with proper String type")
-    (@spec (((Ptr (List String)) Int) -> String))
-    (@ (. (deref files) data) index))
-
-  (fn parse-file ((arena Arena) (path String))
-    (@intent "Read and parse a SLOP file")
-    (@spec ((Arena String) -> (Result (List (Ptr SExpr)) String)))
-    (@alloc arena)
-    (match (file-open path 'read)
-      ((error e)
-        (error "Could not open file"))
-      ((ok f)
-        (match (file-read-all arena (addr f))
-          ((error e)
-            (do
-              (file-close (addr f))
-              (error "Could not read file")))
-          ((ok source)
-            (do
-              (file-close (addr f))
-              (match (parse arena source)
-                ((ok ast) (ok ast))
-                ((error e)
-                  (error (. e message))))))))))
-
-  (fn output-code ((arena Arena) (c-code String) (output-file (Option String)))
-    (@intent "Write C code to file or stdout")
-    (@spec ((Arena String (Option String)) -> Int))
-    (match output-file
-      ((some out-path)
-        ;; Write to file
-        (match (file-open out-path 'write)
-          ((error e)
-            (do
-              (println "Error: Could not open output file")
-              1))
-          ((ok out-f)
-            (let ((bytes (Bytes (cast (Ptr U8) (. c-code data)) (. c-code len) (. c-code len))))
-              (match (file-write (addr out-f) bytes)
-                ((error e)
-                  (do
-                    (file-close (addr out-f))
-                    (println "Error: Could not write output file")
-                    1))
-                ((ok _)
-                  (do
-                    (file-close (addr out-f))
-                    (print "Wrote ")
-                    (println out-path)
-                    0)))))))
-      ((none)
-        ;; Write to stdout
-        (do
-          (print c-code)
+      (with-arena 16777216  ;; 16MB arena for large multi-file builds
+        ;; Create a single shared context for all modules
+        ;; This preserves type registrations, enum variants, etc. across modules
+        (let ((ctx (context-new arena)))
+          (ctx-set-prefixing ctx true)
+          ;; Output JSON object opening
+          (putchar 123)  ;; {
+          ;; Process each input file using the shared context
+          (let ((mut i 1)
+                (mut first true))
+            (while (< i argc)
+              (let ((filename (@ argv i)))
+                (match (read-file arena filename)
+                  ((some source)
+                    (let ((result (transpile-single-file-with-ctx ctx source first)))
+                      (set! first false)))
+                  ((none)
+                    (print-str (cast (Ptr Char) "Error: Could not read file\n")))))
+              (set! i (+ i 1))))
+          ;; Output JSON object closing
+          (putchar 125)  ;; }
+          (putchar 10)   ;; newline
           0))))
 
-  (fn parse-output-arg ((arena Arena) (argc Int) (argv (Ptr (Ptr U8))))
-    (@intent "Parse -o argument from command line")
-    (@spec ((Arena Int (Ptr (Ptr U8))) -> (Option String)))
-    (@alloc arena)
-    ;; Look for -o flag
-    (let ((mut i 1))
-      (while (< i argc)
-        (let ((arg (String (@ argv i) (strlen (@ argv i)))))
-          (if (starts-with arg "-o")
-            (if (< (+ i 1) argc)
-              (return (some (String (@ argv (+ i 1)) (strlen (@ argv (+ i 1))))))
-              (return none))
-            (set! i (+ i 1)))))
-      none)))
+  (fn transpile-single-file-with-ctx ((ctx (Ptr TranspileContext)) (source String) (first Bool))
+    (@intent "Parse and transpile a single source file using shared context, output JSON")
+    (@spec (((Ptr TranspileContext) String Bool) -> Int))
+    (@pre {ctx != nil})
+    ;; Parse the source
+    (let ((arena (. (deref ctx) arena))
+          (parse-result (parse arena source)))
+      (match parse-result
+        ((ok exprs)
+          ;; Get module name
+          (let ((mod-name (extract-module-name exprs)))
+            ;; Reset context for this module while preserving cross-module state
+            (ctx-reset-for-new-module ctx mod-name)
+            ;; Transpile
+            (transpile-file ctx exprs)
+            ;; Output JSON for this module
+            (output-module-json arena ctx mod-name first)
+            0))
+        ((error err)
+          (do
+            (print-str (cast (Ptr Char) "Parse error: "))
+            (print-string (. err message))
+            (putchar 10)
+            1)))))
+
+  ;; Keep old function for backward compatibility (single-file transpilation)
+  (fn transpile-single-file ((arena Arena) (source String) (first Bool))
+    (@intent "Parse and transpile a single source file, output JSON")
+    (@spec ((Arena String Bool) -> Int))
+    ;; Parse the source
+    (let ((parse-result (parse arena source)))
+      (match parse-result
+        ((ok exprs)
+          ;; Get module name
+          (let ((mod-name (extract-module-name exprs))
+                ;; Create transpiler context
+                (ctx (context-new arena)))
+            ;; Enable prefixing for multi-module builds
+            (ctx-set-prefixing ctx true)
+            ;; Use ctx-reset-for-new-module instead of ctx-set-module to avoid Option type inference issues
+            (ctx-reset-for-new-module ctx mod-name)
+            ;; Transpile
+            (transpile-file ctx exprs)
+            ;; Output JSON for this module
+            (output-module-json arena ctx mod-name first)
+            0))
+        ((error err)
+          (do
+            (print-str (cast (Ptr Char) "Parse error: "))
+            (print-string (. err message))
+            (putchar 10)
+            1)))))
+
+  (fn output-module-json ((arena Arena) (ctx (Ptr TranspileContext)) (mod-name String) (first Bool))
+    (@intent "Output JSON for a single module")
+    (@spec ((Arena (Ptr TranspileContext) String Bool) -> Unit))
+    (@pre {ctx != nil})
+    ;; Add comma if not first
+    (when (not first)
+      (putchar 44))  ;; ,
+    ;; Output: "mod-name": {"header": "...", "impl": "..."}
+    (print-json-string arena mod-name)
+    (putchar 58)   ;; :
+    (putchar 123)  ;; {
+    ;; Header - forward declarations
+    (print-str (cast (Ptr Char) "\"header\":"))
+    (let ((header-lines (ctx-get-header ctx))
+          (header-str (lines-to-string arena header-lines)))
+      (print-json-string arena header-str))
+    (putchar 44)  ;; ,
+    ;; Impl - actual code
+    (print-str (cast (Ptr Char) "\"impl\":"))
+    (let ((impl-lines (ctx-get-output ctx))
+          (impl-str (lines-to-string arena impl-lines)))
+      (print-json-string arena impl-str))
+    (putchar 125)  ;; }
+    (do))
+
+) ;; end module

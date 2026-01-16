@@ -1,0 +1,100 @@
+;; ============================================================
+;; Phase 7 Tests: constants and forward declarations
+;; ============================================================
+
+(module test-phase7
+
+  ;; ============================================================
+  ;; Integer constant tests
+  ;; ============================================================
+
+  (const MAX_SIZE Int 1024)
+  (const MIN_VALUE Int -100)
+  (const BYTE_MASK U8 255)
+  (const FLAGS I32 42)
+
+  ;; ============================================================
+  ;; String constant tests
+  ;; ============================================================
+
+  (const GREETING String "Hello")
+  (const VERSION String "1.0.0")
+
+  ;; ============================================================
+  ;; Forward declaration tests (mutual recursion)
+  ;; ============================================================
+
+  (fn is-even ((n Int))
+    (@intent "Check if n is even using mutual recursion")
+    (@spec ((Int) -> Bool))
+    (if (== n 0)
+      true
+      (is-odd (- n 1))))
+
+  (fn is-odd ((n Int))
+    (@intent "Check if n is odd using mutual recursion")
+    (@spec ((Int) -> Bool))
+    (if (== n 0)
+      false
+      (is-even (- n 1))))
+
+  ;; ============================================================
+  ;; Function using constants
+  ;; ============================================================
+
+  (fn test-int-const ()
+    (@intent "Test integer constants")
+    (@spec (() -> Int))
+    (+ MAX_SIZE MIN_VALUE))
+
+  (fn test-byte-const ()
+    (@intent "Test byte constant")
+    (@spec (() -> Int))
+    (cast Int BYTE_MASK))
+
+  (fn test-mutual-recursion ()
+    (@intent "Test mutual recursion works with forward declarations")
+    (@spec (() -> Int))
+    (let ((even4 (is-even 4))
+          (odd5 (is-odd 5))
+          (even7 (is-even 7)))
+      (if (and even4 (and odd5 (not even7)))
+        1
+        0)))
+
+  ;; ============================================================
+  ;; Main runner
+  ;; ============================================================
+
+  (fn main ()
+    (@intent "Run Phase 7 declaration tests")
+    (@spec (() -> Int))
+    (let ((mut passed 0)
+          (mut failed 0))
+
+      ;; Integer constant tests
+      (if (== MAX_SIZE 1024)
+        (set! passed (+ passed 1))
+        (set! failed (+ failed 1)))
+
+      (if (== MIN_VALUE -100)
+        (set! passed (+ passed 1))
+        (set! failed (+ failed 1)))
+
+      (if (== (test-int-const) 924)
+        (set! passed (+ passed 1))
+        (set! failed (+ failed 1)))
+
+      (if (== (test-byte-const) 255)
+        (set! passed (+ passed 1))
+        (set! failed (+ failed 1)))
+
+      ;; Mutual recursion test
+      (if (== (test-mutual-recursion) 1)
+        (set! passed (+ passed 1))
+        (set! failed (+ failed 1)))
+
+      ;; Return 0 if all passed, 1 otherwise
+      (if (== failed 0)
+        0
+        1))))

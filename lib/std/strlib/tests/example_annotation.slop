@@ -1,0 +1,21 @@
+;; Test case: @example annotation handling
+;; Tests that @example annotations are ignored during transpilation
+;;
+;; Expected C: @example lines should NOT appear in output
+;; Bug produces: strlib__at_example(...) function calls
+
+(module example-annotation-test
+  (export main)
+
+  (fn add ((a Int) (b Int))
+    (@intent "Add two numbers")
+    (@spec ((Int Int) -> Int))
+    (@example (1 2) -> 3)
+    (@example (0 0) -> 0)
+    (+ a b))
+
+  (fn main ()
+    (@intent "Test example annotation")
+    (@spec (() -> Int))
+    (add 1 2))
+)

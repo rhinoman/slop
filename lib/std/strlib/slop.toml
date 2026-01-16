@@ -1,0 +1,3 @@
+[project]
+name = "strlib"
+entry = "strlib.slop"

@@ -75,6 +75,13 @@
 
   (type AsciiChar (Int 0 .. 127))
 
+  ;; Internal helper
+  (fn min ((a Int) (b Int))
+    (@intent "Return the smaller of two integers")
+    (@spec ((Int Int) -> Int))
+    (@pure)
+    (if (< a b) a b))
+
   (fn cstring-to-string ((cstr (Ptr U8)))
     (@intent "Convert null-terminated C string to SLOP String")
     (@spec (((Ptr U8)) -> String))

@@ -1,0 +1,22 @@
+;; Test case: FFI function prefixing
+;; Tests that FFI functions are called without module prefix
+;;
+;; Expected C: isalpha(c)
+;; Bug produces: ffi_functions_test_isalpha(c) (incorrectly prefixed)
+
+(module ffi-functions-test
+  (export main)
+
+  (ffi "ctype.h"
+    (isalpha ((c Int)) Int))
+
+  (fn check-alpha ((c Int))
+    (@intent "Check if character is alphabetic")
+    (@spec ((Int) -> Bool))
+    (!= (isalpha c) 0))
+
+  (fn main ()
+    (@intent "Test FFI function calls")
+    (@spec (() -> Int))
+    (if (check-alpha 65) 0 1))
+)

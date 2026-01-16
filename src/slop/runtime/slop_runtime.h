@@ -133,6 +133,23 @@ typedef struct {
 
 #define SLOP_STR(literal) ((slop_string){sizeof(literal)-1, literal})
 
+/* String constructor macro for native transpiler: String(data, len) -> slop_string */
+#define String(data, len) ((slop_string){(len), (const char*)(data)})
+
+/* Generic Option constructors for native transpiler */
+/* These use anonymous struct literals compatible with slop_option types */
+typedef struct { bool has_value; int64_t value; } _slop_option_generic;
+#define some(v) ((_slop_option_generic){true, (int64_t)(v)})
+#define none ((_slop_option_generic){false, 0})
+/* Generic unwrap for any Option type */
+#define unwrap(opt) ({ __auto_type _opt = (opt); SLOP_PRE(_opt.has_value, "unwrap on None"); _opt.value; })
+
+/* Generic Result type for native transpiler */
+/* ok/error constructors produce generic result that can be assigned to typed results */
+typedef struct { bool is_ok; union { int64_t ok; int64_t err; } data; } _slop_result_generic;
+#define ok(v) ((_slop_result_generic){true, {.ok = (int64_t)(v)}})
+#define error(e) ((_slop_result_generic){false, {.err = (int64_t)(e)}})
+
 static inline slop_string slop_string_new(slop_arena* arena, const char* cstr) {
     size_t len = strlen(cstr);
     char* data = (char*)slop_arena_alloc(arena, len + 1);
@@ -326,6 +343,13 @@ static inline slop_map slop_map_new(slop_arena* arena, size_t capacity) {
         arena, capacity * sizeof(slop_map_entry));
     memset(entries, 0, capacity * sizeof(slop_map_entry));
     return (slop_map){0, capacity, entries};
+}
+
+/* Return pointer to arena-allocated map (for slop_map* type) */
+static inline slop_map* slop_map_new_ptr(slop_arena* arena, size_t capacity) {
+    slop_map* map = (slop_map*)slop_arena_alloc(arena, sizeof(slop_map));
+    *map = slop_map_new(arena, capacity);
+    return map;
 }
 
 static inline void* slop_map_get(slop_map* map, slop_string key) {
@@ -690,6 +714,7 @@ SLOP_OPTION_DEFINE(int64_t, slop_option_int)
 SLOP_OPTION_DEFINE(double, slop_option_float)
 SLOP_OPTION_DEFINE(slop_string, slop_option_string)
 SLOP_OPTION_DEFINE(void*, slop_option_ptr)
+SLOP_OPTION_DEFINE(bool, slop_option_bool)
 
 /* Pre-define common string-keyed maps (must come after SLOP_OPTION_DEFINE) */
 SLOP_STRING_MAP_DEFINE(slop_string, slop_map_string_string, slop_option_string)

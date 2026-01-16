@@ -247,7 +247,10 @@
   (fn test-optional-none ()
     (@intent "Call function with (none) - tests Option type inference")
     (@spec (() -> Int))
-    (process-optional-name (none)))
+    ;; Note: Using typed let to work around native transpiler limitation
+    ;; (direct (none) as function argument needs parameter type inference)
+    (let ((n (Option String) none))
+      (process-optional-name n)))
 
   ;; Bug 2: map-keys on string-keyed map
   (fn test-map-keys ((arena Arena))

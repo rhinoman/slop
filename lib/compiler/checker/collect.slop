@@ -16,11 +16,13 @@
   (import types (ResolvedType ResolvedTypeKind ResolvedVariant ResolvedField
                  FnSignature ParamInfo
                  resolved-type-new resolved-variant-new resolved-field-new
+                 resolved-type-set-inner
                  fn-signature-new param-info-new))
   (import env (TypeEnv env-arena env-register-type env-lookup-type
                env-register-function env-set-module env-get-module
                env-get-int-type env-get-bool-type env-get-string-type
-               env-get-unit-type env-register-variant env-check-variant-collisions))
+               env-get-unit-type env-register-variant env-check-variant-collisions
+               env-make-option-type))
 
   ;; ============================================================
   ;; Main Collection Functions
@@ -88,6 +90,12 @@
                             (let ((resolved (resolved-type-new arena 'rk-union type-name (none) type-name)))
                               (env-register-type env resolved)
                               (collect-union-variants env arena resolved type-expr)))
+                          ;; Range: (type Name (BaseType min .. max))
+                          ((is-range-type-expr type-expr)
+                            (let ((base-type (get-range-base-type env arena type-expr))
+                                  (resolved (resolved-type-new arena 'rk-range type-name (none) type-name)))
+                              (resolved-type-set-inner resolved base-type)
+                              (env-register-type env resolved)))
                           ;; Other - use placeholder
                           (else
                             (let ((resolved (resolved-type-new arena 'rk-primitive type-name (none) type-name)))
@@ -157,7 +165,31 @@
                 ((string-eq type-name "Unit") (env-get-unit-type env))
                 ;; Unknown type - create placeholder
                 (else (resolved-type-new arena 'rk-primitive type-name (none) type-name)))))))
-      ;; Complex type expression - return placeholder for now
+      ((list lst)
+        ;; Complex type expression like (Option Int), (Ptr T), (List T)
+        (let ((items (. lst items)))
+          (match (list-get items 0)
+            ((some head-expr)
+              (let ((head-name (sexpr-get-symbol-name head-expr)))
+                (cond
+                  ;; Option type: (Option InnerType)
+                  ((string-eq head-name "Option")
+                    (let ((inner-type (if (>= (list-len items) 2)
+                                        (match (list-get items 1)
+                                          ((some inner-expr) (get-field-type env arena inner-expr))
+                                          ((none) nil))
+                                        nil)))
+                      (env-make-option-type env inner-type)))
+                  ;; Ptr type: (Ptr PointeeType) - return placeholder
+                  ((string-eq head-name "Ptr")
+                    (resolved-type-new arena 'rk-primitive "Ptr" (none) "void*"))
+                  ;; List type: (List ElemType) - return placeholder
+                  ((string-eq head-name "List")
+                    (resolved-type-new arena 'rk-primitive "List" (none) "slop_list_t*"))
+                  ;; Unknown complex type
+                  (else (resolved-type-new arena 'rk-primitive head-name (none) head-name)))))
+            ((none) (env-get-unit-type env)))))
+      ;; Other expression types
       (_ (env-get-unit-type env))))
 
   (fn collect-module-types ((env (Ptr TypeEnv)) (module-form (Ptr SExpr)))
@@ -193,6 +225,40 @@
             ((string-eq type-name "Bool") (some (env-get-bool-type env)))
             ((string-eq type-name "String") (some (env-get-string-type env)))
             (else (none)))))))
+
+  (fn is-range-type-expr ((type-expr (Ptr SExpr)))
+    (@intent "Check if expression is a range type like (Int 0 .. 127)")
+    (@spec (((Ptr SExpr)) -> Bool))
+    (@pure)
+    ;; Range type is a list like (Int 0 .. 127) or (Int 0 127)
+    ;; First element is the base type (a symbol like Int)
+    (if (not (sexpr-is-list type-expr))
+      false
+      (if (< (sexpr-list-len type-expr) 2)
+        false
+        (match (sexpr-list-get type-expr 0)
+          ((some first-elem)
+            (let ((base-name (sexpr-get-symbol-name first-elem)))
+              ;; Check if it's a known base type for ranges
+              (or (string-eq base-name "Int")
+                  (string-eq base-name "Float"))))
+          ((none) false)))))
+
+  (fn get-range-base-type ((env (Ptr TypeEnv)) (arena Arena) (type-expr (Ptr SExpr)))
+    (@intent "Get the base type from a range expression like (Int 0 .. 127)")
+    (@spec (((Ptr TypeEnv) Arena (Ptr SExpr)) -> (Ptr ResolvedType)))
+    (@pre (!= env nil))
+    (match (sexpr-list-get type-expr 0)
+      ((some first-elem)
+        (let ((base-name (sexpr-get-symbol-name first-elem)))
+          (cond
+            ((string-eq base-name "Int") (env-get-int-type env))
+            ((string-eq base-name "Float")
+              (match (env-lookup-type env "Float")
+                ((some t) t)
+                ((none) (env-get-int-type env))))
+            (else (env-get-int-type env)))))
+      ((none) (env-get-int-type env))))
 
   (fn get-type-name-from-expr ((expr (Ptr SExpr)))
     (@intent "Extract type name from an expression")
@@ -344,18 +410,36 @@
               (for (i 0 num-params)
                 (match (sexpr-list-get params-expr i)
                   ((some param-form)
-                    ;; param-form is (param-name Type)
+                    ;; param-form is (param-name Type) or (mode param-name Type)
                     (when (and (sexpr-is-list param-form) (>= (sexpr-list-len param-form) 2))
                       (match (sexpr-list-get param-form 0)
-                        ((some name-expr)
-                          (let ((param-name (sexpr-get-symbol-name name-expr)))
-                            (when (not (string-eq param-name ""))
-                              (match (sexpr-list-get param-form 1)
-                                ((some type-expr)
-                                  (let ((param-type (get-field-type env arena type-expr))
-                                        (info (param-info-new arena param-name param-type)))
-                                    (list-push params (deref info))))
-                                ((none) (do))))))
+                        ((some first-expr)
+                          (let ((first-name (sexpr-get-symbol-name first-expr)))
+                            ;; Check if first element is a mode annotation (in, out, mut)
+                            (if (or (string-eq first-name "in")
+                                    (string-eq first-name "out")
+                                    (string-eq first-name "mut"))
+                              ;; Mode form: (mode name Type) - need at least 3 elements
+                              (when (>= (sexpr-list-len param-form) 3)
+                                (match (sexpr-list-get param-form 1)
+                                  ((some name-expr)
+                                    (let ((param-name (sexpr-get-symbol-name name-expr)))
+                                      (when (not (string-eq param-name ""))
+                                        (match (sexpr-list-get param-form 2)
+                                          ((some type-expr)
+                                            (let ((param-type (get-field-type env arena type-expr))
+                                                  (info (param-info-new arena param-name param-type)))
+                                              (list-push params (deref info))))
+                                          ((none) (do))))))
+                                  ((none) (do))))
+                              ;; Regular form: (name Type) - first element is name
+                              (when (not (string-eq first-name ""))
+                                (match (sexpr-list-get param-form 1)
+                                  ((some type-expr)
+                                    (let ((param-type (get-field-type env arena type-expr))
+                                          (info (param-info-new arena first-name param-type)))
+                                      (list-push params (deref info))))
+                                  ((none) (do)))))))
                         ((none) (do)))))
                   ((none) (do)))))))
         ((none) (do)))

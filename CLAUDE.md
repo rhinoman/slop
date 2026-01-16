@@ -36,6 +36,9 @@ uv run slop transpile examples/rate-limiter.slop -o output.c
 
 # Build to native binary (requires cc)
 uv run slop build examples/rate-limiter.slop -o binary
+
+# Build the native toolchain using the python toolchain
+./build_native_py.sh
 ```
 
 ## Architecture
@@ -118,3 +121,13 @@ Located in `tree-sitter-slop/`:
 **Arena allocation**: Primary memory model. `(with-arena size body)` creates scoped arena, freed automatically.
 
 **Result types**: `(Result T E)` is a tagged union. Use `(ok val)` / `(error e)` constructors, `match` to destructure.
+
+## Self Hosting
+The goal is a self-hosting slop parser, type checker, and transpiler.  When working on the slop native tooling
+- It is always better to generate a transpiler error than to emit ambiguous C code and / or some hard-coded default when running into some unimplemented SLOP feature.
+- Errors should be caught as early as possible.  First by the parser, then the type checker, then the transpiler.  It is a FAILURE if an error is caught by the C compiler.
+- The goal is not simply to get something that builds.  We do not workaround code generation issues with hardcoding, default types, rewriting using a different SLOP construct, etc.  
+
+
+## General guidance
+- Paren balance is critical for a language based on S-expressions.  Verify balance BEFORE making multiple writes to a file to avoid large compounding imbalances that require extensive troubleshooting.

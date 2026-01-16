@@ -1,239 +1,225 @@
 ;; ============================================================
-;; SLOP Transpiler - Code Emission
+;; SLOP Native Transpiler - Emit Module
 ;;
-;; Utilities for emitting C code with proper indentation,
-;; includes, comments, and include guards.
+;; Higher-level code emission helpers built on context module.
+;; Handles includes, declarations, and block structures.
 ;; ============================================================
 
 (module emit
   (export
-    ;; Emitter type
-    Emitter
-    ;; Lifecycle
-    emitter-new emitter-output emitter-line-count
-    ;; Basic emission
-    emit emit-line emit-blank
-    ;; Indentation
-    indent dedent get-indent
-    ;; Structured emission
-    emit-include emit-comment
-    emit-guard-start emit-guard-end
-    emit-block-start emit-block-end)
+    ;; Include emission
+    emit-include emit-standard-includes
+    ;; Declaration emission
+    emit-forward-decl emit-var-decl emit-const-decl
+    ;; Block helpers
+    emit-block-open emit-block-close
+    emit-if-open emit-else emit-while-open
+    ;; Type emission helpers
+    emit-struct-open emit-struct-close
+    emit-enum-open emit-enum-close
+    emit-typedef)
+
+  (import types (SExpr SExprList SExprSymbol))
+  (import context (TranspileContext ctx-emit ctx-emit ctx-indent ctx-dedent ctx-str ctx-str3 ctx-str4 ctx-str5 ctx-add-include))
+  (import ctype (to-c-type to-c-name))
+  (import strlib (replace))
 
   ;; ============================================================
-  ;; Emitter State
+  ;; Include Emission
   ;; ============================================================
 
-  (type Emitter (record
-    (arena Arena)
-    (lines (List String))         ;; Accumulated output lines
-    (indent-level (Int 0 ..))     ;; Current indentation level
-    (indent-str String)           ;; Indentation string (default: 4 spaces)
-    (current-line String)))       ;; Partial line being built
+  (fn emit-include ((ctx (Ptr TranspileContext)) (header String) (is-system Bool))
+    (@intent "Emit an include directive")
+    (@spec (((Ptr TranspileContext) String Bool) -> Unit))
+    (@pre {ctx != nil})
+    (if is-system
+      (ctx-emit ctx (ctx-str3 ctx "#include <" header ">"))
+      (ctx-emit ctx (ctx-str3 ctx "#include \"" header "\""))))
+
+  (fn emit-standard-includes ((ctx (Ptr TranspileContext)))
+    (@intent "Emit standard include headers for SLOP runtime")
+    (@spec (((Ptr TranspileContext)) -> Unit))
+    (@pre {ctx != nil})
+    (ctx-emit ctx "#include \"slop_runtime.h\"")
+    (ctx-emit ctx "#include <stdint.h>")
+    (ctx-emit ctx "#include <stdbool.h>")
+    (ctx-emit ctx ""))
 
   ;; ============================================================
-  ;; Lifecycle
+  ;; Declaration Emission
   ;; ============================================================
 
-  (fn emitter-new ((arena Arena))
-    (@intent "Create a new code emitter")
-    (@spec ((Arena) -> (Ptr Emitter)))
-    (@alloc arena)
-    (@post (!= $result nil))
-    (@example (arena) -> (!= nil))
-    (@example (arena) -> (-> indent-level 0))
-    (let ((em (cast (Ptr Emitter) (arena-alloc arena 128))))
-      (set! (deref em) (Emitter
-        arena
-        (list-new arena String)
-        0
-        "    "
-        ""))
-      em))
+  (fn emit-forward-decl ((ctx (Ptr TranspileContext)) (return-type String) (name String) (params String))
+    (@intent "Emit a function forward declaration")
+    (@spec (((Ptr TranspileContext) String String String) -> Unit))
+    (@example (ctx "int" "foo" "int x, int y") -> "int foo(int x, int y);")
+    (@pre {ctx != nil})
+    (let ((param-str (if (string-eq params "")
+                        "void"
+                        params)))
+      (ctx-emit ctx (ctx-str5 ctx return-type " " name "(" (ctx-str3 ctx param-str ")" ";")))))
 
-  (fn emitter-line-count ((em (Ptr Emitter)))
-    (@intent "Get number of lines in emitter (for debugging)")
-    (@spec (((Ptr Emitter)) -> Int))
-    (@pre (!= em nil))
-    (@pure)
-    (list-len (. (deref em) lines)))
+  (fn emit-var-decl ((ctx (Ptr TranspileContext)) (c-type String) (name String))
+    (@intent "Emit a variable declaration without initializer")
+    (@spec (((Ptr TranspileContext) String String) -> Unit))
+    (@example (ctx "int64_t" "x") -> "int64_t x;")
+    (@pre {ctx != nil})
+    (ctx-emit ctx (ctx-str4 ctx c-type " " name ";")))
 
-  (fn emitter-output ((em (Ptr Emitter)))
-    (@intent "Get accumulated output as single string with newlines")
-    (@spec (((Ptr Emitter)) -> String))
-    (@pre (!= em nil))
-    ;; Calculate total length needed
-    (let ((lines (. (deref em) lines))
-          (arena (. (deref em) arena))
-          (len (list-len lines)))
-      (if (== len 0)
-        ""
-        ;; Calculate total size: sum of all line lengths + (len-1) newlines
-        (let ((mut total-len 0))
-          (do
-            (for (i 0 len)
-              (match (list-get lines i)
-                ((some line)
-                  (set! total-len (+ total-len (cast Int (string-len line)))))
-                ((none) (do))))
-            ;; Add space for newlines between lines
-            (set! total-len (+ total-len (- len 1)))
-            ;; Allocate single buffer
-            (let ((buf (arena-alloc arena (+ total-len 1)))
-                  (mut offset 0))
-              (do
-                (for (i 0 len)
-                  (match (list-get lines i)
-                    ((some line)
-                      (let ((line-len (cast Int (string-len line))))
-                        (do
-                          ;; Add newline before all lines except first
-                          (when (> i 0)
-                            (set! (@ buf offset) (cast U8 10))  ;; '\n'
-                            (set! offset (+ offset 1)))
-                          ;; Copy line content
-                          (for (j 0 line-len)
-                            (do
-                              (set! (@ buf offset) (@ (. line data) j))
-                              (set! offset (+ offset 1)))))))
-                    ((none) (do))))
-                ;; Return as string
-                (String (cast (Ptr U8) buf) (cast U64 offset)))))))))
+  (fn emit-var-decl-init ((ctx (Ptr TranspileContext)) (c-type String) (name String) (init String))
+    (@intent "Emit a variable declaration with initializer")
+    (@spec (((Ptr TranspileContext) String String String) -> Unit))
+    (@example (ctx "int64_t" "x" "42") -> "int64_t x = 42;")
+    (@pre {ctx != nil})
+    (ctx-emit ctx (ctx-str5 ctx c-type " " name " = " (ctx-str ctx init ";"))))
+
+  (fn emit-const-decl ((ctx (Ptr TranspileContext)) (c-type String) (name String) (value String) (is-int Bool))
+    (@intent "Emit a constant declaration")
+    (@spec (((Ptr TranspileContext) String String String Bool) -> Unit))
+    (@example (ctx "int64_t" "MAX_SIZE" "1024" true) -> "#define MAX_SIZE (1024)")
+    (@pre {ctx != nil})
+    (if is-int
+      ;; Integer constants use #define
+      (ctx-emit ctx (ctx-str4 ctx "#define " name " (" (ctx-str ctx value ")")))
+      ;; Other constants use static const
+      (ctx-emit ctx (ctx-str5 ctx "static const " c-type " " name (ctx-str3 ctx " = " value ";")))))
 
   ;; ============================================================
-  ;; Basic Emission
+  ;; Block Helpers
   ;; ============================================================
 
-  (fn emit ((em (Ptr Emitter)) (text String))
-    (@intent "Emit text without newline (for building lines)")
-    (@spec (((Ptr Emitter) String) -> Unit))
-    (@pre (!= em nil))
-    ;; Appends to current-line buffer
-    (set! (. (deref em) current-line)
-          (string-concat (. (deref em) arena)
-                         (. (deref em) current-line)
-                         text)))
+  (fn emit-block-open ((ctx (Ptr TranspileContext)))
+    (@intent "Emit opening brace and increase indent")
+    (@spec (((Ptr TranspileContext)) -> Unit))
+    (@pre {ctx != nil})
+    (ctx-emit ctx "{")
+    (ctx-indent ctx))
 
-  (fn emit-line ((em (Ptr Emitter)) (line String))
-    (@intent "Emit complete line with current indentation")
-    (@spec (((Ptr Emitter) String) -> Unit))
-    (@pre (!= em nil))
-    (let ((indented (build-indented-line em line)))
-      ;; Flush any partial line first
-      (when (> (string-len (. (deref em) current-line)) 0)
-        (list-push (. (deref em) lines) (. (deref em) current-line))
-        (set! (. (deref em) current-line) ""))
-      ;; Add the new line
-      (list-push (. (deref em) lines) indented)))
+  (fn emit-block-close ((ctx (Ptr TranspileContext)))
+    (@intent "Emit closing brace and decrease indent")
+    (@spec (((Ptr TranspileContext)) -> Unit))
+    (@pre {ctx != nil})
+    (ctx-dedent ctx)
+    (ctx-emit ctx "}"))
 
-  (fn emit-blank ((em (Ptr Emitter)))
-    (@intent "Emit empty line")
-    (@spec (((Ptr Emitter)) -> Unit))
-    (@pre (!= em nil))
-    (list-push (. (deref em) lines) ""))
+  (fn emit-if-open ((ctx (Ptr TranspileContext)) (condition String))
+    (@intent "Emit if statement opening")
+    (@spec (((Ptr TranspileContext) String) -> Unit))
+    (@example (ctx "x > 0") -> "if (x > 0) {")
+    (@pre {ctx != nil})
+    (ctx-emit ctx (ctx-str3 ctx "if (" condition ") {"))
+    (ctx-indent ctx))
 
-  ;; ============================================================
-  ;; Indentation
-  ;; ============================================================
+  (fn emit-else ((ctx (Ptr TranspileContext)))
+    (@intent "Emit else clause opening")
+    (@spec (((Ptr TranspileContext)) -> Unit))
+    (@pre {ctx != nil})
+    (ctx-dedent ctx)
+    (ctx-emit ctx "} else {")
+    (ctx-indent ctx))
 
-  (fn indent ((em (Ptr Emitter)))
-    (@intent "Increase indentation level by one")
-    (@spec (((Ptr Emitter)) -> Unit))
-    (@pre (!= em nil))
-    (set! (. (deref em) indent-level)
-          (+ (. (deref em) indent-level) 1)))
+  (fn emit-else-if ((ctx (Ptr TranspileContext)) (condition String))
+    (@intent "Emit else-if clause opening")
+    (@spec (((Ptr TranspileContext) String) -> Unit))
+    (@pre {ctx != nil})
+    (ctx-dedent ctx)
+    (ctx-emit ctx (ctx-str3 ctx "} else if (" condition ") {"))
+    (ctx-indent ctx))
 
-  (fn dedent ((em (Ptr Emitter)))
-    (@intent "Decrease indentation level by one")
-    (@spec (((Ptr Emitter)) -> Unit))
-    (@pre (!= em nil))
-    (@pre (> (. (deref em) indent-level) 0))
-    (set! (. (deref em) indent-level)
-          (- (. (deref em) indent-level) 1)))
+  (fn emit-while-open ((ctx (Ptr TranspileContext)) (condition String))
+    (@intent "Emit while loop opening")
+    (@spec (((Ptr TranspileContext) String) -> Unit))
+    (@example (ctx "i < n") -> "while (i < n) {")
+    (@pre {ctx != nil})
+    (ctx-emit ctx (ctx-str3 ctx "while (" condition ") {"))
+    (ctx-indent ctx))
 
-  (fn get-indent ((em (Ptr Emitter)))
-    (@intent "Get current indentation level")
-    (@spec (((Ptr Emitter)) -> (Int 0 ..)))
-    (@pre (!= em nil))
-    (@pure)
-    (. (deref em) indent-level))
-
-  ;; ============================================================
-  ;; Structured Emission
-  ;; ============================================================
-
-  (fn emit-include ((em (Ptr Emitter)) (header String) (system Bool))
-    (@intent "Emit #include directive")
-    (@spec (((Ptr Emitter) String Bool) -> Unit))
-    (@pre (!= em nil))
-    ;; system=true:  #include <header>
-    ;; system=false: #include "header"
-    (let ((arena (. (deref em) arena)))
-      (if system
-        (emit-line em (string-concat arena
-                        (string-concat arena "#include <" header)
-                        ">"))
-        (emit-line em (string-concat arena
-                        (string-concat arena "#include \"" header)
-                        "\"")))))
-
-  (fn emit-comment ((em (Ptr Emitter)) (text String))
-    (@intent "Emit C comment")
-    (@spec (((Ptr Emitter) String) -> Unit))
-    (@pre (!= em nil))
-    (let ((arena (. (deref em) arena)))
-      (emit-line em (string-concat arena
-                      (string-concat arena "/* " text)
-                      " */"))))
-
-  (fn emit-guard-start ((em (Ptr Emitter)) (name String))
-    (@intent "Emit include guard start: #ifndef NAME / #define NAME")
-    (@spec (((Ptr Emitter) String) -> Unit))
-    (@pre (!= em nil))
-    (let ((arena (. (deref em) arena)))
-      (emit-line em (string-concat arena "#ifndef " name))
-      (emit-line em (string-concat arena "#define " name))))
-
-  (fn emit-guard-end ((em (Ptr Emitter)))
-    (@intent "Emit include guard end: #endif")
-    (@spec (((Ptr Emitter)) -> Unit))
-    (@pre (!= em nil))
-    (emit-line em "#endif"))
-
-  (fn emit-block-start ((em (Ptr Emitter)) (header String))
-    (@intent "Emit block start: header followed by { and indent")
-    (@spec (((Ptr Emitter) String) -> Unit))
-    (@pre (!= em nil))
-    ;; Emits: "header {"
-    (let ((arena (. (deref em) arena)))
-      (emit-line em (string-concat arena header " {"))
-      (indent em)))
-
-  (fn emit-block-end ((em (Ptr Emitter)))
-    (@intent "Emit block end: dedent and }")
-    (@spec (((Ptr Emitter)) -> Unit))
-    (@pre (!= em nil))
-    (@pre (> (. (deref em) indent-level) 0))
-    (do
-      (dedent em)
-      (emit-line em "}")))
+  (fn emit-for-open ((ctx (Ptr TranspileContext)) (init String) (cond String) (incr String))
+    (@intent "Emit for loop opening")
+    (@spec (((Ptr TranspileContext) String String String) -> Unit))
+    (@pre {ctx != nil})
+    (ctx-emit ctx (ctx-str5 ctx "for (" init "; " cond (ctx-str3 ctx "; " incr ") {")))
+    (ctx-indent ctx))
 
   ;; ============================================================
-  ;; Internal Helpers
+  ;; Type Emission Helpers
   ;; ============================================================
 
-  (fn build-indented-line ((em (Ptr Emitter)) (line String))
-    (@intent "Build line with current indentation prepended")
-    (@spec (((Ptr Emitter) String) -> String))
-    (@pre (!= em nil))
-    (@pure)
-    (if (== (. (deref em) indent-level) 0)
-      line
-      (let ((arena (. (deref em) arena))
-            (indent-level (. (deref em) indent-level))
-            (indent-str (. (deref em) indent-str))
-            (mut prefix ""))
-        (do
-          (for (i 0 indent-level)
-            (set! prefix (string-concat arena prefix indent-str)))
-          (string-concat arena prefix line))))))
+  (fn emit-typedef ((ctx (Ptr TranspileContext)) (c-type String) (name String))
+    (@intent "Emit a typedef")
+    (@spec (((Ptr TranspileContext) String String) -> Unit))
+    (@example (ctx "struct Foo" "Foo") -> "typedef struct Foo Foo;")
+    (@pre {ctx != nil})
+    (ctx-emit ctx (ctx-str4 ctx "typedef " c-type " " (ctx-str ctx name ";"))))
+
+  (fn emit-struct-open ((ctx (Ptr TranspileContext)) (name String))
+    (@intent "Emit struct definition opening")
+    (@spec (((Ptr TranspileContext) String) -> Unit))
+    (@example (ctx "MyRecord") -> "struct MyRecord {")
+    (@pre {ctx != nil})
+    (ctx-emit ctx (ctx-str3 ctx "struct " name " {"))
+    (ctx-indent ctx))
+
+  (fn emit-struct-close ((ctx (Ptr TranspileContext)))
+    (@intent "Emit struct definition closing")
+    (@spec (((Ptr TranspileContext)) -> Unit))
+    (@pre {ctx != nil})
+    (ctx-dedent ctx)
+    (ctx-emit ctx "};"))
+
+  (fn emit-struct-field ((ctx (Ptr TranspileContext)) (c-type String) (name String))
+    (@intent "Emit a struct field")
+    (@spec (((Ptr TranspileContext) String String) -> Unit))
+    (@example (ctx "int64_t" "value") -> "int64_t value;")
+    (@pre {ctx != nil})
+    (ctx-emit ctx (ctx-str4 ctx "    " c-type " " (ctx-str ctx name ";"))))
+
+  (fn emit-enum-open ((ctx (Ptr TranspileContext)) (name String))
+    (@intent "Emit enum definition opening")
+    (@spec (((Ptr TranspileContext) String) -> Unit))
+    (@example (ctx "Color") -> "typedef enum {")
+    (@pre {ctx != nil})
+    (ctx-emit ctx "typedef enum {")
+    (ctx-indent ctx))
+
+  (fn emit-enum-value ((ctx (Ptr TranspileContext)) (name String) (is-last Bool))
+    (@intent "Emit an enum value")
+    (@spec (((Ptr TranspileContext) String Bool) -> Unit))
+    (@pre {ctx != nil})
+    (if is-last
+      (ctx-emit ctx (ctx-str ctx "    " name))
+      (ctx-emit ctx (ctx-str3 ctx "    " name ","))))
+
+  (fn emit-enum-close ((ctx (Ptr TranspileContext)) (type-name String))
+    (@intent "Emit enum definition closing with typedef")
+    (@spec (((Ptr TranspileContext) String) -> Unit))
+    (@example (ctx "Color") -> "} Color;")
+    (@pre {ctx != nil})
+    (ctx-dedent ctx)
+    (ctx-emit ctx (ctx-str3 ctx "} " type-name ";")))
+
+  ;; ============================================================
+  ;; Expression Helpers
+  ;; ============================================================
+
+  (fn emit-return ((ctx (Ptr TranspileContext)) (value String))
+    (@intent "Emit a return statement")
+    (@spec (((Ptr TranspileContext) String) -> Unit))
+    (@pre {ctx != nil})
+    (if (string-eq value "")
+      (ctx-emit ctx "return;")
+      (ctx-emit ctx (ctx-str3 ctx "return " value ";"))))
+
+  (fn emit-assignment ((ctx (Ptr TranspileContext)) (lhs String) (rhs String))
+    (@intent "Emit an assignment statement")
+    (@spec (((Ptr TranspileContext) String String) -> Unit))
+    (@pre {ctx != nil})
+    (ctx-emit ctx (ctx-str4 ctx lhs " = " rhs ";")))
+
+  (fn emit-call ((ctx (Ptr TranspileContext)) (fn-name String) (args String))
+    (@intent "Emit a function call statement")
+    (@spec (((Ptr TranspileContext) String String) -> Unit))
+    (@pre {ctx != nil})
+    (ctx-emit ctx (ctx-str4 ctx fn-name "(" args ");")))
+
+) ;; end module

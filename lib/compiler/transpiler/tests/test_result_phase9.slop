@@ -1,0 +1,86 @@
+;; ============================================================
+;; Phase 9 Tests: Result type generation
+;; ============================================================
+
+(module test-result-phase9
+
+  ;; ============================================================
+  ;; Error type for testing
+  ;; ============================================================
+
+  (type TestError (enum
+    not_found
+    invalid_input
+    overflow))
+
+  ;; ============================================================
+  ;; Functions returning Result types
+  ;; ============================================================
+
+  (fn safe-divide ((a Int) (b Int))
+    (@intent "Divide a by b, returning error if b is zero")
+    (@spec ((Int Int) -> (Result Int TestError)))
+    (if (== b 0)
+      (error (quote overflow))
+      (ok (/ a b))))
+
+  (fn find-positive ((n Int))
+    (@intent "Return n if positive, error otherwise")
+    (@spec ((Int) -> (Result Int TestError)))
+    (if (> n 0)
+      (ok n)
+      (error (quote invalid_input))))
+
+  (fn test-ok-result ()
+    (@intent "Test ok result construction")
+    (@spec (() -> Int))
+    (match (safe-divide 10 2)
+      ((ok val) (if (== val 5) 1 0))
+      ((error _) 0)))
+
+  (fn test-error-result ()
+    (@intent "Test error result construction")
+    (@spec (() -> Int))
+    (match (safe-divide 10 0)
+      ((ok _) 0)
+      ((error e) (if (== e (quote overflow)) 1 0))))
+
+  (fn test-chained-results ()
+    (@intent "Test chaining result operations")
+    (@spec (() -> Int))
+    (match (find-positive 5)
+      ((ok val)
+        (match (safe-divide val 1)
+          ((ok result) (if (== result 5) 1 0))
+          ((error _) 0)))
+      ((error _) 0)))
+
+  ;; ============================================================
+  ;; Main runner
+  ;; ============================================================
+
+  (fn main ()
+    (@intent "Run Phase 9 Result type tests")
+    (@spec (() -> Int))
+    (let ((mut passed 0)
+          (mut failed 0))
+
+      ;; Test ok result
+      (if (== (test-ok-result) 1)
+        (set! passed (+ passed 1))
+        (set! failed (+ failed 1)))
+
+      ;; Test error result
+      (if (== (test-error-result) 1)
+        (set! passed (+ passed 1))
+        (set! failed (+ failed 1)))
+
+      ;; Test chained results
+      (if (== (test-chained-results) 1)
+        (set! passed (+ passed 1))
+        (set! failed (+ failed 1)))
+
+      ;; Return 0 if all passed, 1 otherwise
+      (if (== failed 0)
+        0
+        1))))

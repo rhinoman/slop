@@ -1,483 +1,1109 @@
 ;; ============================================================
-;; SLOP Transpiler - Context Management
+;; SLOP Native Transpiler - Context Module
 ;;
-;; Mutable state during transpilation: type registry, variable
-;; scopes, function registry, FFI declarations, module context,
-;; and generic type tracking.
+;; Transpiler state management: output buffers, variable scopes,
+;; type registries, and module context.
 ;; ============================================================
 
 (module context
   (export
-    ;; Main state type
-    TranspileContext
-    ;; Helper types
-    ResultTypeInfo MapTypeInfo
-    ;; Lifecycle
-    context-new
-    ;; Type registry
-    ctx-register-type ctx-lookup-type
-    ctx-register-enum-value ctx-lookup-enum
-    ctx-register-fields ctx-lookup-fields
-    ctx-register-variants ctx-lookup-variants
-    ;; Variable scopes
+    ;; Types
+    TranspileContext VarEntry TypeEntry FuncEntry FieldEntry TranspileError
+    ;; Context creation and reset
+    context-new ctx-reset-for-new-module
+    ;; Output management
+    ctx-emit ctx-emit-header ctx-get-output ctx-get-header
+    ctx-indent ctx-dedent
+    ;; Scope management
     ctx-push-scope ctx-pop-scope
-    ctx-register-var ctx-lookup-var
-    ctx-mark-pointer ctx-is-pointer
-    ;; Function registry
-    ctx-register-function ctx-lookup-function
-    ctx-set-return-type ctx-get-return-type
-    ;; FFI registry
-    ctx-register-ffi-func ctx-lookup-ffi-func
-    ctx-register-ffi-struct ctx-lookup-ffi-struct
-    ctx-add-include ctx-get-includes
+    ctx-bind-var ctx-lookup-var
+    ;; Type/function registration
+    ctx-register-type ctx-lookup-type
+    ctx-register-func ctx-lookup-func
+    ctx-register-field-type ctx-lookup-field-type
+    ctx-mark-pointer-var ctx-is-pointer-var
     ;; Module context
     ctx-set-module ctx-get-module
-    ctx-set-prefixing ctx-get-prefixing
-    ctx-register-import ctx-lookup-import
-    ;; Generic type tracking
-    ctx-register-option ctx-register-result
-    ctx-register-list ctx-register-map
-    ctx-get-options ctx-get-results
-    ctx-get-lists ctx-get-maps
-    ctx-is-emitted ctx-mark-emitted
-    ;; Type environment access
-    ctx-set-type-env ctx-get-type-env)
+    ctx-set-prefixing ctx-prefixing-enabled ctx-prefix-type
+    ;; String building helpers
+    ctx-str ctx-str3 ctx-str4 ctx-str5
+    ;; Include management
+    ctx-add-include ctx-get-includes
+    ;; Generated type tracking
+    ctx-mark-type-emitted ctx-is-type-emitted
+    ;; Enum variant tracking
+    EnumVariant ctx-register-enum-variant ctx-lookup-enum-variant
+    ;; Result type tracking
+    ResultType ctx-register-result-type ctx-has-result-type ctx-get-result-types
+    ;; Current function result type (for ok/error expressions)
+    ctx-set-current-result-type ctx-get-current-result-type ctx-clear-current-result-type
+    ;; Current function return type (for typed none in returns)
+    ctx-set-current-return-type ctx-get-current-return-type ctx-clear-current-return-type
+    ;; Option/List type tracking
+    OptionType ListType
+    ctx-register-option-type ctx-has-option-type ctx-get-option-types
+    ctx-register-list-type ctx-has-list-type ctx-get-list-types
+    ;; Result type alias tracking
+    ResultTypeAlias ctx-register-result-type-alias ctx-lookup-result-type-alias
+    ;; Inline record tracking
+    InlineRecord ctx-register-inline-record ctx-get-inline-records
+    ;; Import tracking
+    ctx-add-import ctx-get-imports
+    ;; Type conversion with prefixing
+    to-c-type-prefixed
+    ;; Gensym for unique variable names
+    ctx-gensym
+    ;; Hash helper
+    simple-hash)
 
-  ;; Import shared types from common
-  (import types (TypeKind RangeBounds FieldDef VariantDef))
-
-  ;; Import C-specific types from transpiler
-  (import transpiler-types (CTypeInfo CFieldInfo CVariantInfo
-                            VarEntry FuncEntry
-                            FFIFuncEntry FFIStructEntry))
-
-  ;; Import type environment from checker
-  (import env (TypeEnv env-lookup-var env-lookup-type env-lookup-function))
-
-  ;; ============================================================
-  ;; Helper Types for Generic Tracking
-  ;; ============================================================
-
-  ;; Result type info: ok and err type names
-  (type ResultTypeInfo (record
-    (ok String)
-    (err String)))
-
-  ;; Map type info: key and value type names
-  (type MapTypeInfo (record
-    (key String)
-    (val String)))
-
-  ;; ============================================================
-  ;; Main Context Type
-  ;; ============================================================
-
-  (type TranspileContext (record
-    (arena Arena)
-    ;; Type environment from checker (for type inference)
-    (type-env (Option (Ptr TypeEnv)))
-    ;; Type registry (C-specific representations)
-    (types (Map String CTypeInfo))
-    (enums (Map String String))           ;; value -> qualified C name
-    (record-fields (Map String (List CFieldInfo)))
-    (union-variants (Map String (List CVariantInfo)))
-    ;; Variable scopes (stack of maps)
-    (var-scopes (List (Map String VarEntry)))
-    (pointer-vars (Map String Bool))      ;; Additional pointer tracking
-    ;; Function registry
-    (functions (Map String FuncEntry))
-    (current-return-type (Option String))
-    ;; FFI registries
-    (ffi-funcs (Map String FFIFuncEntry))
-    (ffi-structs (Map String FFIStructEntry))
-    (ffi-includes (List String))
-    ;; Module context
-    (current-module (Option String))
-    (enable-prefixing Bool)
-    (import-map (Map String String))      ;; local -> qualified
-    ;; Generic type tracking
-    (generated-options (Map String String))  ;; type_name -> inner_type
-    (generated-results (Map String ResultTypeInfo))
-    (generated-lists (Map String String))    ;; type_name -> elem_type
-    (generated-maps (Map String MapTypeInfo))
-    (emitted-guards (Map String Bool))))     ;; Include guard tracking
+  (import types (SExpr SExprList SExprSymbol ResolvedType FnSignature))
+  (import ctype (to-c-type to-c-name type-to-identifier is-builtin-c-type))
 
   ;; ============================================================
-  ;; Lifecycle
+  ;; Type Definitions
+  ;; ============================================================
+
+  (type TranspileError
+    (record
+      (message String)
+      (line Int)
+      (col Int)))
+
+  (type VarEntry
+    (record
+      (name String)        ;; SLOP name
+      (c-name String)      ;; C identifier
+      (c-type String)      ;; C type string
+      (is-pointer Bool)    ;; Is this a pointer variable?
+      (is-mutable Bool)))  ;; Is this mutable?
+
+  (type TypeEntry
+    (record
+      (name String)
+      (c-name String)
+      (c-type String)
+      (is-enum Bool)
+      (is-record Bool)
+      (is-union Bool)))
+
+  (type FuncEntry
+    (record
+      (name String)
+      (c-name String)
+      (returns-pointer Bool)
+      (returns-string Bool)))
+
+  ;; Field type info for record types
+  (type FieldEntry
+    (record
+      (type-name String)    ;; Name of the record type
+      (field-name String)   ;; Name of the field
+      (c-type String)       ;; C type of the field
+      (is-pointer Bool)))   ;; Is this field a pointer type?
+
+  ;; Scope for variable bindings (linked list of scopes)
+  (type Scope
+    (record
+      (vars (List VarEntry))
+      (parent (Option (Ptr Scope)))))
+
+  ;; Main transpiler context
+  (type TranspileContext
+    (record
+      (arena Arena)
+      ;; Output buffers
+      (output (List String))        ;; Implementation code lines
+      (header (List String))        ;; Header code lines
+      (indent Int)                  ;; Current indentation level
+      ;; Variable scopes (stack)
+      (scope (Ptr Scope))
+      ;; Type registry
+      (types (List TypeEntry))
+      ;; Function registry
+      (funcs (List FuncEntry))
+      ;; Field type registry (for record field type lookup)
+      (field-types (List FieldEntry))
+      ;; Pointer variable tracking (names of pointer vars)
+      (pointer-vars (List String))
+      ;; Module context
+      (current-module (Option String))
+      (enable-prefixing Bool)
+      ;; Include files
+      (includes (List String))
+      ;; Emitted generated types (to avoid duplicates)
+      (emitted-types (List String))
+      ;; Enum variant to type mapping (for quote operator)
+      (enum-variants (List EnumVariant))
+      ;; Result types to generate
+      (result-types (List ResultType))
+      ;; Current function's result type (for ok/error expressions)
+      (current-result-type (Option String))
+      ;; Current function's C return type (for typed none in returns)
+      (current-return-c-type (Option String))
+      ;; Imported module names (for header includes)
+      (imported-modules (List String))
+      ;; Option types to generate
+      (option-types (List OptionType))
+      ;; List types to generate
+      (list-types (List ListType))
+      ;; Type aliases to Result types (for ok/error expression type tracking)
+      (result-type-aliases (List ResultTypeAlias))
+      ;; Inline record types (anonymous struct types)
+      (inline-records (List InlineRecord))
+      ;; Gensym counter for unique variable names
+      (gensym-counter Int)))
+
+  (type EnumVariant (record
+    (variant-name String)
+    (enum-name String)))
+
+  (type ResultType (record
+    (ok-type String)      ;; C type for ok value
+    (err-type String)     ;; C type for error value
+    (c-name String)))     ;; Generated C type name like slop_result_int_TestError
+
+  (type OptionType (record
+    (inner-type String)   ;; C type of the contained value
+    (c-name String)))     ;; Generated C type name like slop_option_SExpr_ptr
+
+  (type ListType (record
+    (elem-type String)    ;; C type of list elements
+    (c-name String)))     ;; Generated C type name like slop_list_SExpr_ptr
+
+  (type ResultTypeAlias (record
+    (alias-name String)   ;; SLOP type alias name (e.g., "ComputeResult")
+    (c-name String)))     ;; Generated C type name (e.g., "slop_result_int_BaseError")
+
+  (type InlineRecord (record
+    (type-name String)    ;; Generated type name (e.g., "_anon_record_12345678")
+    (field-body String))) ;; C struct body (e.g., "int64_t first; int64_t second; ")
+
+  ;; ============================================================
+  ;; Context Creation
   ;; ============================================================
 
   (fn context-new ((arena Arena))
-    (@intent "Create new transpilation context with empty registries")
+    (@intent "Create a new transpiler context")
     (@spec ((Arena) -> (Ptr TranspileContext)))
-    (@alloc arena)
-    (@post (!= $result nil))
-    (@example (arena) -> (!= nil))
-    (@example (arena) -> (-> enable-prefixing false))
-    (let ((ctx (cast (Ptr TranspileContext) (arena-alloc arena 8192))))
-      (set! (deref ctx) (TranspileContext
-        arena
-        (none)                       ;; type-env (set by ctx-set-type-env)
-        (map-new arena)              ;; types
-        (map-new arena)              ;; enums
-        (map-new arena)              ;; record-fields
-        (map-new arena)              ;; union-variants
-        (list-new arena)             ;; var-scopes
-        (map-new arena)              ;; pointer-vars
-        (map-new arena)              ;; functions
-        (none)                       ;; current-return-type
-        (map-new arena)              ;; ffi-funcs
-        (map-new arena)              ;; ffi-structs
-        (list-new arena)             ;; ffi-includes
-        (none)                       ;; current-module
-        false                        ;; enable-prefixing
-        (map-new arena)              ;; import-map
-        (map-new arena)              ;; generated-options
-        (map-new arena)              ;; generated-results
-        (map-new arena)              ;; generated-lists
-        (map-new arena)              ;; generated-maps
-        (map-new arena)))            ;; emitted-guards
+    (@example (arena) -> ctx)
+    ;; TranspileContext is ~432 bytes with all fields, allocate 512 for safety
+    (let ((ctx (cast (Ptr TranspileContext) (arena-alloc arena 512)))
+          (initial-scope (cast (Ptr Scope) (arena-alloc arena 64)))
+          (no-parent (Option (Ptr Scope)) none)
+          (no-module (Option String) none))
+      ;; Initialize scope
+      (set! (deref initial-scope) vars (list-new arena VarEntry))
+      (set! (deref initial-scope) parent no-parent)
+      ;; Initialize context
+      (set! (deref ctx) arena arena)
+      (set! (deref ctx) output (list-new arena String))
+      (set! (deref ctx) header (list-new arena String))
+      (set! (deref ctx) indent 0)
+      (set! (deref ctx) scope initial-scope)
+      (set! (deref ctx) types (list-new arena TypeEntry))
+      (set! (deref ctx) funcs (list-new arena FuncEntry))
+      (set! (deref ctx) field-types (list-new arena FieldEntry))
+      (set! (deref ctx) pointer-vars (list-new arena String))
+      (set! (deref ctx) current-module no-module)
+      (set! (deref ctx) enable-prefixing false)
+      (set! (deref ctx) includes (list-new arena String))
+      (set! (deref ctx) emitted-types (list-new arena String))
+      (set! (deref ctx) enum-variants (list-new arena EnumVariant))
+      (set! (deref ctx) result-types (list-new arena ResultType))
+      (set! (deref ctx) current-result-type (Option String) none)
+      (set! (deref ctx) current-return-c-type (Option String) none)
+      (set! (deref ctx) imported-modules (list-new arena String))
+      (set! (deref ctx) option-types (list-new arena OptionType))
+      (set! (deref ctx) list-types (list-new arena ListType))
+      (set! (deref ctx) result-type-aliases (list-new arena ResultTypeAlias))
+      (set! (deref ctx) inline-records (list-new arena InlineRecord))
+      (set! (deref ctx) gensym-counter 0)
       ctx))
 
-  ;; ============================================================
-  ;; Type Registry
-  ;; ============================================================
-
-  (fn ctx-register-type ((ctx (Ptr TranspileContext)) (info CTypeInfo))
-    (@intent "Register a type definition in the registry")
-    (@spec (((Ptr TranspileContext) CTypeInfo) -> Unit))
-    (@pre (!= ctx nil))
-    (map-put (. (deref ctx) types) (. info slop-name) info))
-
-  (fn ctx-lookup-type ((ctx (Ptr TranspileContext)) (name String))
-    (@intent "Look up type by SLOP name")
-    (@spec (((Ptr TranspileContext) String) -> (Option CTypeInfo)))
-    (@pre (!= ctx nil))
-    (@pure)
-    (map-get (. (deref ctx) types) name))
-
-  (fn ctx-register-enum-value ((ctx (Ptr TranspileContext))
-                               (value String) (qualified String))
-    (@intent "Register enum value to qualified C name mapping")
-    (@spec (((Ptr TranspileContext) String String) -> Unit))
-    (@pre (!= ctx nil))
-    (map-put (. (deref ctx) enums) value qualified))
-
-  (fn ctx-lookup-enum ((ctx (Ptr TranspileContext)) (value String))
-    (@intent "Look up qualified C name for enum value")
-    (@spec (((Ptr TranspileContext) String) -> (Option String)))
-    (@pre (!= ctx nil))
-    (@pure)
-    (map-get (. (deref ctx) enums) value))
-
-  (fn ctx-register-fields ((ctx (Ptr TranspileContext))
-                           (type-name String) (fields (List CFieldInfo)))
-    (@intent "Register record field list for a type")
-    (@spec (((Ptr TranspileContext) String (List CFieldInfo)) -> Unit))
-    (@pre (!= ctx nil))
-    (map-put (. (deref ctx) record-fields) type-name fields))
-
-  (fn ctx-lookup-fields ((ctx (Ptr TranspileContext)) (type-name String))
-    (@intent "Look up fields for a record type")
-    (@spec (((Ptr TranspileContext) String) -> (Option (List CFieldInfo))))
-    (@pre (!= ctx nil))
-    (@pure)
-    (map-get (. (deref ctx) record-fields) type-name))
-
-  (fn ctx-register-variants ((ctx (Ptr TranspileContext))
-                             (type-name String) (variants (List CVariantInfo)))
-    (@intent "Register union variant list for a type")
-    (@spec (((Ptr TranspileContext) String (List CVariantInfo)) -> Unit))
-    (@pre (!= ctx nil))
-    (map-put (. (deref ctx) union-variants) type-name variants))
-
-  (fn ctx-lookup-variants ((ctx (Ptr TranspileContext)) (type-name String))
-    (@intent "Look up variants for a union type")
-    (@spec (((Ptr TranspileContext) String) -> (Option (List CVariantInfo))))
-    (@pre (!= ctx nil))
-    (@pure)
-    (map-get (. (deref ctx) union-variants) type-name))
+  (fn ctx-reset-for-new-module ((ctx (Ptr TranspileContext)) (mod-name String))
+    (@intent "Reset context for a new module while preserving cross-module state")
+    (@spec (((Ptr TranspileContext) String) -> Unit))
+    (@pre {ctx != nil})
+    ;; Clear output and header (per-module)
+    (let ((arena (. (deref ctx) arena))
+          (fresh-scope (cast (Ptr Scope) (arena-alloc arena 64)))
+          (no-parent (Option (Ptr Scope)) none))
+      ;; Initialize fresh scope
+      (set! (deref fresh-scope) vars (list-new arena VarEntry))
+      (set! (deref fresh-scope) parent no-parent)
+      ;; Reset per-module state
+      (set! (deref ctx) output (list-new arena String))
+      (set! (deref ctx) header (list-new arena String))
+      (set! (deref ctx) indent 0)
+      (set! (deref ctx) scope fresh-scope)
+      (set! (deref ctx) current-result-type (Option String) none)
+      (set! (deref ctx) current-return-c-type (Option String) none)
+      (set! (deref ctx) includes (list-new arena String))
+      (set! (deref ctx) emitted-types (list-new arena String))
+      ;; Clear imported-modules for the new module's imports
+      (set! (deref ctx) imported-modules (list-new arena String))
+      ;; Clear per-module generic type lists (will be re-registered during prescan)
+      ;; This prevents types from previous modules being emitted in this module's header
+      (set! (deref ctx) result-types (list-new arena ResultType))
+      (set! (deref ctx) option-types (list-new arena OptionType))
+      (set! (deref ctx) list-types (list-new arena ListType))
+      (set! (deref ctx) inline-records (list-new arena InlineRecord))
+      ;; Set new module name
+      (set! (deref ctx) current-module (Option String) (some mod-name))
+      ;; KEEP preserved: types, funcs, enum-variants, result-type-aliases, pointer-vars
+      ;; These are lookup tables that need cross-module visibility
+      (do)))
 
   ;; ============================================================
-  ;; Variable Scopes
+  ;; Output Management
+  ;; ============================================================
+
+  (fn ctx-emit ((ctx (Ptr TranspileContext)) (line String))
+    (@intent "Emit a line of implementation code with current indentation")
+    (@spec (((Ptr TranspileContext) String) -> Unit))
+    (@pre {ctx != nil})
+    (let ((arena (. (deref ctx) arena))
+          (indent-level (. (deref ctx) indent)))
+      ;; Build indented line
+      (let ((mut indented line)
+            (mut i 0))
+        (while (< i indent-level)
+          (set! indented (string-concat arena "    " indented))
+          (set! i (+ i 1)))
+        (list-push (. (deref ctx) output) indented))))
+
+  (fn ctx-emit-header ((ctx (Ptr TranspileContext)) (line String))
+    (@intent "Emit a line of header code")
+    (@spec (((Ptr TranspileContext) String) -> Unit))
+    (@pre {ctx != nil})
+    (list-push (. (deref ctx) header) line))
+
+  (fn ctx-get-output ((ctx (Ptr TranspileContext)))
+    (@intent "Get all output lines")
+    (@spec (((Ptr TranspileContext)) -> (List String)))
+    (@pre {ctx != nil})
+    (. (deref ctx) output))
+
+  (fn ctx-get-header ((ctx (Ptr TranspileContext)))
+    (@intent "Get all header lines")
+    (@spec (((Ptr TranspileContext)) -> (List String)))
+    (@pre {ctx != nil})
+    (. (deref ctx) header))
+
+  (fn ctx-indent ((ctx (Ptr TranspileContext)))
+    (@intent "Increase indentation level")
+    (@spec (((Ptr TranspileContext)) -> Unit))
+    (@pre {ctx != nil})
+    (set! (deref ctx) indent (+ (. (deref ctx) indent) 1)))
+
+  (fn ctx-dedent ((ctx (Ptr TranspileContext)))
+    (@intent "Decrease indentation level")
+    (@spec (((Ptr TranspileContext)) -> Unit))
+    (@pre {ctx != nil})
+    (@pre {(. (deref ctx) indent) > 0})
+    (set! (deref ctx) indent (- (. (deref ctx) indent) 1)))
+
+  ;; ============================================================
+  ;; Scope Management
   ;; ============================================================
 
   (fn ctx-push-scope ((ctx (Ptr TranspileContext)))
-    (@intent "Push new variable scope onto the stack")
+    (@intent "Push a new variable scope")
     (@spec (((Ptr TranspileContext)) -> Unit))
-    (@pre (!= ctx nil))
-    (let ((new-scope (map-new (. (deref ctx) arena))))
-      (list-push (. (deref ctx) var-scopes) new-scope)))
+    (@pre {ctx != nil})
+    (let ((arena (. (deref ctx) arena))
+          (new-scope (cast (Ptr Scope) (arena-alloc arena 64)))
+          (current (. (deref ctx) scope))
+          (parent-opt (Option (Ptr Scope)) (some current)))
+      (set! (deref new-scope) vars (list-new arena VarEntry))
+      (set! (deref new-scope) parent parent-opt)
+      (set! (deref ctx) scope new-scope)))
 
   (fn ctx-pop-scope ((ctx (Ptr TranspileContext)))
-    (@intent "Pop current variable scope from the stack")
+    (@intent "Pop the current variable scope")
     (@spec (((Ptr TranspileContext)) -> Unit))
-    (@pre (!= ctx nil))
-    (@pre (> (list-len (. (deref ctx) var-scopes)) 0))
-    ;; Discard the popped scope - bind result but don't use it
-    (let ((_ (list-pop (. (deref ctx) var-scopes))))
-      (do)))
+    (@pre {ctx != nil})
+    (match (. (deref (. (deref ctx) scope)) parent)
+      ((some parent-scope)
+        (set! (deref ctx) scope parent-scope))
+      ((none) (do))))  ;; Don't pop the root scope
 
-  (fn ctx-register-var ((ctx (Ptr TranspileContext)) (entry VarEntry))
-    (@intent "Register variable in current (top) scope")
+  (fn ctx-bind-var ((ctx (Ptr TranspileContext)) (entry VarEntry))
+    (@intent "Bind a variable in the current scope")
     (@spec (((Ptr TranspileContext) VarEntry) -> Unit))
-    (@pre (!= ctx nil))
-    (@pre (> (list-len (. (deref ctx) var-scopes)) 0))
-    ;; Get top scope and put entry into it
-    ;; Note: Direct access to list element and map-put
-    (let ((scopes (. (deref ctx) var-scopes))
-          (top-idx (- (list-len scopes) 1)))
-      (map-put (@ scopes top-idx) (. entry name) entry)
+    (@pre {ctx != nil})
+    (let ((scope (. (deref ctx) scope)))
+      (list-push (. (deref scope) vars) entry)
+      ;; Track pointer variables globally
       (when (. entry is-pointer)
-        (map-put (. (deref ctx) pointer-vars) (. entry name) true))))
+        (list-push (. (deref ctx) pointer-vars) (. entry name)))))
+
+  (fn lookup-in-scope ((scope (Ptr Scope)) (name String))
+    (@intent "Look up a variable in a single scope")
+    (@spec (((Ptr Scope) String) -> (Option VarEntry)))
+    ;; Safety check: return none if scope is nil
+    (if (== scope nil)
+      none
+      (let ((len (list-len (. (deref scope) vars)))
+            (mut i 0)
+            (mut result (Option VarEntry) none))
+        (while (and (< i len) (match result ((none) true) ((some _) false)))
+          (match (list-get (. (deref scope) vars) i)
+            ((some entry)
+              (when (string-eq (. entry name) name)
+                (set! result (some entry))))
+            ((none) (do)))
+          (set! i (+ i 1)))
+        result)))
 
   (fn ctx-lookup-var ((ctx (Ptr TranspileContext)) (name String))
-    (@intent "Look up variable, searching from innermost scope outward")
+    (@intent "Look up a variable by name in all scopes")
     (@spec (((Ptr TranspileContext) String) -> (Option VarEntry)))
-    (@pre (!= ctx nil))
-    (@pure)
-    ;; Search scopes from top (innermost) to bottom (outermost)
-    (let ((scopes (. (deref ctx) var-scopes))
-          (len (list-len scopes))
-          (mut i (- len 1)))
-      (while (>= i 0)
-        (let ((scope (@ scopes i)))
-          (match (map-get scope name)
-            ((some entry) (return (some entry)))
-            (_ (none))))
-        (set! i (- i 1)))
-      (none)))
+    (@pre {ctx != nil})
+    ;; Search all scopes from current up to root
+    (lookup-var-in-scope-chain (. (deref ctx) scope) name))
 
-  (fn ctx-mark-pointer ((ctx (Ptr TranspileContext)) (name String))
-    (@intent "Mark a variable as being a pointer")
-    (@spec (((Ptr TranspileContext) String) -> Unit))
-    (@pre (!= ctx nil))
-    (map-put (. (deref ctx) pointer-vars) name true))
-
-  (fn ctx-is-pointer ((ctx (Ptr TranspileContext)) (name String))
-    (@intent "Check if variable is known to be a pointer")
-    (@spec (((Ptr TranspileContext) String) -> Bool))
-    (@pre (!= ctx nil))
-    (@pure)
-    (if (map-has (. (deref ctx) pointer-vars) name)
-      true
-      (match (ctx-lookup-var ctx name)
-        ((some entry) (. entry is-pointer))
-        ((none) false))))
+  (fn lookup-var-in-scope-chain ((scope (Ptr Scope)) (name String))
+    (@intent "Recursively look up variable in scope chain")
+    (@spec (((Ptr Scope) String) -> (Option VarEntry)))
+    ;; Safety check for nil scope
+    (if (== scope nil)
+      none
+      ;; First check current scope
+      (let ((result (lookup-in-scope scope name)))
+        (match result
+          ((some _) result)
+          ((none)
+            ;; Check parent scopes recursively
+            (match (. (deref scope) parent)
+              ((some parent-scope)
+                (lookup-var-in-scope-chain parent-scope name))
+              ((none) none)))))))
 
   ;; ============================================================
-  ;; Function Registry
+  ;; Type/Function Registration
   ;; ============================================================
 
-  (fn ctx-register-function ((ctx (Ptr TranspileContext)) (entry FuncEntry))
-    (@intent "Register function in the context")
+  (fn ctx-register-type ((ctx (Ptr TranspileContext)) (entry TypeEntry))
+    (@intent "Register a type in the context")
+    (@spec (((Ptr TranspileContext) TypeEntry) -> Unit))
+    (@pre {ctx != nil})
+    (list-push (. (deref ctx) types) entry))
+
+  (fn ctx-lookup-type ((ctx (Ptr TranspileContext)) (name String))
+    (@intent "Look up a type by name, searching from most recent first")
+    (@spec (((Ptr TranspileContext) String) -> (Option TypeEntry)))
+    (@pre {ctx != nil})
+    ;; Search from end to find most recently registered (local definitions shadow imports)
+    (let ((types (. (deref ctx) types))
+          (len (list-len types))
+          (mut result (Option TypeEntry) none))
+      (when (> len 0)
+        (let ((mut i (- (cast Int len) 1)))
+          (while (and (>= i 0) (match result ((none) true) ((some _) false)))
+            (match (list-get types (cast (Int 0 ..) i))
+              ((some entry)
+                (when (string-eq (. entry name) name)
+                  (set! result (some entry))))
+              ((none) (do)))
+            (set! i (- i 1)))))
+      result))
+
+  (fn ctx-register-func ((ctx (Ptr TranspileContext)) (entry FuncEntry))
+    (@intent "Register a function in the context")
     (@spec (((Ptr TranspileContext) FuncEntry) -> Unit))
-    (@pre (!= ctx nil))
-    (map-put (. (deref ctx) functions) (. entry name) entry))
+    (@pre {ctx != nil})
+    (list-push (. (deref ctx) funcs) entry))
 
-  (fn ctx-lookup-function ((ctx (Ptr TranspileContext)) (name String))
-    (@intent "Look up function by name")
+  (fn ctx-lookup-func ((ctx (Ptr TranspileContext)) (name String))
+    (@intent "Look up a function by name")
     (@spec (((Ptr TranspileContext) String) -> (Option FuncEntry)))
-    (@pre (!= ctx nil))
-    (@pure)
-    (map-get (. (deref ctx) functions) name))
+    (@pre {ctx != nil})
+    (let ((funcs (. (deref ctx) funcs))
+          (len (list-len funcs))
+          (mut i 0)
+          (mut result (Option FuncEntry) none))
+      (while (and (< i len) (match result ((none) true) ((some _) false)))
+        (match (list-get funcs i)
+          ((some entry)
+            (when (string-eq (. entry name) name)
+              (set! result (some entry))))
+          ((none) (do)))
+        (set! i (+ i 1)))
+      result))
 
-  (fn ctx-set-return-type ((ctx (Ptr TranspileContext)) (typ (Option String)))
-    (@intent "Set current function's return type for type inference")
-    (@spec (((Ptr TranspileContext) (Option String)) -> Unit))
-    (@pre (!= ctx nil))
-    (set! (. (deref ctx) current-return-type) typ))
+  (fn ctx-register-field-type ((ctx (Ptr TranspileContext)) (type-name String) (field-name String) (c-type String) (is-pointer Bool))
+    (@intent "Register a field type for a record type")
+    (@spec (((Ptr TranspileContext) String String String Bool) -> Unit))
+    (@pre {ctx != nil})
+    (list-push (. (deref ctx) field-types) (FieldEntry type-name field-name c-type is-pointer)))
 
-  (fn ctx-get-return-type ((ctx (Ptr TranspileContext)))
-    (@intent "Get current function's return type")
-    (@spec (((Ptr TranspileContext)) -> (Option String)))
-    (@pre (!= ctx nil))
-    (@pure)
-    (. (deref ctx) current-return-type))
+  (fn ctx-lookup-field-type ((ctx (Ptr TranspileContext)) (type-name String) (field-name String))
+    (@intent "Look up the C type of a field in a record type")
+    (@spec (((Ptr TranspileContext) String String) -> (Option String)))
+    (@pre {ctx != nil})
+    (let ((fields (. (deref ctx) field-types))
+          (len (list-len fields))
+          (mut i 0)
+          (mut result (Option String) none))
+      (while (and (< i len) (match result ((none) true) ((some _) false)))
+        (match (list-get fields i)
+          ((some entry)
+            (when (and (string-eq (. entry type-name) type-name)
+                       (string-eq (. entry field-name) field-name))
+              (set! result (some (. entry c-type)))))
+          ((none) (do)))
+        (set! i (+ i 1)))
+      result))
 
-  ;; ============================================================
-  ;; FFI Registry
-  ;; ============================================================
-
-  (fn ctx-register-ffi-func ((ctx (Ptr TranspileContext)) (entry FFIFuncEntry))
-    (@intent "Register FFI function declaration")
-    (@spec (((Ptr TranspileContext) FFIFuncEntry) -> Unit))
-    (@pre (!= ctx nil))
-    (map-put (. (deref ctx) ffi-funcs) (. entry slop-name) entry))
-
-  (fn ctx-lookup-ffi-func ((ctx (Ptr TranspileContext)) (name String))
-    (@intent "Look up FFI function by SLOP name")
-    (@spec (((Ptr TranspileContext) String) -> (Option FFIFuncEntry)))
-    (@pre (!= ctx nil))
-    (@pure)
-    (map-get (. (deref ctx) ffi-funcs) name))
-
-  (fn ctx-register-ffi-struct ((ctx (Ptr TranspileContext)) (entry FFIStructEntry))
-    (@intent "Register FFI struct declaration")
-    (@spec (((Ptr TranspileContext) FFIStructEntry) -> Unit))
-    (@pre (!= ctx nil))
-    (map-put (. (deref ctx) ffi-structs) (. entry slop-name) entry))
-
-  (fn ctx-lookup-ffi-struct ((ctx (Ptr TranspileContext)) (name String))
-    (@intent "Look up FFI struct by SLOP name")
-    (@spec (((Ptr TranspileContext) String) -> (Option FFIStructEntry)))
-    (@pre (!= ctx nil))
-    (@pure)
-    (map-get (. (deref ctx) ffi-structs) name))
-
-  (fn ctx-add-include ((ctx (Ptr TranspileContext)) (header String))
-    (@intent "Add header file to FFI includes")
+  (fn ctx-mark-pointer-var ((ctx (Ptr TranspileContext)) (name String))
+    (@intent "Mark a variable as a pointer")
     (@spec (((Ptr TranspileContext) String) -> Unit))
-    (@pre (!= ctx nil))
-    ;; Check if header already in list before adding
-    (let ((len (list-len (. (deref ctx) ffi-includes)))
-          (mut found false))
-      (for (i 0 len)
-        (let ((h (@ (. (deref ctx) ffi-includes) i)))
-          (when (string-eq h header)
-            (set! found true))))
-      (when (not found)
-        (list-push (. (deref ctx) ffi-includes) header))))
+    (@pre {ctx != nil})
+    (list-push (. (deref ctx) pointer-vars) name))
 
-  (fn ctx-get-includes ((ctx (Ptr TranspileContext)))
-    (@intent "Get list of FFI include headers")
-    (@spec (((Ptr TranspileContext)) -> (List String)))
-    (@pre (!= ctx nil))
-    (@pure)
-    (. (deref ctx) ffi-includes))
+  (fn ctx-is-pointer-var ((ctx (Ptr TranspileContext)) (name String))
+    (@intent "Check if a variable is known to be a pointer")
+    (@spec (((Ptr TranspileContext) String) -> Bool))
+    (@pre {ctx != nil})
+    (let ((vars (. (deref ctx) pointer-vars))
+          (len (list-len vars))
+          (mut i 0)
+          (mut found false))
+      (while (and (< i len) (not found))
+        (match (list-get vars i)
+          ((some v)
+            (when (string-eq v name)
+              (set! found true)))
+          ((none) (do)))
+        (set! i (+ i 1)))
+      found))
 
   ;; ============================================================
   ;; Module Context
   ;; ============================================================
 
   (fn ctx-set-module ((ctx (Ptr TranspileContext)) (name (Option String)))
-    (@intent "Set current module name for qualified naming")
+    (@intent "Set the current module name")
     (@spec (((Ptr TranspileContext) (Option String)) -> Unit))
-    (@pre (!= ctx nil))
-    (set! (. (deref ctx) current-module) name))
+    (@pre {ctx != nil})
+    (set! (deref ctx) current-module name))
 
   (fn ctx-get-module ((ctx (Ptr TranspileContext)))
-    (@intent "Get current module name")
+    (@intent "Get the current module name")
     (@spec (((Ptr TranspileContext)) -> (Option String)))
-    (@pre (!= ctx nil))
-    (@pure)
+    (@pre {ctx != nil})
     (. (deref ctx) current-module))
 
   (fn ctx-set-prefixing ((ctx (Ptr TranspileContext)) (enabled Bool))
-    (@intent "Enable or disable module prefixing")
+    (@intent "Enable or disable module name prefixing")
     (@spec (((Ptr TranspileContext) Bool) -> Unit))
-    (@pre (!= ctx nil))
+    (@pre {ctx != nil})
     (set! (. (deref ctx) enable-prefixing) enabled))
 
-  (fn ctx-get-prefixing ((ctx (Ptr TranspileContext)))
-    (@intent "Check if module prefixing is enabled")
+  (fn ctx-prefixing-enabled ((ctx (Ptr TranspileContext)))
+    (@intent "Check if module name prefixing is enabled")
     (@spec (((Ptr TranspileContext)) -> Bool))
-    (@pre (!= ctx nil))
-    (@pure)
+    (@pre {ctx != nil})
     (. (deref ctx) enable-prefixing))
 
-  (fn ctx-register-import ((ctx (Ptr TranspileContext))
-                           (local String) (qualified String))
-    (@intent "Register import: local name -> qualified C name")
-    (@spec (((Ptr TranspileContext) String String) -> Unit))
-    (@pre (!= ctx nil))
-    (map-put (. (deref ctx) import-map) local qualified))
-
-  (fn ctx-lookup-import ((ctx (Ptr TranspileContext)) (local String))
-    (@intent "Look up qualified name for imported symbol")
-    (@spec (((Ptr TranspileContext) String) -> (Option String)))
-    (@pre (!= ctx nil))
-    (@pure)
-    (map-get (. (deref ctx) import-map) local))
+  (fn ctx-prefix-type ((ctx (Ptr TranspileContext)) (type-name String))
+    (@intent "Add module prefix to a type name if prefixing is enabled")
+    (@spec (((Ptr TranspileContext) String) -> String))
+    (@pre {ctx != nil})
+    (let ((arena (. (deref ctx) arena)))
+      (if (ctx-prefixing-enabled ctx)
+        (match (ctx-get-module ctx)
+          ((some mod-name)
+            ;; Convert module name to valid C identifier (hyphens to underscores)
+            (let ((c-mod-name (to-c-name arena mod-name)))
+              (ctx-str ctx c-mod-name (ctx-str ctx "_" type-name))))
+          ((none) type-name))
+        type-name)))
 
   ;; ============================================================
-  ;; Generic Type Tracking
+  ;; Include Management
   ;; ============================================================
 
-  (fn ctx-register-option ((ctx (Ptr TranspileContext))
-                           (type-name String) (inner-type String))
-    (@intent "Register Option<T> instantiation for later emission")
-    (@spec (((Ptr TranspileContext) String String) -> Unit))
-    (@pre (!= ctx nil))
-    (map-put (. (deref ctx) generated-options) type-name inner-type))
-
-  (fn ctx-register-result ((ctx (Ptr TranspileContext))
-                           (type-name String) (ok-type String) (err-type String))
-    (@intent "Register Result<T,E> instantiation for later emission")
-    (@spec (((Ptr TranspileContext) String String String) -> Unit))
-    (@pre (!= ctx nil))
-    (map-put (. (deref ctx) generated-results) type-name
-             (ResultTypeInfo ok-type err-type)))
-
-  (fn ctx-register-list ((ctx (Ptr TranspileContext))
-                         (type-name String) (elem-type String))
-    (@intent "Register List<T> instantiation for later emission")
-    (@spec (((Ptr TranspileContext) String String) -> Unit))
-    (@pre (!= ctx nil))
-    (map-put (. (deref ctx) generated-lists) type-name elem-type))
-
-  (fn ctx-register-map ((ctx (Ptr TranspileContext))
-                        (type-name String) (key-type String) (val-type String))
-    (@intent "Register Map<K,V> instantiation for later emission")
-    (@spec (((Ptr TranspileContext) String String String) -> Unit))
-    (@pre (!= ctx nil))
-    (map-put (. (deref ctx) generated-maps) type-name
-             (MapTypeInfo key-type val-type)))
-
-  (fn ctx-get-options ((ctx (Ptr TranspileContext)))
-    (@intent "Get all registered Option types")
-    (@spec (((Ptr TranspileContext)) -> (Map String String)))
-    (@pre (!= ctx nil))
-    (@pure)
-    (. (deref ctx) generated-options))
-
-  (fn ctx-get-results ((ctx (Ptr TranspileContext)))
-    (@intent "Get all registered Result types")
-    (@spec (((Ptr TranspileContext)) -> (Map String ResultTypeInfo)))
-    (@pre (!= ctx nil))
-    (@pure)
-    (. (deref ctx) generated-results))
-
-  (fn ctx-get-lists ((ctx (Ptr TranspileContext)))
-    (@intent "Get all registered List types")
-    (@spec (((Ptr TranspileContext)) -> (Map String String)))
-    (@pre (!= ctx nil))
-    (@pure)
-    (. (deref ctx) generated-lists))
-
-  (fn ctx-get-maps ((ctx (Ptr TranspileContext)))
-    (@intent "Get all registered Map types")
-    (@spec (((Ptr TranspileContext)) -> (Map String MapTypeInfo)))
-    (@pre (!= ctx nil))
-    (@pure)
-    (. (deref ctx) generated-maps))
-
-  (fn ctx-is-emitted ((ctx (Ptr TranspileContext)) (guard String))
-    (@intent "Check if type guard has been emitted")
-    (@spec (((Ptr TranspileContext) String) -> Bool))
-    (@pre (!= ctx nil))
-    (@pure)
-    (map-has (. (deref ctx) emitted-guards) guard))
-
-  (fn ctx-mark-emitted ((ctx (Ptr TranspileContext)) (guard String))
-    (@intent "Mark type guard as emitted")
+  (fn ctx-add-include ((ctx (Ptr TranspileContext)) (header String))
+    (@intent "Add a header file to include")
     (@spec (((Ptr TranspileContext) String) -> Unit))
-    (@pre (!= ctx nil))
-    (map-put (. (deref ctx) emitted-guards) guard true))
+    (@pre {ctx != nil})
+    ;; Check if already included
+    (let ((len (list-len (. (deref ctx) includes)))
+          (mut i 0)
+          (mut found false))
+      (while (and (< i len) (not found))
+        (match (list-get (. (deref ctx) includes) i)
+          ((some h)
+            (when (string-eq h header)
+              (set! found true)))
+          ((none) (do)))
+        (set! i (+ i 1)))
+      (when (not found)
+        (list-push (. (deref ctx) includes) header))))
+
+  (fn ctx-get-includes ((ctx (Ptr TranspileContext)))
+    (@intent "Get all include headers")
+    (@spec (((Ptr TranspileContext)) -> (List String)))
+    (@pre {ctx != nil})
+    (. (deref ctx) includes))
 
   ;; ============================================================
-  ;; Type Environment Access
+  ;; Generated Type Tracking
   ;; ============================================================
 
-  (fn ctx-set-type-env ((ctx (Ptr TranspileContext)) (tenv (Ptr TypeEnv)))
-    (@intent "Set the type environment from the type checker")
-    (@spec (((Ptr TranspileContext) (Ptr TypeEnv)) -> Unit))
-    (@pre (!= ctx nil))
-    (let ((opt (Option (Ptr TypeEnv)) (some tenv)))
-      (set! (. (deref ctx) type-env) opt)))
+  (fn ctx-mark-type-emitted ((ctx (Ptr TranspileContext)) (type-name String))
+    (@intent "Mark a generated type as emitted")
+    (@spec (((Ptr TranspileContext) String) -> Unit))
+    (@pre {ctx != nil})
+    (list-push (. (deref ctx) emitted-types) type-name))
 
-  (fn ctx-get-type-env ((ctx (Ptr TranspileContext)))
-    (@intent "Get the type environment if set")
-    (@spec (((Ptr TranspileContext)) -> (Option (Ptr TypeEnv))))
-    (@pre (!= ctx nil))
-    (@pure)
-    (. (deref ctx) type-env)))
+  (fn ctx-is-type-emitted ((ctx (Ptr TranspileContext)) (type-name String))
+    (@intent "Check if a generated type has been emitted")
+    (@spec (((Ptr TranspileContext) String) -> Bool))
+    (@pre {ctx != nil})
+    (let ((types (. (deref ctx) emitted-types))
+          (len (list-len types))
+          (mut i 0)
+          (mut found false))
+      (while (and (< i len) (not found))
+        (match (list-get types i)
+          ((some t)
+            (when (string-eq t type-name)
+              (set! found true)))
+          ((none) (do)))
+        (set! i (+ i 1)))
+      found))
+
+  ;; ============================================================
+  ;; Enum Variant Tracking
+  ;; ============================================================
+
+  (fn ctx-register-enum-variant ((ctx (Ptr TranspileContext)) (variant-name String) (enum-name String))
+    (@intent "Register an enum variant with its parent type")
+    (@spec (((Ptr TranspileContext) String String) -> Unit))
+    (@pre {ctx != nil})
+    (list-push (. (deref ctx) enum-variants) (EnumVariant variant-name enum-name)))
+
+  (fn ctx-lookup-enum-variant ((ctx (Ptr TranspileContext)) (variant-name String))
+    (@intent "Look up the enum type for a variant")
+    (@spec (((Ptr TranspileContext) String) -> (Option String)))
+    (@pre {ctx != nil})
+    (let ((variants (. (deref ctx) enum-variants))
+          (len (list-len variants))
+          (mut i 0)
+          (mut result (Option String) none))
+      (while (and (< i len) (match result ((none) true) ((some _) false)))
+        (match (list-get variants i)
+          ((some entry)
+            (when (string-eq (. entry variant-name) variant-name)
+              (set! result (some (. entry enum-name)))))
+          ((none) (do)))
+        (set! i (+ i 1)))
+      result))
+
+  ;; ============================================================
+  ;; Result Type Tracking
+  ;; ============================================================
+
+  (fn ctx-register-result-type ((ctx (Ptr TranspileContext)) (ok-type String) (err-type String) (c-name String))
+    (@intent "Register a Result type for generation")
+    (@spec (((Ptr TranspileContext) String String String) -> Unit))
+    (@pre {ctx != nil})
+    ;; Check if already registered
+    (when (not (ctx-has-result-type ctx c-name))
+      (list-push (. (deref ctx) result-types) (ResultType ok-type err-type c-name))))
+
+  (fn ctx-has-result-type ((ctx (Ptr TranspileContext)) (c-name String))
+    (@intent "Check if a Result type is already registered")
+    (@spec (((Ptr TranspileContext) String) -> Bool))
+    (@pre {ctx != nil})
+    (let ((types (. (deref ctx) result-types))
+          (len (list-len types))
+          (mut i 0)
+          (mut found false))
+      (while (and (< i len) (not found))
+        (match (list-get types i)
+          ((some entry)
+            (when (string-eq (. entry c-name) c-name)
+              (set! found true)))
+          ((none) (do)))
+        (set! i (+ i 1)))
+      found))
+
+  (fn ctx-get-result-types ((ctx (Ptr TranspileContext)))
+    (@intent "Get all registered Result types")
+    (@spec (((Ptr TranspileContext)) -> (List ResultType)))
+    (@pre {ctx != nil})
+    (. (deref ctx) result-types))
+
+  ;; ============================================================
+  ;; Current Function Result Type
+  ;; ============================================================
+
+  (fn ctx-set-current-result-type ((ctx (Ptr TranspileContext)) (result-type String))
+    (@intent "Set the current function's result type name")
+    (@spec (((Ptr TranspileContext) String) -> Unit))
+    (@pre {ctx != nil})
+    (let ((opt (Option String) (some result-type)))
+      (set! (deref ctx) current-result-type opt)))
+
+  (fn ctx-get-current-result-type ((ctx (Ptr TranspileContext)))
+    (@intent "Get the current function's result type name")
+    (@spec (((Ptr TranspileContext)) -> (Option String)))
+    (@pre {ctx != nil})
+    (. (deref ctx) current-result-type))
+
+  (fn ctx-clear-current-result-type ((ctx (Ptr TranspileContext)))
+    (@intent "Clear the current function's result type")
+    (@spec (((Ptr TranspileContext)) -> Unit))
+    (@pre {ctx != nil})
+    (set! (deref ctx) current-result-type (Option String) none))
+
+  ;; ============================================================
+  ;; Current Function Return Type Tracking
+  ;; ============================================================
+
+  (fn ctx-set-current-return-type ((ctx (Ptr TranspileContext)) (c-type String))
+    (@intent "Set the current function's C return type")
+    (@spec (((Ptr TranspileContext) String) -> Unit))
+    (@pre {ctx != nil})
+    (let ((opt (Option String) (some c-type)))
+      (set! (deref ctx) current-return-c-type opt)))
+
+  (fn ctx-get-current-return-type ((ctx (Ptr TranspileContext)))
+    (@intent "Get the current function's C return type")
+    (@spec (((Ptr TranspileContext)) -> (Option String)))
+    (@pre {ctx != nil})
+    (. (deref ctx) current-return-c-type))
+
+  (fn ctx-clear-current-return-type ((ctx (Ptr TranspileContext)))
+    (@intent "Clear the current function's return type")
+    (@spec (((Ptr TranspileContext)) -> Unit))
+    (@pre {ctx != nil})
+    (set! (deref ctx) current-return-c-type (Option String) none))
+
+  ;; ============================================================
+  ;; Option Type Tracking
+  ;; ============================================================
+
+  (fn ctx-register-option-type ((ctx (Ptr TranspileContext)) (inner-type String) (c-name String))
+    (@intent "Register an Option type for generation")
+    (@spec (((Ptr TranspileContext) String String) -> Unit))
+    (@pre {ctx != nil})
+    (when (not (ctx-has-option-type ctx c-name))
+      (list-push (. (deref ctx) option-types) (OptionType inner-type c-name))))
+
+  (fn ctx-has-option-type ((ctx (Ptr TranspileContext)) (c-name String))
+    (@intent "Check if an Option type is already registered")
+    (@spec (((Ptr TranspileContext) String) -> Bool))
+    (@pre {ctx != nil})
+    (let ((types (. (deref ctx) option-types))
+          (len (list-len types))
+          (mut i 0)
+          (mut found false))
+      (while (and (< i len) (not found))
+        (match (list-get types i)
+          ((some entry)
+            (when (string-eq (. entry c-name) c-name)
+              (set! found true)))
+          ((none) (do)))
+        (set! i (+ i 1)))
+      found))
+
+  (fn ctx-get-option-types ((ctx (Ptr TranspileContext)))
+    (@intent "Get all registered Option types")
+    (@spec (((Ptr TranspileContext)) -> (List OptionType)))
+    (@pre {ctx != nil})
+    (. (deref ctx) option-types))
+
+  ;; ============================================================
+  ;; List Type Tracking
+  ;; ============================================================
+
+  (fn ctx-register-list-type ((ctx (Ptr TranspileContext)) (elem-type String) (c-name String))
+    (@intent "Register a List type for generation")
+    (@spec (((Ptr TranspileContext) String String) -> Unit))
+    (@pre {ctx != nil})
+    (when (not (ctx-has-list-type ctx c-name))
+      (list-push (. (deref ctx) list-types) (ListType elem-type c-name))))
+
+  (fn ctx-has-list-type ((ctx (Ptr TranspileContext)) (c-name String))
+    (@intent "Check if a List type is already registered")
+    (@spec (((Ptr TranspileContext) String) -> Bool))
+    (@pre {ctx != nil})
+    (let ((types (. (deref ctx) list-types))
+          (len (list-len types))
+          (mut i 0)
+          (mut found false))
+      (while (and (< i len) (not found))
+        (match (list-get types i)
+          ((some entry)
+            (when (string-eq (. entry c-name) c-name)
+              (set! found true)))
+          ((none) (do)))
+        (set! i (+ i 1)))
+      found))
+
+  (fn ctx-get-list-types ((ctx (Ptr TranspileContext)))
+    (@intent "Get all registered List types")
+    (@spec (((Ptr TranspileContext)) -> (List ListType)))
+    (@pre {ctx != nil})
+    (. (deref ctx) list-types))
+
+  ;; ============================================================
+  ;; Result Type Alias Tracking
+  ;; ============================================================
+
+  (fn ctx-register-result-type-alias ((ctx (Ptr TranspileContext)) (alias-name String) (c-name String))
+    (@intent "Register a type alias to a Result type")
+    (@spec (((Ptr TranspileContext) String String) -> Unit))
+    (@pre {ctx != nil})
+    (list-push (. (deref ctx) result-type-aliases) (ResultTypeAlias alias-name c-name)))
+
+  (fn ctx-lookup-result-type-alias ((ctx (Ptr TranspileContext)) (alias-name String))
+    (@intent "Look up a type alias to find its Result type C name")
+    (@spec (((Ptr TranspileContext) String) -> (Option String)))
+    (@pre {ctx != nil})
+    (let ((aliases (. (deref ctx) result-type-aliases))
+          (len (list-len aliases))
+          (mut i 0)
+          (mut result (Option String) none))
+      (while (and (< i len) (match result ((none) true) ((some _) false)))
+        (match (list-get aliases i)
+          ((some entry)
+            (when (string-eq (. entry alias-name) alias-name)
+              (set! result (some (. entry c-name)))))
+          ((none) (do)))
+        (set! i (+ i 1)))
+      result))
+
+  ;; ============================================================
+  ;; String Building Helpers
+  ;; ============================================================
+
+  (fn ctx-str ((ctx (Ptr TranspileContext)) (a String) (b String))
+    (@intent "Concatenate two strings using context arena")
+    (@spec (((Ptr TranspileContext) String String) -> String))
+    (@pre {ctx != nil})
+    (string-concat (. (deref ctx) arena) a b))
+
+  (fn ctx-str3 ((ctx (Ptr TranspileContext)) (a String) (b String) (c String))
+    (@intent "Concatenate three strings using context arena")
+    (@spec (((Ptr TranspileContext) String String String) -> String))
+    (@pre {ctx != nil})
+    (let ((arena (. (deref ctx) arena)))
+      (string-concat arena (string-concat arena a b) c)))
+
+  (fn ctx-str4 ((ctx (Ptr TranspileContext)) (a String) (b String) (c String) (d String))
+    (@intent "Concatenate four strings using context arena")
+    (@spec (((Ptr TranspileContext) String String String String) -> String))
+    (@pre {ctx != nil})
+    (let ((arena (. (deref ctx) arena)))
+      (string-concat arena (string-concat arena (string-concat arena a b) c) d)))
+
+  (fn ctx-str5 ((ctx (Ptr TranspileContext)) (a String) (b String) (c String) (d String) (e String))
+    (@intent "Concatenate five strings using context arena")
+    (@spec (((Ptr TranspileContext) String String String String String) -> String))
+    (@pre {ctx != nil})
+    (let ((arena (. (deref ctx) arena)))
+      (string-concat arena (string-concat arena (string-concat arena (string-concat arena a b) c) d) e)))
+
+  ;; ============================================================
+  ;; Import Module Tracking
+  ;; ============================================================
+
+  (fn ctx-add-import ((ctx (Ptr TranspileContext)) (mod-name String))
+    (@intent "Register an imported module for header includes")
+    (@spec (((Ptr TranspileContext) String) -> Unit))
+    (@pre {ctx != nil})
+    ;; Check if already added
+    (let ((imports (. (deref ctx) imported-modules))
+          (len (list-len imports))
+          (mut i 0)
+          (mut found false))
+      (while (and (< i len) (not found))
+        (match (list-get imports i)
+          ((some m)
+            (when (string-eq m mod-name)
+              (set! found true)))
+          ((none) (do)))
+        (set! i (+ i 1)))
+      (when (not found)
+        (list-push (. (deref ctx) imported-modules) mod-name))))
+
+  (fn ctx-get-imports ((ctx (Ptr TranspileContext)))
+    (@intent "Get list of imported module names")
+    (@spec (((Ptr TranspileContext)) -> (List String)))
+    (@pre {ctx != nil})
+    (. (deref ctx) imported-modules))
+
+  ;; ============================================================
+  ;; Inline Record Tracking
+  ;; ============================================================
+
+  (fn ctx-register-inline-record ((ctx (Ptr TranspileContext)) (type-name String) (field-body String))
+    (@intent "Register an inline record type for later emission")
+    (@spec (((Ptr TranspileContext) String String) -> Unit))
+    (@pre {ctx != nil})
+    ;; Check if already registered
+    (let ((records (. (deref ctx) inline-records))
+          (len (list-len records))
+          (mut i 0)
+          (mut found false))
+      (while (and (< i len) (not found))
+        (match (list-get records i)
+          ((some r)
+            (when (string-eq (. r type-name) type-name)
+              (set! found true)))
+          ((none) (do)))
+        (set! i (+ i 1)))
+      (when (not found)
+        (list-push (. (deref ctx) inline-records) (InlineRecord type-name field-body)))))
+
+  (fn ctx-get-inline-records ((ctx (Ptr TranspileContext)))
+    (@intent "Get list of inline record types")
+    (@spec (((Ptr TranspileContext)) -> (List InlineRecord)))
+    (@pre {ctx != nil})
+    (. (deref ctx) inline-records))
+
+  ;; ============================================================
+  ;; Hash Helper
+  ;; ============================================================
+
+  (fn simple-hash ((arena Arena) (s String))
+    (@intent "Generate simple hash string from input for unique type names")
+    (@spec ((Arena String) -> String))
+    ;; Simple hash algorithm using modulo for positive result
+    (let ((mut hash 5381)
+          (len (cast Int (string-len s)))
+          (mut i 0))
+      (while (< i len)
+        (let ((c (cast Int (@ (. s data) i))))
+          ;; hash * 33 + c
+          (set! hash (+ (* hash 33) c)))
+        (set! i (+ i 1)))
+      ;; Make positive using modulo and convert to string
+      (let ((positive-hash (% (if (< hash 0) (- 0 hash) hash) 999999999)))
+        (int-to-string arena positive-hash))))
+
+  ;; ============================================================
+  ;; Type Conversion with Prefixing
+  ;; ============================================================
+
+  (fn to-c-type-prefixed ((ctx (Ptr TranspileContext)) (type-expr (Ptr SExpr)))
+    (@intent "Convert SLOP type to C type with module prefix applied")
+    (@spec (((Ptr TranspileContext) (Ptr SExpr)) -> String))
+    (@pre {ctx != nil})
+    (@pre {type-expr != nil})
+    (let ((arena (. (deref ctx) arena)))
+      (match (deref type-expr)
+        ;; Symbol: builtin type or user-defined type name
+        ((symbol sym)
+          (let ((name (. sym name))
+                (base-c-type (to-c-type arena type-expr)))
+            ;; If it's a builtin, use as-is
+            (if (is-builtin-c-type base-c-type)
+              base-c-type
+              ;; Check if this type is registered (e.g., from an import)
+              (match (ctx-lookup-type ctx name)
+                ((some entry)
+                  ;; Use the registered c-name (which has the correct module prefix)
+                  (. entry c-name))
+                ;; Not registered - use current module prefix (local type)
+                ((none) (ctx-prefix-type ctx base-c-type))))))
+        ;; List: compound type like (Ptr T), (Option T), etc.
+        ((list lst)
+          (to-c-type-prefixed-compound ctx (. lst items)))
+        ;; Other forms
+        ((string _) "void*")
+        ((number _) "void*"))))
+
+  (fn get-array-pointer-type ((ctx (Ptr TranspileContext)) (expr (Ptr SExpr)))
+    (@intent "If expr is a symbol that's an array type alias, return its pointer type")
+    (@spec (((Ptr TranspileContext) (Ptr SExpr)) -> (Option String)))
+    (@pre {ctx != nil})
+    (@pre {expr != nil})
+    ;; Only check symbols (type name references)
+    (match (deref expr)
+      ((symbol sym)
+        (let ((type-name (. sym name)))
+          ;; Look up in type registry
+          (match (ctx-lookup-type ctx type-name)
+            ((some entry)
+              ;; Check if c-type differs from c-name (indicates array type)
+              ;; Array types have c-type = "elem*" while c-name = "Typename"
+              (let ((c-name (. entry c-name))
+                    (c-type (. entry c-type)))
+                ;; If c-type ends with * and isn't just c-name*, it's an array type
+                (if (and (ends-with-star c-type)
+                         (not (string-eq c-type (string-concat-ctx ctx c-name "*"))))
+                  (some c-type)  ;; Return the element pointer type
+                  none)))
+            ((none) none))))
+      (else none)))
+
+  (fn ends-with-star ((s String))
+    (@intent "Check if string ends with *")
+    (@spec ((String) -> Bool))
+    (let ((len (string-len s)))
+      (if (< len 1)
+        false
+        (== (@ (. s data) (- (cast Int len) 1)) 42))))  ;; 42 is ASCII for *
+
+  (fn string-concat-ctx ((ctx (Ptr TranspileContext)) (a String) (b String))
+    (@intent "Concatenate two strings using context arena")
+    (@spec (((Ptr TranspileContext) String String) -> String))
+    (@pre {ctx != nil})
+    (let ((arena (. (deref ctx) arena)))
+      (string-concat arena a b)))
+
+  (fn to-c-type-prefixed-compound ((ctx (Ptr TranspileContext)) (items (List (Ptr SExpr))))
+    (@intent "Convert compound SLOP type to C type with prefixing")
+    (@spec (((Ptr TranspileContext) (List (Ptr SExpr))) -> String))
+    (@pre {ctx != nil})
+    (let ((arena (. (deref ctx) arena))
+          (len (list-len items))
+          (mut result "void*"))
+      (when (>= len 1)
+        (match (list-get items 0)
+          ((some first-expr)
+            (match (deref first-expr)
+              ((symbol head-sym)
+                (let ((head (. head-sym name)))
+                  (cond
+                    ;; (Ptr T) -> T* (special case for array type aliases)
+                    ((string-eq head "Ptr")
+                      (if (>= len 2)
+                        (match (list-get items 1)
+                          ((some inner)
+                            ;; Check if inner is a symbol that's an array type alias
+                            (match (get-array-pointer-type ctx inner)
+                              ((some ptr-type) (set! result ptr-type))
+                              ((none) (set! result (ctx-str ctx (to-c-type-prefixed ctx inner) "*")))))
+                          ((none) (do)))
+                        (do)))
+
+                    ;; (ScopedPtr T) -> T*
+                    ((string-eq head "ScopedPtr")
+                      (if (>= len 2)
+                        (match (list-get items 1)
+                          ((some inner) (set! result (ctx-str ctx (to-c-type-prefixed ctx inner) "*")))
+                          ((none) (do)))
+                        (do)))
+
+                    ;; (Option T) -> slop_option_<inner>
+                    ((string-eq head "Option")
+                      (set! result "slop_option_void")
+                      (when (>= len 2)
+                        (match (list-get items 1)
+                          ((some inner)
+                            (let ((inner-c (to-c-type-prefixed ctx inner))
+                                  (inner-id (type-to-identifier arena inner-c)))
+                              (set! result (ctx-str ctx "slop_option_" inner-id))))
+                          ((none) (do)))))
+
+                    ;; (Result T E) -> slop_result_<ok>_<err>
+                    ((string-eq head "Result")
+                      (let ((mut ok-id "void")
+                            (mut err-id "slop_error"))
+                        (when (>= len 2)
+                          (match (list-get items 1)
+                            ((some ok-expr)
+                              (set! ok-id (type-to-identifier arena (to-c-type-prefixed ctx ok-expr))))
+                            ((none) (do))))
+                        (when (>= len 3)
+                          (match (list-get items 2)
+                            ((some err-expr)
+                              (set! err-id (type-to-identifier arena (to-c-type-prefixed ctx err-expr))))
+                            ((none) (do))))
+                        (set! result (ctx-str ctx
+                          (ctx-str ctx "slop_result_" ok-id)
+                          (ctx-str ctx "_" err-id)))))
+
+                    ;; (List T) -> slop_list_<inner>
+                    ((string-eq head "List")
+                      (set! result "slop_list_void")
+                      (when (>= len 2)
+                        (match (list-get items 1)
+                          ((some inner)
+                            (let ((inner-c (to-c-type-prefixed ctx inner))
+                                  (inner-id (type-to-identifier arena inner-c)))
+                              (set! result (ctx-str ctx "slop_list_" inner-id))))
+                          ((none) (do)))))
+
+                    ;; (Map K V) -> slop_map*
+                    ((string-eq head "Map")
+                      (set! result "slop_map*"))
+
+                    ;; (Array T size) -> T*
+                    ((string-eq head "Array")
+                      (when (>= len 2)
+                        (match (list-get items 1)
+                          ((some inner) (set! result (ctx-str ctx (to-c-type-prefixed ctx inner) "*")))
+                          ((none) (do)))))
+
+                    ;; (record (field1 Type1) (field2 Type2) ...) -> _anon_record_<hash>
+                    ((string-eq head "record")
+                      ;; Build struct field string for hashing and emission
+                      (let ((mut field-str "")
+                            (mut i 1))
+                        (while (< i len)
+                          (match (list-get items i)
+                            ((some field-expr)
+                              (match (deref field-expr)
+                                ((list field-lst)
+                                  (let ((field-items (. field-lst items)))
+                                    (when (>= (list-len field-items) 2)
+                                      (match (list-get field-items 0)
+                                        ((some name-expr)
+                                          (match (deref name-expr)
+                                            ((symbol name-sym)
+                                              (match (list-get field-items 1)
+                                                ((some type-expr)
+                                                  (let ((field-name (to-c-name arena (. name-sym name)))
+                                                        (field-type (to-c-type-prefixed ctx type-expr)))
+                                                    (set! field-str (ctx-str ctx field-str
+                                                      (ctx-str ctx field-type (ctx-str ctx " " (ctx-str ctx field-name "; ")))))))
+                                                ((none) (do))))
+                                            (else (do))))
+                                        ((none) (do))))))
+                                (else (do))))
+                            ((none) (do)))
+                          (set! i (+ i 1)))
+                        ;; Generate hash-based name and register
+                        (let ((type-name (ctx-str ctx "_anon_record_" (simple-hash arena field-str))))
+                          (ctx-register-inline-record ctx type-name field-str)
+                          (set! result type-name))))
+
+                    ;; Default: treat as type name
+                    (else
+                      (let ((base-c-type (to-c-type arena first-expr)))
+                        (if (is-builtin-c-type base-c-type)
+                          (set! result base-c-type)
+                          ;; Check if registered (from import)
+                          (match (ctx-lookup-type ctx head)
+                            ((some entry) (set! result (. entry c-name)))
+                            ((none) (set! result (ctx-prefix-type ctx base-c-type))))))))))
+              ;; Not a symbol head
+              (_ (do))))
+          ((none) (do))))
+      result))
+
+  ;; ============================================================
+  ;; Gensym for Unique Variable Names
+  ;; ============================================================
+
+  (fn ctx-gensym ((ctx (Ptr TranspileContext)) (prefix String))
+    (@intent "Generate a unique variable name with the given prefix")
+    (@spec (((Ptr TranspileContext) String) -> String))
+    (@pre {ctx != nil})
+    (let ((arena (. (deref ctx) arena))
+          (counter (. (deref ctx) gensym-counter)))
+      ;; Increment counter
+      (set! (deref ctx) gensym-counter (+ counter 1))
+      ;; Generate name: prefix_N
+      (ctx-str3 ctx prefix "_" (int-to-string arena counter))))
+
+) ;; end module

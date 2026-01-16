@@ -1,0 +1,10 @@
+;; Test case: Main module using type alias
+
+(module alias-main
+  (import alias-a (MyResult parse-something))
+
+  (fn main ()
+    (@intent "Test type alias")
+    (@spec (() -> Int))
+    0)
+)

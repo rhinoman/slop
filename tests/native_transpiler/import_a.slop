@@ -1,0 +1,12 @@
+;; Test case: Base module defining types
+;; Used to test import resolution in native transpiler
+
+(module import-a
+  (export Foo Token)
+
+  ;; Simple record type
+  (type Foo (record (x Int)))
+
+  ;; Token type used for generic list testing
+  (type Token (record (kind Int) (value String)))
+)

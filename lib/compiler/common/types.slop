@@ -1,5 +1,7 @@
 (module types
   (export
+    ;; S-Expression AST types
+    SExpr SExprSymbol SExprString SExprNumber SExprList
     ;; Existing type definition structures
     TypeKind RangeBounds FieldDef VariantDef TypeDef
     ;; Resolved type information (for type checker)
@@ -19,8 +21,50 @@
     resolved-type-is-pointer resolved-type-is-union resolved-type-is-record
     ;; Accessors
     resolved-type-get-variant-index resolved-type-get-variant-payload
-    resolved-type-has-field)
-  (import parser (SExpr))
+    resolved-type-has-field
+    ;; Setters
+    resolved-type-set-inner)
+
+  ;; ============================================================
+  ;; S-Expression AST Types
+  ;;
+  ;; Core AST representation for parsed SLOP source.
+  ;; Used by parser, type checker, and transpiler.
+  ;; ============================================================
+
+  ;; AST node for symbols (identifiers, keywords, operators)
+  (type SExprSymbol (record
+    (name String)
+    (line (Int 0 ..))
+    (col (Int 0 ..))))
+
+  ;; AST node for string literals
+  (type SExprString (record
+    (value String)
+    (line (Int 0 ..))
+    (col (Int 0 ..))))
+
+  ;; AST node for numeric literals
+  (type SExprNumber (record
+    (int-value I64)
+    (float-value Float)
+    (is-float Bool)
+    (raw String)              ;; Original text representation
+    (line (Int 0 ..))
+    (col (Int 0 ..))))
+
+  ;; AST node for lists (parenthesized expressions)
+  (type SExprList (record
+    (items (List (Ptr SExpr)))
+    (line (Int 0 ..))
+    (col (Int 0 ..))))
+
+  ;; Main S-expression type - discriminated union of all node types
+  (type SExpr (union
+    (symbol SExprSymbol)
+    (string SExprString)
+    (number SExprNumber)
+    (list SExprList)))
 
   (type TypeKind (enum kind-primitive kind-range kind-record kind-enum kind-union kind-alias kind-option kind-result kind-list kind-map kind-ptr kind-array kind-function kind-ffi))
 
@@ -175,6 +219,19 @@
       (or (not (. bounds has-min)) (>= value (. bounds min-val)))
       (or (not (. bounds has-max)) (<= value (. bounds max-val)))))
 
+  ;; Internal helpers for range arithmetic
+  (fn min ((a I64) (b I64))
+    (@intent "Return the smaller of two integers")
+    (@spec ((I64 I64) -> I64))
+    (@pure)
+    (if (< a b) a b))
+
+  (fn max ((a I64) (b I64))
+    (@intent "Return the larger of two integers")
+    (@spec ((I64 I64) -> I64))
+    (@pure)
+    (if (> a b) a b))
+
   (fn range-intersect ((a RangeBounds) (b RangeBounds))
     (@intent "Compute intersection of two ranges")
     (@spec ((RangeBounds RangeBounds) -> RangeBounds))
@@ -247,6 +304,14 @@
         (none)   ;; range
         0 0))    ;; source location
       t))
+
+  (fn resolved-type-set-inner ((t (Ptr ResolvedType)) (inner (Ptr ResolvedType)))
+    (@intent "Set the inner type for container types (Option, List, Ptr)")
+    (@spec (((Ptr ResolvedType) (Ptr ResolvedType)) -> Unit))
+    (@pre (!= t nil))
+    ;; Using explicit typed local to help transpiler generate correct option type
+    (let ((inner-opt (Option (Ptr ResolvedType)) (if (!= inner nil) (some inner) (none))))
+      (set! (. (deref t) inner-type) inner-opt)))
 
   (fn param-info-new ((arena Arena) (name String) (param-type (Ptr ResolvedType)))
     (@intent "Create a function parameter info")

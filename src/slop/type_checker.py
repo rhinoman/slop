@@ -2255,6 +2255,9 @@ class TypeChecker:
         if isinstance(source, ListType) and isinstance(target, ListType):
             if isinstance(source.element_type, UnknownType) or isinstance(target.element_type, UnknownType):
                 return
+            # Fallback: compare element types by string representation (for forward references)
+            if str(source.element_type) == str(target.element_type):
+                return
 
         if isinstance(source, MapType) and isinstance(target, MapType):
             if (isinstance(source.key_type, UnknownType) or isinstance(target.key_type, UnknownType) or
@@ -2319,6 +2322,9 @@ class TypeChecker:
                 # Just verify error types are compatible
                 if source.err_type.equals(target.err_type) or source.err_type.is_subtype_of(target.err_type):
                     return
+            # Fallback: compare by string representation (for forward references)
+            if str(source.ok_type) == str(target.ok_type) and str(source.err_type) == str(target.err_type):
+                return
 
         self.error(f"{context}: expected {target}, got {source}", node)
 

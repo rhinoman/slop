@@ -12,9 +12,10 @@
 
 (module parser
   (export
-    ;; Types
-    TokenType Token
+    ;; Types (re-exported from types module)
     SExpr SExprSymbol SExprString SExprNumber SExprList
+    ;; Parser-specific types
+    TokenType Token
     ParseError ParseResult
     ;; Lexer
     tokenize
@@ -23,7 +24,14 @@
     ;; Utilities
     is-form find-holes pretty-print
     sexpr-line sexpr-col
-    sexpr-list-len sexpr-list-get sexpr-is-list sexpr-get-symbol-name)
+    sexpr-list-len sexpr-list-get sexpr-is-list sexpr-get-symbol-name
+    ;; Type predicates
+    sexpr-is-symbol sexpr-is-number sexpr-is-string
+    ;; Value accessors
+    sexpr-symbol-name sexpr-number-string sexpr-string-value)
+
+  ;; Import S-expression types from common types module
+  (import types (SExpr SExprSymbol SExprString SExprNumber SExprList))
 
   ;; Import string utilities from strlib
   (import strlib (is-alpha is-digit is-alnum is-space
@@ -98,44 +106,6 @@
     (value String)
     (line (Int 1 ..))
     (col (Int 1 ..))))
-
-  ;; ============================================================
-  ;; AST Types
-  ;; ============================================================
-
-  ;; AST node for symbols
-  (type SExprSymbol (record
-    (name String)
-    (line (Int 0 ..))
-    (col (Int 0 ..))))
-
-  ;; AST node for strings
-  (type SExprString (record
-    (value String)
-    (line (Int 0 ..))
-    (col (Int 0 ..))))
-
-  ;; AST node for numbers
-  (type SExprNumber (record
-    (int-value I64)
-    (float-value Float)
-    (is-float Bool)
-    (line (Int 0 ..))
-    (col (Int 0 ..))))
-
-  ;; Forward declare SExpr for recursive list type
-  ;; AST node for lists - contains pointers to SExpr
-  (type SExprList (record
-    (items (List (Ptr SExpr)))
-    (line (Int 0 ..))
-    (col (Int 0 ..))))
-
-  ;; Main AST type - discriminated union
-  (type SExpr (union
-    (symbol SExprSymbol)
-    (string SExprString)
-    (number SExprNumber)
-    (list SExprList)))
 
   ;; ============================================================
   ;; Error Types
@@ -537,6 +507,7 @@
                           0  ;; int-value (unused for float)
                           (strtod (cast (Ptr Char) (. (. tok value) data)) (cast (Ptr (Ptr Char)) 0))
                           true
+                          (. tok value)  ;; raw
                           (. tok line)
                           (. tok col))))
                 (set! (deref node)
@@ -545,6 +516,7 @@
                           (strtoll (cast (Ptr Char) (. (. tok value) data)) (cast (Ptr (Ptr Char)) 0) 10)
                           0.0
                           false
+                          (. tok value)  ;; raw
                           (. tok line)
                           (. tok col)))))
               (ok node))))
@@ -736,12 +708,14 @@
                         (SExprNumber 0
                                      (strtod (cast (Ptr Char) (. (. tok value) data)) (cast (Ptr (Ptr Char)) 0))
                                      true
+                                     (. tok value)
                                      (. tok line) (. tok col))))
                 (set! (deref node)
                       (union-new SExpr number
                         (SExprNumber (strtoll (cast (Ptr Char) (. (. tok value) data)) (cast (Ptr (Ptr Char)) 0) 10)
                                      0.0
                                      false
+                                     (. tok value)
                                      (. tok line) (. tok col)))))
               (ok node))))
 
@@ -982,6 +956,53 @@
     (@pure)
     (match (deref expr)
       ((symbol sym) (. sym name))
+      (_ "")))
+
+  ;; Alias for compatibility
+  (fn sexpr-symbol-name ((expr (Ptr SExpr)))
+    (@intent "Get name if expression is a symbol, else empty string")
+    (@spec (((Ptr SExpr)) -> String))
+    (@pure)
+    (sexpr-get-symbol-name expr))
+
+  (fn sexpr-is-symbol ((expr (Ptr SExpr)))
+    (@intent "Check if expression is a symbol")
+    (@spec (((Ptr SExpr)) -> Bool))
+    (@pure)
+    (match (deref expr)
+      ((symbol s) true)
+      (_ false)))
+
+  (fn sexpr-is-number ((expr (Ptr SExpr)))
+    (@intent "Check if expression is a number")
+    (@spec (((Ptr SExpr)) -> Bool))
+    (@pure)
+    (match (deref expr)
+      ((number n) true)
+      (_ false)))
+
+  (fn sexpr-is-string ((expr (Ptr SExpr)))
+    (@intent "Check if expression is a string")
+    (@spec (((Ptr SExpr)) -> Bool))
+    (@pure)
+    (match (deref expr)
+      ((string s) true)
+      (_ false)))
+
+  (fn sexpr-number-string ((expr (Ptr SExpr)))
+    (@intent "Get string representation of number, or empty string")
+    (@spec (((Ptr SExpr)) -> String))
+    (@pure)
+    (match (deref expr)
+      ((number n) (. n raw))
+      (_ "")))
+
+  (fn sexpr-string-value ((expr (Ptr SExpr)))
+    (@intent "Get string value, or empty string if not a string")
+    (@spec (((Ptr SExpr)) -> String))
+    (@pure)
+    (match (deref expr)
+      ((string s) (. s value))
       (_ "")))
 
   (fn find-holes ((arena Arena) (expr (Ptr SExpr)))

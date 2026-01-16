@@ -1,894 +1,2816 @@
 ;; ============================================================
-;; SLOP Transpiler - Expression Transpilation
+;; SLOP Native Transpiler - Expression Module
 ;;
-;; Convert SLOP expressions to C expression strings.
-;; Handles literals, symbols, operators, field access,
-;; function calls, and constructors.
+;; Transpiles SLOP expressions to C code.
 ;; ============================================================
 
 (module expr
   (export
+    ;; Main entry point
     transpile-expr
-    is-pointer-expr
+    ;; Helpers
+    transpile-literal transpile-symbol
+    transpile-call transpile-binop
+    ;; Operator helpers
+    is-binop is-unop is-comparison-op
+    ;; Type inference
     infer-expr-c-type)
 
-  (import parser (SExpr SExprList SExprSymbol SExprNumber SExprString
-                  is-form sexpr-line sexpr-col))
-  (import context (TranspileContext ctx-lookup-var ctx-lookup-enum
-                   ctx-lookup-function ctx-lookup-ffi-func
-                   ctx-is-pointer ctx-get-return-type
-                   ctx-lookup-fields ctx-get-type-env))
-  ;; Import type checker for type inference
-  (import env (TypeEnv env-lookup-var env-lookup-function))
-  (import types (ResolvedType FnSignature))
-  (import ctype (to-c-type is-pointer-type is-string-type
-                 is-option-type is-result-type))
-  (import names (to-c-name to-qualified-name))
-  (import emit (Emitter))
-  (import strlib (float-to-string))
+  (import types (SExpr SExprList SExprSymbol SExprString SExprNumber))
+  (import context (TranspileContext ctx-lookup-var ctx-lookup-func ctx-lookup-type ctx-lookup-enum-variant
+                   ctx-get-current-result-type ctx-get-current-return-type ctx-prefixing-enabled ctx-prefix-type ctx-get-module
+                   ctx-str ctx-str3 ctx-str4 ctx-str5 VarEntry FuncEntry TypeEntry
+                   to-c-type-prefixed ctx-push-scope ctx-pop-scope ctx-bind-var))
+  (import ctype (to-c-type to-c-name type-to-identifier))
+  (import strlib (replace starts-with substring char-at count-occurrences index-of contains))
 
   ;; ============================================================
-  ;; Main Expression Transpilation
+  ;; String Escaping for C
   ;; ============================================================
 
-  (fn transpile-expr ((ctx (Ptr TranspileContext)) (expr (Ptr SExpr))
-                      (expected-type (Option String)))
-    (@intent "Transpile SLOP expression to C expression string")
-    (@spec (((Ptr TranspileContext) (Ptr SExpr) (Option String)) -> String))
-    (@pre (!= ctx nil))
-    (@pre (!= expr nil))
-    (match (deref expr)
-      ;; Number literal
-      ((number n)
-        (if (. n is-float)
-          (float-to-string (. (deref ctx) arena) (. n float-value) 6)
-          (int-to-string (. (deref ctx) arena) (. n int-value))))
+  (fn escape-c-string ((ctx (Ptr TranspileContext)) (s String))
+    (@intent "Escape string for C string literal")
+    (@spec (((Ptr TranspileContext) String) -> String))
+    (@pre {ctx != nil})
+    (let ((arena (. (deref ctx) arena))
+          (len (cast Int (. s len)))
+          (data (. s data)))
+      ;; Calculate output size (worst case: every char needs escaping)
+      (let ((buf (arena-alloc arena (+ (* len 2) 1)))
+            (mut out-pos 0)
+            (mut in-pos 0))
+        (while (< in-pos len)
+          (let ((c (cast Int (@ data in-pos))))
+            (cond
+              ((== c 10)  ;; \n
+                (set! (@ buf out-pos) 92)       ;; backslash
+                (set! out-pos (+ out-pos 1))
+                (set! (@ buf out-pos) 110)      ;; n
+                (set! out-pos (+ out-pos 1)))
+              ((== c 13)  ;; \r
+                (set! (@ buf out-pos) 92)
+                (set! out-pos (+ out-pos 1))
+                (set! (@ buf out-pos) 114)      ;; r
+                (set! out-pos (+ out-pos 1)))
+              ((== c 9)   ;; \t
+                (set! (@ buf out-pos) 92)
+                (set! out-pos (+ out-pos 1))
+                (set! (@ buf out-pos) 116)      ;; t
+                (set! out-pos (+ out-pos 1)))
+              ((== c 92)  ;; backslash -> \\
+                (set! (@ buf out-pos) 92)
+                (set! out-pos (+ out-pos 1))
+                (set! (@ buf out-pos) 92)
+                (set! out-pos (+ out-pos 1)))
+              ((== c 34)  ;; quote -> \"
+                (set! (@ buf out-pos) 92)
+                (set! out-pos (+ out-pos 1))
+                (set! (@ buf out-pos) 34)
+                (set! out-pos (+ out-pos 1)))
+              (else
+                (set! (@ buf out-pos) (cast U8 c))
+                (set! out-pos (+ out-pos 1)))))
+          (set! in-pos (+ in-pos 1)))
+        (set! (@ buf out-pos) 0)  ;; null terminate
+        (String buf (cast U64 out-pos)))))
 
-      ;; String literal
-      ((string s)
-        (transpile-string-literal ctx (. s value)))
+  ;; ============================================================
+  ;; Operator Classification
+  ;; ============================================================
 
-      ;; Symbol (variable, enum, builtin)
-      ((symbol sym)
-        (transpile-symbol ctx (. sym name) expected-type))
+  (fn is-binop ((op String))
+    (@intent "Check if operator is a binary operator")
+    (@spec ((String) -> Bool))
+    (or (string-eq op "+")
+        (string-eq op "-")
+        (string-eq op "*")
+        (string-eq op "/")
+        (string-eq op "%")
+        (string-eq op "and")
+        (string-eq op "or")
+        (string-eq op "bit-and")
+        (string-eq op "bit-or")
+        (string-eq op "bit-xor")
+        (string-eq op "&")
+        (string-eq op "|")
+        (string-eq op "^")
+        (string-eq op "<<")
+        (string-eq op ">>")))
 
-      ;; List (operator, function call, special form)
-      ((list l)
-        (transpile-list-expr ctx l expected-type))))
+  (fn is-comparison-op ((op String))
+    (@intent "Check if operator is a comparison operator")
+    (@spec ((String) -> Bool))
+    (or (string-eq op "==")
+        (string-eq op "=")
+        (string-eq op "!=")
+        (string-eq op "<")
+        (string-eq op ">")
+        (string-eq op "<=")
+        (string-eq op ">=")))
+
+  (fn is-unop ((op String))
+    (@intent "Check if operator is a unary operator")
+    (@spec ((String) -> Bool))
+    (or (string-eq op "not")
+        (string-eq op "bit-not")
+        (string-eq op "-")))
 
   ;; ============================================================
   ;; Literal Transpilation
   ;; ============================================================
 
-  (fn transpile-string-literal ((ctx (Ptr TranspileContext)) (value String))
-    (@intent "Transpile string literal to SLOP_STR macro")
+  (fn transpile-literal ((ctx (Ptr TranspileContext)) (expr (Ptr SExpr)))
+    (@intent "Transpile a literal expression")
+    (@spec (((Ptr TranspileContext) (Ptr SExpr)) -> String))
+    (@pre {ctx != nil})
+    (@pre {expr != nil})
+    (match (deref expr)
+      ((number num)
+        (if (. num is-float)
+          (. num raw)  ;; Use raw string representation
+          (. num raw)))
+      ((string str)
+        ;; Wrap in SLOP_STR macro with escaped string
+        (ctx-str3 ctx "SLOP_STR(\"" (escape-c-string ctx (. str value)) "\")"))
+      ((symbol sym)
+        (transpile-symbol ctx (. sym name)))
+      ((list _)
+        "/* error: list is not a literal */")))
+
+  (fn transpile-symbol ((ctx (Ptr TranspileContext)) (name String))
+    (@intent "Transpile a symbol to C code")
     (@spec (((Ptr TranspileContext) String) -> String))
-    (@pre (!= ctx nil))
-    ;; Output: SLOP_STR("escaped content")
+    (@pre {ctx != nil})
     (let ((arena (. (deref ctx) arena)))
-      (string-concat arena
-        (string-concat arena "SLOP_STR(\"" value)
-        "\")")))
+      (cond
+        ;; Boolean literals
+        ((string-eq name "true") "1")
+        ((string-eq name "false") "0")
+        ;; Null pointer
+        ((string-eq name "nil") "NULL")
+        ;; None literal - use runtime macro
+        ((string-eq name "none") "none")
+        ;; Quoted symbols for enum values: 'read -> file_FileMode_read
+        ((starts-with name "'")
+          (let ((name-len (string-len name))
+                (variant-name (substring arena name 1 (cast (Int 0 ..) (- name-len 1)))))
+            (match (ctx-lookup-enum-variant ctx variant-name)
+              ((some enum-name)
+                ;; Return prefixed enum constant
+                (get-prefixed-enum-value ctx enum-name variant-name))
+              ((none)
+                ;; Fallback - just strip quote and convert
+                (to-c-name arena variant-name)))))
+        ;; Variable/constant lookup - check context first
+        (else
+          (match (ctx-lookup-var ctx name)
+            ;; Found in context - use registered c-name
+            ((some entry) (. entry c-name))
+            ;; Not found - check if it's an enum variant
+            ((none)
+              (match (ctx-lookup-enum-variant ctx name)
+                ((some enum-name)
+                  (get-prefixed-enum-value ctx enum-name name))
+                ((none)
+                  ;; Not found - convert to C name
+                  (to-c-name arena name)))))))))
+
+  (fn get-prefixed-enum-value ((ctx (Ptr TranspileContext)) (enum-name String) (variant-name String))
+    (@intent "Get fully qualified enum value - enum-name already has module prefix")
+    (@spec (((Ptr TranspileContext) String String) -> String))
+    (@pre {ctx != nil})
+    ;; enum-name already includes module prefix (e.g., "file_FileMode")
+    ;; Just append _variant to get the full constant name
+    (ctx-str3 ctx enum-name "_" variant-name))
 
   ;; ============================================================
-  ;; Symbol Transpilation
+  ;; Binary Operation Transpilation
   ;; ============================================================
 
-  (fn transpile-symbol ((ctx (Ptr TranspileContext)) (name String)
-                        (expected-type (Option String)))
-    (@intent "Transpile symbol to C expression")
-    (@spec (((Ptr TranspileContext) String (Option String)) -> String))
-    (@pre (!= ctx nil))
+  (fn binop-to-c ((op String))
+    (@intent "Convert SLOP binary operator to C operator")
+    (@spec ((String) -> String))
     (cond
-      ;; Boolean literals
-      ((string-eq name "true") "true")
-      ((string-eq name "false") "false")
-      ;; Null
-      ((string-eq name "nil") "NULL")
-      ;; None constructor (needs expected type for proper typing)
-      ((string-eq name "none")
-        (transpile-none ctx expected-type))
-      ;; Check if it's an enum value
-      (else
-        (match (ctx-lookup-enum ctx name)
-          ((some qualified) qualified)
-          ((none) (to-c-name (. (deref ctx) arena) name))))))
+      ((string-eq op "+") "+")
+      ((string-eq op "-") "-")
+      ((string-eq op "*") "*")
+      ((string-eq op "/") "/")
+      ((string-eq op "%") "%")
+      ((string-eq op "==") "==")
+      ((string-eq op "=") "==")
+      ((string-eq op "!=") "!=")
+      ((string-eq op "<") "<")
+      ((string-eq op ">") ">")
+      ((string-eq op "<=") "<=")
+      ((string-eq op ">=") ">=")
+      ((string-eq op "and") "&&")
+      ((string-eq op "or") "||")
+      ((string-eq op "bit-and") "&")
+      ((string-eq op "bit-or") "|")
+      ((string-eq op "bit-xor") "^")
+      ((string-eq op "&") "&")
+      ((string-eq op "|") "|")
+      ((string-eq op "^") "^")
+      ((string-eq op "<<") "<<")
+      ((string-eq op ">>") ">>")
+      (else op)))
+
+  (fn transpile-binop ((ctx (Ptr TranspileContext)) (op String) (left String) (right String))
+    (@intent "Transpile a binary operation")
+    (@spec (((Ptr TranspileContext) String String String) -> String))
+    (@pre {ctx != nil})
+    (let ((c-op (binop-to-c op)))
+      (ctx-str5 ctx "(" left " " c-op (ctx-str3 ctx " " right ")"))))
+
+  (fn transpile-variadic-binop ((ctx (Ptr TranspileContext)) (op String) (items (List (Ptr SExpr))) (start-idx Int))
+    (@intent "Transpile a variadic binary operation (and/or) by chaining all arguments")
+    (@spec (((Ptr TranspileContext) String (List (Ptr SExpr)) Int) -> String))
+    (@pre {ctx != nil})
+    (let ((c-op (binop-to-c op))
+          (len (cast Int (list-len items))))
+      (if (<= len (+ start-idx 1))
+        "/* not enough operands */"
+        (let ((mut result "("))
+          ;; Process first operand
+          (match (list-get items start-idx)
+            ((some first-arg)
+              (set! result (ctx-str4 ctx result "(" (transpile-expr ctx first-arg) ")")))
+            ((none) (set! result result)))
+          ;; Process remaining operands
+          (let ((mut i (+ start-idx 1)))
+            (while (< i len)
+              (match (list-get items i)
+                ((some arg)
+                  (let ((arg-str (ctx-str3 ctx " (" (transpile-expr ctx arg) ")")))
+                    (set! result (ctx-str4 ctx result " " c-op arg-str))))
+                ((none) (set! result result)))
+              (set! i (+ i 1))))
+          (ctx-str ctx result ")")))))
 
   ;; ============================================================
-  ;; List Expression Transpilation
+  ;; Built-in Type Detection
   ;; ============================================================
 
-  (fn transpile-list-expr ((ctx (Ptr TranspileContext))
-                           (lst SExprList)
-                           (expected-type (Option String)))
-    (@intent "Transpile list expression (operator, call, or special form)")
-    (@spec (((Ptr TranspileContext) SExprList (Option String)) -> String))
-    (@pre (!= ctx nil))
-    (@pre (> (list-len (. lst items)) 0))
-    ;; Get the operator/function name
-    (match (list-get (. lst items) 0)
-      ((none) "/* empty list */")
-      ((some head)
-        (match (deref head)
-          ((symbol sym)
-            (let ((op (. sym name)))
-              (cond
-                ;; Arithmetic operators
-                ((string-eq op "+") (transpile-binary ctx lst "+"))
-                ((string-eq op "-") (transpile-minus ctx lst))
-                ((string-eq op "*") (transpile-binary ctx lst "*"))
-                ((string-eq op "/") (transpile-binary ctx lst "/"))
-                ((string-eq op "%") (transpile-binary ctx lst "%"))
+  (fn get-builtin-type-c-name ((type-name String))
+    (@intent "Get C type name for built-in types, empty string if not a built-in")
+    (@spec ((String) -> String))
+    ;; Map SLOP built-in type names to their C equivalents
+    ;; Returns empty string if not a built-in type
+    (cond
+      ((string-eq type-name "Bytes") "slop_bytes")
+      ((string-eq type-name "String") "slop_string")
+      (else "")))
 
-                ;; Comparison operators
-                ((string-eq op "==") (transpile-comparison ctx lst "=="))
-                ((string-eq op "!=") (transpile-comparison ctx lst "!="))
-                ((string-eq op "<") (transpile-comparison ctx lst "<"))
-                ((string-eq op "<=") (transpile-comparison ctx lst "<="))
-                ((string-eq op ">") (transpile-comparison ctx lst ">"))
-                ((string-eq op ">=") (transpile-comparison ctx lst ">="))
+  (fn is-pointer-type-expr ((type-expr (Ptr SExpr)))
+    (@intent "Check if type expression is a pointer type like (Ptr X)")
+    (@spec (((Ptr SExpr)) -> Bool))
+    (@pre {type-expr != nil})
+    (match (deref type-expr)
+      ((list lst)
+        (let ((items (. lst items)))
+          (if (< (list-len items) 1)
+            false
+            (match (list-get items 0)
+              ((some head)
+                (match (deref head)
+                  ((symbol sym)
+                    (or (string-eq (. sym name) "Ptr")
+                        (string-eq (. sym name) "ScopedPtr")))
+                  (_ false)))
+              ((none) false)))))
+      (_ false)))
 
-                ;; Logical operators
-                ((string-eq op "and") (transpile-binary ctx lst "&&"))
-                ((string-eq op "or") (transpile-binary ctx lst "||"))
-                ((string-eq op "not") (transpile-unary ctx lst "!"))
+  (fn is-string-literal ((expr (Ptr SExpr)))
+    (@intent "Check if expression is a string literal")
+    (@spec (((Ptr SExpr)) -> Bool))
+    (@pre {expr != nil})
+    (match (deref expr)
+      ((string _) true)
+      (_ false)))
 
-                ;; Field access
-                ((string-eq op ".") (transpile-field-access ctx lst))
-
-                ;; Index access
-                ((string-eq op "@") (transpile-index-access ctx lst))
-
-                ;; Pointer operations
-                ((string-eq op "addr") (transpile-addr ctx lst))
-                ((string-eq op "deref") (transpile-deref ctx lst))
-
-                ;; Type cast
-                ((string-eq op "cast") (transpile-cast ctx lst))
-
-                ;; Option/Result constructors
-                ((string-eq op "some") (transpile-some ctx lst expected-type))
-                ((string-eq op "ok") (transpile-ok ctx lst expected-type))
-                ((string-eq op "error") (transpile-error ctx lst expected-type))
-
-                ;; List operations
-                ((string-eq op "list-new") (transpile-list-new ctx lst))
-                ((string-eq op "list-push") (transpile-list-push ctx lst))
-                ((string-eq op "list-pop") (transpile-list-pop ctx lst))
-                ((string-eq op "list-get") (transpile-list-get ctx lst))
-                ((string-eq op "list-len") (transpile-list-len ctx lst))
-
-                ;; Map operations
-                ((string-eq op "map-get") (transpile-map-get ctx lst))
-                ((string-eq op "map-has") (transpile-map-has ctx lst))
-                ((string-eq op "map-keys") (transpile-map-keys ctx lst))
-                ((string-eq op "map-remove") (transpile-map-remove ctx lst))
-
-                ;; Record construction
-                ((string-eq op "record-new") (transpile-record-new ctx lst))
-
-                ;; Union construction
-                ((string-eq op "union-new") (transpile-union-new ctx lst))
-
-                ;; Quote (enum literal)
-                ((string-eq op "quote") (transpile-quote ctx lst))
-
-                ;; C inline
-                ((string-eq op "c-inline") (transpile-c-inline ctx lst))
-
-                ;; Sizeof
-                ((string-eq op "sizeof") (transpile-sizeof ctx lst))
-
-                ;; Arena allocation
-                ((string-eq op "arena-alloc") (transpile-arena-alloc ctx lst))
-
-                ;; Default: function call
-                (else (transpile-function-call ctx op lst)))))
-          ;; Head is not a symbol - treat as computed function call
-          (_ "/* computed function expressions not supported */")))))
-
-  ;; ============================================================
-  ;; Arithmetic and Comparison
-  ;; ============================================================
-
-  (fn transpile-binary ((ctx (Ptr TranspileContext))
-                        (lst SExprList) (c-op String))
-    (@intent "Transpile binary operator expression")
-    (@spec (((Ptr TranspileContext) SExprList String) -> String))
-    (@pre (!= ctx nil))
-    (@pre (>= (list-len (. lst items)) 3))
-    (match (list-get (. lst items) 1)
-      ((some left)
-        (match (list-get (. lst items) 2)
-          ((some right)
-            (let ((left-str (transpile-expr ctx left (none)))
-                  (right-str (transpile-expr ctx right (none)))
-                  (arena (. (deref ctx) arena)))
-              (string-concat arena
-                (string-concat arena "(" left-str)
-                (string-concat arena (string-concat arena " " c-op)
-                  (string-concat arena (string-concat arena " " right-str) ")")))))
-          ((none) "")))
-      ((none) "")))
-
-  (fn transpile-minus ((ctx (Ptr TranspileContext)) (lst SExprList))
-    (@intent "Transpile minus (unary negation or binary subtraction)")
-    (@spec (((Ptr TranspileContext) SExprList) -> String))
-    (@pre (!= ctx nil))
-    (if (== (list-len (. lst items)) 2)
-      (transpile-unary ctx lst "-")
-      (transpile-binary ctx lst "-")))
-
-  (fn transpile-unary ((ctx (Ptr TranspileContext))
-                       (lst SExprList) (c-op String))
-    (@intent "Transpile unary operator expression")
-    (@spec (((Ptr TranspileContext) SExprList String) -> String))
-    (@pre (!= ctx nil))
-    (@pre (>= (list-len (. lst items)) 2))
-    (match (list-get (. lst items) 1)
-      ((none) "/* missing operand */")
-      ((some operand)
-        (let ((operand-str (transpile-expr ctx operand (none)))
-              (arena (. (deref ctx) arena)))
-          (string-concat arena
-            (string-concat arena c-op "(")
-            (string-concat arena operand-str ")"))))))
-
-  (fn transpile-comparison ((ctx (Ptr TranspileContext))
-                            (lst SExprList) (c-op String))
-    (@intent "Transpile comparison, handling string-eq specially")
-    (@spec (((Ptr TranspileContext) SExprList String) -> String))
-    (@pre (!= ctx nil))
-    (@pre (>= (list-len (. lst items)) 3))
-    ;; For string comparison, use slop_string_eq (TODO: add string check)
-    (match (list-get (. lst items) 1)
-      ((some left)
-        (match (list-get (. lst items) 2)
-          ((some right)
-            (let ((left-str (transpile-expr ctx left (none)))
-                  (right-str (transpile-expr ctx right (none)))
-                  (arena (. (deref ctx) arena)))
-              (string-concat arena
-                (string-concat arena "(" left-str)
-                (string-concat arena (string-concat arena " " c-op)
-                  (string-concat arena (string-concat arena " " right-str) ")")))))
-          ((none) "")))
-      ((none) "")))
-
-  ;; ============================================================
-  ;; Field and Index Access
-  ;; ============================================================
-
-  (fn transpile-field-access ((ctx (Ptr TranspileContext)) (lst SExprList))
-    (@intent "Transpile field access (. base field) or (. base field1 field2 ...)")
-    (@spec (((Ptr TranspileContext) SExprList) -> String))
-    (@pre (!= ctx nil))
-    (@pre (>= (list-len (. lst items)) 3))
-    ;; Use -> for pointers, . for values
-    (match (list-get (. lst items) 1)
-      ((some base-expr)
-        (match (list-get (. lst items) 2)
-          ((some field-expr)
-            (let ((base-str (transpile-expr ctx base-expr (none)))
-                  (is-ptr (is-pointer-expr ctx base-expr))
-                  (arena (. (deref ctx) arena)))
-              (match (deref field-expr)
-                ((symbol s)
-                  (let ((field-name (to-c-name arena (. s name)))
-                        (op (if is-ptr "->" ".")))
-                    (string-concat arena base-str (string-concat arena op field-name))))
-                (_ ""))))
-          ((none) "")))
-      ((none) "")))
-
-  (fn transpile-index-access ((ctx (Ptr TranspileContext)) (lst SExprList))
-    (@intent "Transpile index access (@ array index)")
-    (@spec (((Ptr TranspileContext) SExprList) -> String))
-    (@pre (!= ctx nil))
-    (@pre (>= (list-len (. lst items)) 3))
-    (match (list-get (. lst items) 1)
-      ((some arr-expr)
-        (match (list-get (. lst items) 2)
-          ((some idx-expr)
-            (let ((arr-str (transpile-expr ctx arr-expr (none)))
-                  (idx-str (transpile-expr ctx idx-expr (none)))
-                  (arena (. (deref ctx) arena)))
-              (string-concat arena arr-str (string-concat arena "[" (string-concat arena idx-str "]")))))
-          ((none) "")))
-      ((none) "")))
-
-  ;; ============================================================
-  ;; Pointer Operations
-  ;; ============================================================
-
-  (fn transpile-addr ((ctx (Ptr TranspileContext)) (lst SExprList))
-    (@intent "Transpile address-of (addr var)")
-    (@spec (((Ptr TranspileContext) SExprList) -> String))
-    (@pre (!= ctx nil))
-    (@pre (>= (list-len (. lst items)) 2))
-    (match (list-get (. lst items) 1)
-      ((some operand)
-        (let ((operand-str (transpile-expr ctx operand (none)))
-              (arena (. (deref ctx) arena)))
-          (string-concat arena "&(" (string-concat arena operand-str ")"))))
-      ((none) "")))
-
-  (fn transpile-deref ((ctx (Ptr TranspileContext)) (lst SExprList))
-    (@intent "Transpile pointer dereference (deref ptr)")
-    (@spec (((Ptr TranspileContext) SExprList) -> String))
-    (@pre (!= ctx nil))
-    (@pre (>= (list-len (. lst items)) 2))
-    (match (list-get (. lst items) 1)
-      ((some ptr-expr)
-        (let ((ptr-str (transpile-expr ctx ptr-expr (none)))
-              (arena (. (deref ctx) arena)))
-          (string-concat arena "*(" (string-concat arena ptr-str ")"))))
-      ((none) "")))
-
-  (fn transpile-cast ((ctx (Ptr TranspileContext)) (lst SExprList))
-    (@intent "Transpile type cast (cast Type expr)")
-    (@spec (((Ptr TranspileContext) SExprList) -> String))
-    (@pre (!= ctx nil))
-    (@pre (>= (list-len (. lst items)) 3))
-    ;; Handle range type constructors vs simple casts (TODO: add range check)
-    (match (list-get (. lst items) 1)
-      ((some type-expr)
-        (match (list-get (. lst items) 2)
-          ((some val-expr)
-            (let ((c-type (to-c-type ctx type-expr))
-                  (val-str (transpile-expr ctx val-expr (none)))
-                  (arena (. (deref ctx) arena)))
-              (string-concat arena "(("
-                (string-concat arena c-type
-                  (string-concat arena ")("
-                    (string-concat arena val-str "))"))))))
-          ((none) "")))
-      ((none) "")))
-
-  ;; ============================================================
-  ;; Option/Result Constructors
-  ;; ============================================================
-
-  (fn transpile-none ((ctx (Ptr TranspileContext))
-                      (expected-type (Option String)))
-    (@intent "Transpile none constructor")
-    (@spec (((Ptr TranspileContext) (Option String)) -> String))
-    (@pre (!= ctx nil))
-    ;; Output: ((type){ .has_value = false })
-    (let ((arena (. (deref ctx) arena)))
-      (match expected-type
-        ((some typ)
-          (string-concat arena "((" (string-concat arena typ "){ .has_value = false })")))
-        ((none)
-          (match (ctx-get-return-type ctx)
-            ((some typ)
-              (string-concat arena "((" (string-concat arena typ "){ .has_value = false })")))
-            ((none) "((void){ .has_value = false })"))))))
-
-  (fn transpile-some ((ctx (Ptr TranspileContext)) (lst SExprList)
-                      (expected-type (Option String)))
-    (@intent "Transpile some constructor (some value)")
-    (@spec (((Ptr TranspileContext) SExprList (Option String)) -> String))
-    (@pre (!= ctx nil))
-    (@pre (>= (list-len (. lst items)) 2))
-    ;; Output: ((type){ .has_value = true, .value = expr })
-    (match (list-get (. lst items) 1)
-      ((some val-expr)
-        (let ((val-str (transpile-expr ctx val-expr (none)))
-              (arena (. (deref ctx) arena))
-              (typ (match expected-type
-                     ((some t) t)
-                     ((none) (match (ctx-get-return-type ctx)
-                               ((some rt) rt)
-                               ((none) "slop_option"))))))
-          (string-concat arena
-            (string-concat arena "((" typ)
-            (string-concat arena "){ .has_value = true, .value = "
-              (string-concat arena val-str " })")))))
-      ((none) "")))
-
-  (fn transpile-ok ((ctx (Ptr TranspileContext)) (lst SExprList)
-                    (expected-type (Option String)))
-    (@intent "Transpile ok constructor (ok value)")
-    (@spec (((Ptr TranspileContext) SExprList (Option String)) -> String))
-    (@pre (!= ctx nil))
-    (@pre (>= (list-len (. lst items)) 2))
-    ;; Output: ((type){ .is_ok = true, .data.ok = expr })
-    (match (list-get (. lst items) 1)
-      ((some val-expr)
-        (let ((val-str (transpile-expr ctx val-expr (none)))
-              (arena (. (deref ctx) arena))
-              (typ (match expected-type
-                     ((some t) t)
-                     ((none) (match (ctx-get-return-type ctx)
-                               ((some rt) rt)
-                               ((none) "slop_result"))))))
-          (string-concat arena
-            (string-concat arena "((" typ)
-            (string-concat arena "){ .is_ok = true, .data.ok = "
-              (string-concat arena val-str " })")))))
-      ((none) "")))
-
-  (fn transpile-error ((ctx (Ptr TranspileContext)) (lst SExprList)
-                       (expected-type (Option String)))
-    (@intent "Transpile error constructor (error value)")
-    (@spec (((Ptr TranspileContext) SExprList (Option String)) -> String))
-    (@pre (!= ctx nil))
-    (@pre (>= (list-len (. lst items)) 2))
-    ;; Output: ((type){ .is_ok = false, .data.err = expr })
-    (match (list-get (. lst items) 1)
-      ((some err-expr)
-        (let ((err-str (transpile-expr ctx err-expr (none)))
-              (arena (. (deref ctx) arena))
-              (typ (match expected-type
-                     ((some t) t)
-                     ((none) (match (ctx-get-return-type ctx)
-                               ((some rt) rt)
-                               ((none) "slop_result"))))))
-          (string-concat arena
-            (string-concat arena "((" typ)
-            (string-concat arena "){ .is_ok = false, .data.err = "
-              (string-concat arena err-str " })")))))
-      ((none) "")))
-
-  ;; ============================================================
-  ;; Collection Operations
-  ;; ============================================================
-
-  (fn transpile-list-new ((ctx (Ptr TranspileContext)) (lst SExprList))
-    (@intent "Transpile list-new (list-new arena Type)")
-    (@spec (((Ptr TranspileContext) SExprList) -> String))
-    (@pre (!= ctx nil))
-    (match (list-get (. lst items) 1)
-      ((some arena-expr)
-        (let ((arena-str (transpile-expr ctx arena-expr (none)))
-              (arena (. (deref ctx) arena)))
-          (string-concat arena "slop_list_new(" (string-concat arena arena-str ")"))))
-      ((none) "")))
-
-  (fn transpile-list-push ((ctx (Ptr TranspileContext)) (lst SExprList))
-    (@intent "Transpile list-push (list-push list item)")
-    (@spec (((Ptr TranspileContext) SExprList) -> String))
-    (@pre (!= ctx nil))
-    (match (list-get (. lst items) 1)
-      ((some list-expr)
-        (match (list-get (. lst items) 2)
-          ((some val-expr)
-            (let ((list-str (transpile-expr ctx list-expr (none)))
-                  (val-str (transpile-expr ctx val-expr (none)))
-                  (arena (. (deref ctx) arena)))
-              (string-concat arena "slop_list_push(arena, &"
-                (string-concat arena list-str
-                  (string-concat arena ", "
-                    (string-concat arena val-str ")"))))))
-          ((none) "")))
-      ((none) "")))
-
-  (fn transpile-list-pop ((ctx (Ptr TranspileContext)) (lst SExprList))
-    (@intent "Transpile list-pop (list-pop list) -> Option<T>")
-    (@spec (((Ptr TranspileContext) SExprList) -> String))
-    (@pre (!= ctx nil))
-    (match (list-get (. lst items) 1)
-      ((some list-expr)
-        (let ((list-str (transpile-expr ctx list-expr (none)))
-              (arena (. (deref ctx) arena)))
-          (string-concat arena
-            (string-concat arena "slop_list_pop(&" list-str)
-            ")")))
-      ((none) "")))
-
-  (fn transpile-list-get ((ctx (Ptr TranspileContext)) (lst SExprList))
-    (@intent "Transpile list-get (list-get list index)")
-    (@spec (((Ptr TranspileContext) SExprList) -> String))
-    (@pre (!= ctx nil))
-    (match (list-get (. lst items) 1)
-      ((some list-expr)
-        (match (list-get (. lst items) 2)
-          ((some idx-expr)
-            (let ((list-str (transpile-expr ctx list-expr (none)))
-                  (idx-str (transpile-expr ctx idx-expr (none)))
-                  (arena (. (deref ctx) arena)))
-              (string-concat arena "slop_list_get(" (string-concat arena list-str (string-concat arena ", " (string-concat arena idx-str ")"))))))
-          ((none) "")))
-      ((none) "")))
-
-  (fn transpile-list-len ((ctx (Ptr TranspileContext)) (lst SExprList))
-    (@intent "Transpile list-len (list-len list)")
-    (@spec (((Ptr TranspileContext) SExprList) -> String))
-    (@pre (!= ctx nil))
-    (match (list-get (. lst items) 1)
-      ((none) "0")
-      ((some expr)
-        (let ((list-expr (transpile-expr ctx expr (none))))
-          (string-concat (. (deref ctx) arena) list-expr ".len")))))
-
-  (fn transpile-map-get ((ctx (Ptr TranspileContext)) (lst SExprList))
-    (@intent "Transpile map-get (map-get map key)")
-    (@spec (((Ptr TranspileContext) SExprList) -> String))
-    (@pre (!= ctx nil))
-    (match (list-get (. lst items) 1)
-      ((some map-expr)
-        (match (list-get (. lst items) 2)
-          ((some key-expr)
-            (let ((map-str (transpile-expr ctx map-expr (none)))
-                  (key-str (transpile-expr ctx key-expr (none)))
-                  (arena (. (deref ctx) arena)))
-              (string-concat arena "slop_map_get("
-                (string-concat arena map-str
-                  (string-concat arena ", " (string-concat arena key-str ")"))))))
-          ((none) "")))
-      ((none) "")))
-
-  (fn transpile-map-has ((ctx (Ptr TranspileContext)) (lst SExprList))
-    (@intent "Transpile map-has (map-has map key)")
-    (@spec (((Ptr TranspileContext) SExprList) -> String))
-    (@pre (!= ctx nil))
-    (match (list-get (. lst items) 1)
-      ((some map-expr)
-        (match (list-get (. lst items) 2)
-          ((some key-expr)
-            (let ((map-str (transpile-expr ctx map-expr (none)))
-                  (key-str (transpile-expr ctx key-expr (none)))
-                  (arena (. (deref ctx) arena)))
-              (string-concat arena "slop_map_has("
-                (string-concat arena map-str
-                  (string-concat arena ", " (string-concat arena key-str ")"))))))
-          ((none) "")))
-      ((none) "")))
-
-  (fn transpile-map-keys ((ctx (Ptr TranspileContext)) (lst SExprList))
-    (@intent "Transpile map-keys (map-keys map)")
-    (@spec (((Ptr TranspileContext) SExprList) -> String))
-    (@pre (!= ctx nil))
-    (match (list-get (. lst items) 1)
-      ((some map-expr)
-        (let ((map-str (transpile-expr ctx map-expr (none)))
-              (arena (. (deref ctx) arena)))
-          (string-concat arena "slop_map_keys(arena, &"
-            (string-concat arena map-str ")"))))
-      ((none) "")))
-
-  (fn transpile-map-remove ((ctx (Ptr TranspileContext)) (lst SExprList))
-    (@intent "Transpile map-remove (map-remove map key)")
-    (@spec (((Ptr TranspileContext) SExprList) -> String))
-    (@pre (!= ctx nil))
-    (match (list-get (. lst items) 1)
-      ((some map-expr)
-        (match (list-get (. lst items) 2)
-          ((some key-expr)
-            (let ((map-str (transpile-expr ctx map-expr (none)))
-                  (key-str (transpile-expr ctx key-expr (none)))
-                  (arena (. (deref ctx) arena)))
-              (string-concat arena "slop_map_remove(&"
-                (string-concat arena map-str
-                  (string-concat arena ", " (string-concat arena key-str ")"))))))
-          ((none) "")))
-      ((none) "")))
-
-  ;; ============================================================
-  ;; Record and Union Construction
-  ;; ============================================================
-
-  (fn transpile-record-new ((ctx (Ptr TranspileContext)) (lst SExprList))
-    (@intent "Transpile record constructor (record-new Type (field val) ...)")
-    (@spec (((Ptr TranspileContext) SExprList) -> String))
-    (@pre (!= ctx nil))
-    ;; Syntax: (record-new Type (field1 val1) (field2 val2) ...)
-    ;; Output: ((TypeName){ .field1 = val1, .field2 = val2 })
-    (let ((items (. lst items))
-          (arena (. (deref ctx) arena))
-          (len (list-len items)))
-      (match (list-get items 1)
-        ((some type-expr)
-          (match (deref type-expr)
-            ((symbol s)
-              (let ((type-name (to-c-name arena (. s name)))
-                    (mut fields-str ""))
-                (do
-                  ;; Iterate over field pairs starting at index 2
-                  (for (i 2 len)
-                    (match (list-get items i)
-                      ((some field-pair)
-                        (match (deref field-pair)
-                          ((list pair-lst)
-                            (match (list-get (. pair-lst items) 0)
-                              ((some fname-expr)
-                                (match (deref fname-expr)
-                                  ((symbol fname-sym)
-                                    (match (list-get (. pair-lst items) 1)
-                                      ((some fval-expr)
-                                        (let ((fname (to-c-name arena (. fname-sym name)))
-                                              (fval (transpile-expr ctx fval-expr (none)))
-                                              (init (string-concat arena "."
-                                                      (string-concat arena fname
-                                                        (string-concat arena " = " fval)))))
-                                          (if (== i 2)
-                                            (set! fields-str init)
-                                            (set! fields-str (string-concat arena fields-str
-                                                               (string-concat arena ", " init))))))
-                                      ((none) (do))))
-                                  (_ (do))))
-                              ((none) (do))))
-                          (_ (do))))
-                      ((none) (do))))
-                  ;; Build final output: ((TypeName){ fields })
-                  (string-concat arena "(("
-                    (string-concat arena type-name
-                      (string-concat arena "){"
-                        (string-concat arena fields-str "})")))))))
-            (_ "/* invalid record-new */")))
-        ((none) ""))))
-
-  (fn transpile-union-new ((ctx (Ptr TranspileContext)) (lst SExprList))
-    (@intent "Transpile union constructor (union-new Type tag value?)")
-    (@spec (((Ptr TranspileContext) SExprList) -> String))
-    (@pre (!= ctx nil))
-    ;; Syntax: (union-new Type Tag value?)
-    ;; Output with value: ((TypeName){ .tag = TypeName_tag_TAG, .data.tag = value })
-    ;; Output without value: ((TypeName){ .tag = TypeName_tag_TAG })
-    (let ((items (. lst items))
-          (arena (. (deref ctx) arena))
-          (len (list-len items)))
-      (match (list-get items 1)
-        ((some type-expr)
-          (match (deref type-expr)
-            ((symbol type-sym)
-              (let ((type-name (to-c-name arena (. type-sym name))))
-                (match (list-get items 2)
-                  ((some tag-expr)
-                    (match (deref tag-expr)
-                      ((symbol tag-sym)
-                        (let ((tag (to-c-name arena (. tag-sym name)))
-                              ;; Build tag constant: TypeName_tag_TAG
-                              (tag-const (string-concat arena type-name
-                                           (string-concat arena "_"
-                                             (string-concat arena tag "_TAG")))))
-                          (if (> len 3)
-                            ;; Has payload value
-                            (match (list-get items 3)
-                              ((some val-expr)
-                                (let ((val (transpile-expr ctx val-expr (none))))
-                                  ;; ((TypeName){ .tag = TAG, .data.tag = val })
-                                  (string-concat arena "(("
-                                    (string-concat arena type-name
-                                      (string-concat arena "){ .tag = "
-                                        (string-concat arena tag-const
-                                          (string-concat arena ", .data."
-                                            (string-concat arena tag
-                                              (string-concat arena " = "
-                                                (string-concat arena val " })"))))))))))
-                              ((none) "/* missing union value */"))
-                            ;; No payload
-                            (string-concat arena "(("
-                              (string-concat arena type-name
-                                (string-concat arena "){ .tag = "
-                                  (string-concat arena tag-const " })")))))))
-                      (_ "/* invalid union tag */")))
-                  ((none) "/* missing union tag */"))))
-            (_ "/* invalid union-new */")))
-        ((none) ""))))
-
-  ;; ============================================================
-  ;; Quote (Enum Literals)
-  ;; ============================================================
-
-  (fn transpile-quote ((ctx (Ptr TranspileContext)) (lst SExprList))
-    (@intent "Transpile quoted symbol as enum value (quote sym) or 'sym")
-    (@spec (((Ptr TranspileContext) SExprList) -> String))
-    (@pre (!= ctx nil))
-    (@pre (>= (list-len (. lst items)) 2))
-    (match (list-get (. lst items) 1)
-      ((some sym-expr)
-        (match (deref sym-expr)
-          ((symbol s)
-            (let ((name (. s name))
-                  (arena (. (deref ctx) arena)))
-              (match (ctx-lookup-enum ctx name)
-                ((some qualified) qualified)
-                ((none) (to-c-name arena name)))))
-          (_ "/* quote requires symbol */")))
-      ((none) "")))
-
-  ;; ============================================================
-  ;; C Inline and Sizeof
-  ;; ============================================================
-
-  (fn transpile-c-inline ((ctx (Ptr TranspileContext)) (lst SExprList))
-    (@intent "Transpile c-inline (c-inline \"C code\")")
-    (@spec (((Ptr TranspileContext) SExprList) -> String))
-    (@pre (!= ctx nil))
-    (@pre (>= (list-len (. lst items)) 2))
-    (match (list-get (. lst items) 1)
-      ((some s-expr)
-        (match (deref s-expr)
-          ((string s) (. s value))
-          (_ "/* invalid c-inline */")))
-      ((none) "/* missing c-inline arg */")))
-
-  (fn transpile-sizeof ((ctx (Ptr TranspileContext)) (lst SExprList))
-    (@intent "Transpile sizeof (sizeof Type)")
-    (@spec (((Ptr TranspileContext) SExprList) -> String))
-    (@pre (!= ctx nil))
-    (@pre (>= (list-len (. lst items)) 2))
-    (match (list-get (. lst items) 1)
-      ((some type-expr)
-        (let ((arena (. (deref ctx) arena)))
-          (string-concat arena
-            (string-concat arena "sizeof(" (to-c-type ctx type-expr))
-            ")")))
-      ((none) "")))
-
-  (fn transpile-arena-alloc ((ctx (Ptr TranspileContext)) (lst SExprList))
-    (@intent "Transpile arena-alloc (arena-alloc arena size)")
-    (@spec (((Ptr TranspileContext) SExprList) -> String))
-    (@pre (!= ctx nil))
-    (@pre (>= (list-len (. lst items)) 3))
-    (match (list-get (. lst items) 1)
-      ((some arena-arg)
-        (match (list-get (. lst items) 2)
-          ((some size-arg)
-            (let ((arena-str (transpile-expr ctx arena-arg (none)))
-                  (size-str (transpile-expr ctx size-arg (none)))
-                  (arena (. (deref ctx) arena)))
-              (string-concat arena "slop_arena_alloc("
-                (string-concat arena arena-str
-                  (string-concat arena ", "
-                    (string-concat arena size-str ")"))))))
-          ((none) "")))
-      ((none) "")))
-
-  ;; ============================================================
-  ;; Function Calls
-  ;; ============================================================
-
-  (fn transpile-function-call ((ctx (Ptr TranspileContext))
-                               (fn-name String) (lst SExprList))
-    (@intent "Transpile function call")
-    (@spec (((Ptr TranspileContext) String SExprList) -> String))
-    (@pre (!= ctx nil))
+  (fn transpile-builtin-constructor ((ctx (Ptr TranspileContext)) (type-name String) (items (List (Ptr SExpr))))
+    (@intent "Transpile built-in type constructor with correct field order")
+    (@spec (((Ptr TranspileContext) String (List (Ptr SExpr))) -> String))
+    (@pre {ctx != nil})
     (let ((arena (. (deref ctx) arena))
-          (c-name (to-qualified-name arena ctx fn-name))
-          (items (. lst items))
-          (len (list-len items))
-          (mut result ""))
-      (do
-        (set! result (string-concat arena c-name "("))
-        (for (i 1 len)
-          (match (list-get items i)
-            ((some arg)
-              (let ((arg-str (transpile-expr ctx arg (none))))
-                (if (> i 1)
-                  (set! result (string-concat arena result (string-concat arena ", " arg-str)))
-                  (set! result (string-concat arena result arg-str)))))
-            ((none) (do))))
-        (set! result (string-concat arena result ")"))
-        result)))
+          (len (list-len items)))
+      (cond
+        ;; Bytes: (Bytes data len cap) -> (slop_bytes){.len = len, .cap = cap, .data = data}
+        ((string-eq type-name "Bytes")
+          (if (< len 4)
+            "(slop_bytes){0}"
+            (let ((data-c (match (list-get items 1) ((some e) (transpile-expr ctx e)) ((none) "NULL")))
+                  (len-c (match (list-get items 2) ((some e) (transpile-expr ctx e)) ((none) "0")))
+                  (cap-c (match (list-get items 3) ((some e) (transpile-expr ctx e)) ((none) "0"))))
+              (ctx-str ctx "(slop_bytes){.len = " (ctx-str ctx len-c
+                (ctx-str ctx ", .cap = " (ctx-str ctx cap-c
+                  (ctx-str ctx ", .data = " (ctx-str ctx data-c "}")))))))))
+        ;; String: (String data len) -> (slop_string){.len = len, .data = data}
+        ((string-eq type-name "String")
+          (if (< len 3)
+            "(slop_string){0}"
+            (let ((data-c (match (list-get items 1) ((some e) (transpile-expr ctx e)) ((none) "NULL")))
+                  (len-c (match (list-get items 2) ((some e) (transpile-expr ctx e)) ((none) "0"))))
+              (ctx-str ctx "(slop_string){.len = " (ctx-str ctx len-c
+                (ctx-str ctx ", .data = " (ctx-str ctx data-c "}")))))))
+        (else "(/* unknown builtin */)"))))
+
+  ;; ============================================================
+  ;; Function Call Transpilation
+  ;; ============================================================
+
+  (fn transpile-call ((ctx (Ptr TranspileContext)) (fn-name String) (args String))
+    (@intent "Transpile a function call")
+    (@spec (((Ptr TranspileContext) String String) -> String))
+    (@pre {ctx != nil})
+    (let ((arena (. (deref ctx) arena)))
+      ;; Check for runtime built-in functions first (no prefix)
+      (let ((runtime-name (get-runtime-function-name fn-name)))
+        (if (> (string-len runtime-name) 0)
+          ;; Runtime function - use its name directly
+          (ctx-str4 ctx runtime-name "(" args ")")
+          ;; Handle qualified names like "file.open" or regular names like "open"
+          (let ((base-name (get-base-function-name arena fn-name))
+                (mod-name (get-module-from-qualified-name arena fn-name)))
+            ;; Look up registered function using base name
+            (let ((c-name (match (ctx-lookup-func ctx base-name)
+                            ((some func-entry)
+                              (. func-entry c-name))
+                            ;; Not found - generate C name
+                            ((none)
+                              (if (> (string-len mod-name) 0)
+                                ;; Cross-module call - convert qualified name to C name (mod_func)
+                                (to-c-name arena fn-name)
+                                ;; Same-module call - add current module prefix
+                                (ctx-prefix-type ctx (to-c-name arena fn-name)))))))
+              (ctx-str4 ctx c-name "(" args ")")))))))
+
+  (fn get-base-function-name ((arena Arena) (fn-name String))
+    (@intent "Extract base function name from qualified name (file.open -> open)")
+    (@spec ((Arena String) -> String))
+    ;; Find the dot position
+    (let ((len (cast Int (string-len fn-name)))
+          (mut dot-pos -1)
+          (mut i 0))
+      (while (< i len)
+        (if (= (char-at fn-name (cast (Int 0 ..) i)) 46)  ;; 46 = '.'
+          (set! dot-pos i)
+          (do))
+        (set! i (+ i 1)))
+      (if (< dot-pos 0)
+        ;; No dot - return original name
+        fn-name
+        ;; Extract part after the dot
+        (let ((start (+ dot-pos 1))
+              (sublen (- len start)))
+          (substring arena fn-name (cast (Int 0 ..) start) (cast (Int 0 ..) sublen))))))
+
+  (fn get-module-from-qualified-name ((arena Arena) (fn-name String))
+    (@intent "Extract module name from qualified name (file.open -> file)")
+    (@spec ((Arena String) -> String))
+    ;; Find the dot position
+    (let ((len (cast Int (string-len fn-name)))
+          (mut dot-pos -1)
+          (mut i 0))
+      (while (< i len)
+        (if (= (char-at fn-name (cast (Int 0 ..) i)) 46)  ;; 46 = '.'
+          (set! dot-pos i)
+          (do))
+        (set! i (+ i 1)))
+      (if (< dot-pos 0)
+        ;; No dot - return empty string (not qualified)
+        ""
+        ;; Extract part before the dot
+        (substring arena fn-name 0 (cast (Int 0 ..) dot-pos)))))
+
+  (fn get-runtime-function-name ((fn-name String))
+    (@intent "Check if function is a runtime built-in and return its C name")
+    (@spec ((String) -> String))
+    (cond
+      ;; String operations (from slop_runtime.h)
+      ((string-eq fn-name "string-eq") "string_eq")
+      ((string-eq fn-name "string-concat") "string_concat")
+      ((string-eq fn-name "string-len") "string_len")
+      ((string-eq fn-name "string-new") "string_new")
+      ((string-eq fn-name "int-to-string") "int_to_string")
+      ((string-eq fn-name "float-to-string-short") "float_to_string_short")
+      ;; List operations
+      ((string-eq fn-name "list-len") "list_len")
+      ((string-eq fn-name "list-new") "list_new")
+      ((string-eq fn-name "list-push") "list_push")
+      ((string-eq fn-name "list-get") "list_get")
+      ;; Bytes operations
+      ((string-eq fn-name "bytes-len") "bytes_len")
+      ((string-eq fn-name "bytes-new") "bytes_new")
+      ;; Option operations
+      ((string-eq fn-name "unwrap") "unwrap")
+      ;; Not a runtime function
+      (else "")))
 
   ;; ============================================================
   ;; Type Inference Helpers
   ;; ============================================================
 
-  (fn is-pointer-expr ((ctx (Ptr TranspileContext)) (expr (Ptr SExpr)))
-    (@intent "Check if expression evaluates to a pointer type")
-    (@spec (((Ptr TranspileContext) (Ptr SExpr)) -> Bool))
-    (@pre (!= ctx nil))
-    (@pre (!= expr nil))
-    (@pure)
-    ;; Checks:
-    ;; - Variable is marked as pointer
-    ;; - arena-alloc result
-    ;; - (addr x)
-    ;; - (cast (Ptr T) x)
-    ;; - Field access on pointer type yielding pointer
-    ;; - Function call returning pointer
-    (match (deref expr)
-      ((symbol s)
-        (ctx-is-pointer ctx (. s name)))
-      ((list lst)
-        (match (list-get (. lst items) 0)
-          ((some head)
-            (match (deref head)
-              ((symbol op-sym)
-                (let ((op (. op-sym name)))
-                  (or (string-eq op "addr")
-                      (or (string-eq op "arena-alloc")
-                          (string-eq op "cast")))))
-              (_ false)))
-          ((none) false)))
-      (_ false)))
+  (fn transpile-enum-variant ((ctx (Ptr TranspileContext)) (variant-name String))
+    (@intent "Transpile an enum variant reference")
+    (@spec (((Ptr TranspileContext) String) -> String))
+    (@pre {ctx != nil})
+    (let ((arena (. (deref ctx) arena)))
+      ;; Look up the variant in registered enum types
+      (match (ctx-lookup-enum-variant ctx variant-name)
+        ((some enum-name)
+          ;; Emit EnumType_variant
+          (let ((enum-c (to-c-name arena enum-name))
+                (variant-c (to-c-name arena variant-name)))
+            (ctx-str3 ctx enum-c "_" variant-c)))
+        ((none)
+          ;; Fall back to just the variant name
+          (to-c-name arena variant-name)))))
 
-  (fn is-string-expr ((ctx (Ptr TranspileContext)) (expr (Ptr SExpr)))
-    (@intent "Check if expression evaluates to String type")
-    (@spec (((Ptr TranspileContext) (Ptr SExpr)) -> Bool))
-    (@pre (!= ctx nil))
-    (@pre (!= expr nil))
-    (@pure)
-    (match (deref expr)
-      ((string _) true)
-      ((symbol sym)
-        (match (ctx-lookup-var ctx (. sym name))
-          ((some entry) (string-eq (. entry c-type) "slop_string"))
-          ((none) false)))
-      (_ false)))
-
-  (fn infer-expr-c-type ((ctx (Ptr TranspileContext)) (expr (Ptr SExpr)))
-    (@intent "Infer the C type of an expression using type environment")
-    (@spec (((Ptr TranspileContext) (Ptr SExpr)) -> (Option String)))
-    (@pre (!= ctx nil))
-    (@pre (!= expr nil))
-    (@pure)
-    (match (ctx-get-type-env ctx)
+  (fn transpile-ok ((ctx (Ptr TranspileContext)) (value-c String))
+    (@intent "Transpile ok result construction")
+    (@spec (((Ptr TranspileContext) String) -> String))
+    (@pre {ctx != nil})
+    ;; Get current function's result type
+    (match (ctx-get-current-result-type ctx)
+      ((some result-type)
+        ;; (ResultType){ .is_ok = true, .data.ok = value }
+        (ctx-str5 ctx "((" result-type "){ .is_ok = true, .data.ok = " value-c " })"))
       ((none)
-        ;; No type environment available, fall back to none
-        (none))
-      ((some type-env)
-        ;; Use type environment for inference
-        (match (deref expr)
-          ;; Number literal -> int64_t or double
-          ((number n)
-            (if (. n is-float)
-              (some "double")
-              (some "int64_t")))
-          ;; String literal -> slop_string_t
-          ((string s)
-            (some "slop_string_t"))
-          ;; Symbol -> look up variable type
-          ((symbol sym)
-            (let ((name (. sym name)))
-              (cond
-                ;; Boolean literals
-                ((or (string-eq name "true") (string-eq name "false"))
-                  (some "bool"))
-                ;; nil
-                ((string-eq name "nil")
-                  (some "void*"))
-                ;; Variable lookup
-                (else
-                  (match (env-lookup-var type-env name)
-                    ((some resolved-type)
-                      (some (. (deref resolved-type) c-name)))
-                    ((none)
-                      ;; Try as function (return type)
-                      (match (env-lookup-function type-env name)
-                        ((some fn-sig)
-                          (some (. (deref (. (deref fn-sig) return-type)) c-name)))
-                        ((none) (none)))))))))
-          ;; List expression (function call, operator, etc)
-          ((list lst)
-            (infer-list-c-type ctx type-env lst))))))
+        ;; No result type set - use generic
+        (ctx-str3 ctx "(slop_result){ .is_ok = true, .data.ok = " value-c " }"))))
 
-  (fn infer-list-c-type ((ctx (Ptr TranspileContext)) (type-env (Ptr TypeEnv)) (lst SExprList))
-    (@intent "Infer C type of a list expression")
-    (@spec (((Ptr TranspileContext) (Ptr TypeEnv) SExprList) -> (Option String)))
-    (@pre (!= ctx nil))
-    (@pre (!= type-env nil))
-    (@pure)
-    (let ((items (. lst items))
-          (len (list-len items)))
-      (if (== len 0)
-        (some "void")
+  (fn transpile-error ((ctx (Ptr TranspileContext)) (value-c String))
+    (@intent "Transpile error result construction")
+    (@spec (((Ptr TranspileContext) String) -> String))
+    (@pre {ctx != nil})
+    ;; Get current function's result type
+    (match (ctx-get-current-result-type ctx)
+      ((some result-type)
+        ;; (ResultType){ .is_ok = false, .data.err = value }
+        (ctx-str5 ctx "((" result-type "){ .is_ok = false, .data.err = " value-c " })"))
+      ((none)
+        ;; No result type set - use generic
+        (ctx-str3 ctx "(slop_result){ .is_ok = false, .data.err = " value-c " }"))))
+
+  (fn infer-option-type ((ctx (Ptr TranspileContext)) (val-expr (Ptr SExpr)))
+    (@intent "Infer the slop_option_* type for a value expression")
+    (@spec (((Ptr TranspileContext) (Ptr SExpr)) -> String))
+    (@pre {ctx != nil})
+    (@pre {val-expr != nil})
+    ;; Basic type inference for Option element type
+    (match (deref val-expr)
+      ((number num)
+        ;; Numbers default to int option
+        (if (. num is-float)
+          "slop_option_double"
+          "slop_option_int"))
+      ((string _)
+        "slop_option_string")
+      ((symbol sym)
+        ;; Try to look up variable type
+        (let ((name (. sym name)))
+          (match (ctx-lookup-var ctx name)
+            ((some var-entry)
+              (let ((c-type (. var-entry c-type))
+                    (arena (. (deref ctx) arena)))
+                (cond
+                  ;; Handle auto type - emit error, don't guess
+                  ((string-eq c-type "auto") (ctx-str3 ctx "/* TRANSPILER ERROR: cannot infer Option type for variable '" name "' */"))
+                  ((string-eq c-type "int64_t") "slop_option_int")
+                  ((string-eq c-type "double") "slop_option_double")
+                  ((string-eq c-type "slop_string") "slop_option_string")
+                  ((string-eq c-type "char") "slop_option_char")
+                  ((string-eq c-type "uint8_t") "slop_option_u8")
+                  ;; Check for pointer types (ends with *)
+                  ((ends-with c-type "*")
+                    (let ((base-type (strip-pointer-suffix arena c-type)))
+                      (ctx-str3 ctx "slop_option_" base-type "_ptr")))
+                  ;; Other custom types: build slop_option_<typename>
+                  (else (ctx-str3 ctx "slop_option_" c-type "")))))
+            ;; Default to int
+            ((none) "slop_option_int"))))
+      ;; For complex expressions, try to infer type from the structure
+      ((list lst)
+        (infer-list-expr-option-type ctx (. lst items)))))
+
+  (fn infer-list-expr-option-type ((ctx (Ptr TranspileContext)) (items (List (Ptr SExpr))))
+    (@intent "Infer Option type for a list expression (field access, function call, etc.)")
+    (@spec (((Ptr TranspileContext) (List (Ptr SExpr))) -> String))
+    (@pre {ctx != nil})
+    (let ((len (list-len items))
+          (arena (. (deref ctx) arena)))
+      (if (< len 1)
+        "slop_option_int"
         (match (list-get items 0)
-          ((none) (none))
-          ((some head)
-            (match (deref head)
+          ((some head-expr)
+            (match (deref head-expr)
               ((symbol sym)
                 (let ((op (. sym name)))
                   (cond
-                    ;; Comparison operators return bool
-                    ((or (string-eq op "==") (string-eq op "!=")
-                         (string-eq op "<") (string-eq op "<=")
-                         (string-eq op ">") (string-eq op ">=")
-                         (string-eq op "and") (string-eq op "or") (string-eq op "not"))
-                      (some "bool"))
-                    ;; Arithmetic operators return int64_t
-                    ((or (string-eq op "+") (string-eq op "-")
-                         (string-eq op "*") (string-eq op "/") (string-eq op "%"))
-                      (some "int64_t"))
-                    ;; Function call - look up return type
+                    ;; Field access: (. obj field) - try to infer field type
+                    ((string-eq op ".")
+                      (if (< len 3)
+                        "slop_option_int"
+                        (match (list-get items 2)
+                          ((some field-expr)
+                            (match (deref field-expr)
+                              ((symbol field-sym)
+                                (let ((field-name (. field-sym name)))
+                                  ;; Known string fields from common types
+                                  (cond
+                                    ((string-eq field-name "name") "slop_option_string")
+                                    ((string-eq field-name "value") "slop_option_string")
+                                    ((string-eq field-name "message") "slop_option_string")
+                                    ((string-eq field-name "c-name") "slop_option_string")
+                                    ((string-eq field-name "c-type") "slop_option_string")
+                                    ((string-eq field-name "slop-name") "slop_option_string")
+                                    ;; Default to int for unknown fields
+                                    (else "slop_option_int"))))
+                              (else "slop_option_int")))
+                          ((none) "slop_option_int"))))
+                    ;; String functions that return strings
+                    ((or (string-eq op "string-concat")
+                         (or (string-eq op "string-copy")
+                             (or (string-eq op "int-to-string")
+                                 (string-eq op "substring"))))
+                      "slop_option_string")
+                    ;; Check function registry for return type
                     (else
-                      (match (env-lookup-function type-env op)
-                        ((some fn-sig)
-                          (some (. (deref (. (deref fn-sig) return-type)) c-name)))
-                        ((none) (none)))))))
-              (_ (none))))))))
-)
+                      (match (ctx-lookup-func ctx op)
+                        ((some func-entry)
+                          (if (. func-entry returns-string)
+                            "slop_option_string"
+                            "slop_option_int"))
+                        ((none) "slop_option_int"))))))
+              (else "slop_option_int")))
+          ((none) "slop_option_int")))))
+
+  (fn ends-with ((s String) (suffix String))
+    (@intent "Check if string ends with suffix")
+    (@spec ((String String) -> Bool))
+    (let ((s-len (string-len s))
+          (suffix-len (string-len suffix)))
+      (if (< s-len suffix-len)
+        false
+        (let ((start (- s-len suffix-len))
+              (mut i 0)
+              (mut matches true))
+          (while (and (< i suffix-len) matches)
+            (when (not (== (char-at s (cast (Int 0 ..) (+ start i))) (char-at suffix (cast (Int 0 ..) i))))
+              (set! matches false))
+            (set! i (+ i 1)))
+          matches))))
+
+  (fn strip-pointer-suffix ((arena Arena) (s String))
+    (@intent "Strip trailing * from pointer type string")
+    (@spec ((Arena String) -> String))
+    (let ((len (string-len s)))
+      (if (< len 1)
+        ""
+        (substring arena s (cast (Int 0 ..) 0) (cast (Int 0 ..) (- len 1))))))
+
+  (fn infer-list-element-option-type ((ctx (Ptr TranspileContext)) (list-expr (Ptr SExpr)))
+    (@intent "Infer the slop_option_* type for a list element (for list-get)")
+    (@spec (((Ptr TranspileContext) (Ptr SExpr)) -> String))
+    (@pre {ctx != nil})
+    (@pre {list-expr != nil})
+    ;; Return empty string to indicate "use anonymous struct fallback"
+    (let ((arena (. (deref ctx) arena)))
+      (match (deref list-expr)
+        ;; Simple variable name
+        ((symbol sym)
+          (let ((name (. sym name)))
+            (match (ctx-lookup-var ctx name)
+              ((some var-entry)
+                (list-type-to-option-type ctx (. var-entry c-type)))
+              ((none) ""))))  ;; fallback
+        ;; Field access: (. var field) - check for known fields
+        ((list lst)
+          (let ((items (. lst items)))
+            (if (< (list-len items) 3)
+              ""
+              (match (list-get items 0)
+                ((some head)
+                  (match (deref head)
+                    ((symbol head-sym)
+                      (if (string-eq (. head-sym name) ".")
+                        ;; This is a field access (. obj field)
+                        (match (list-get items 2)
+                          ((some field-expr)
+                            (infer-field-access-list-type ctx field-expr))
+                          ((none) ""))
+                        ""))
+                    (_ "")))
+                ((none) "")))))
+        (_ ""))))
+
+  (fn infer-field-access-list-type ((ctx (Ptr TranspileContext)) (field-expr (Ptr SExpr)))
+    (@intent "Infer option type for list field access")
+    (@spec (((Ptr TranspileContext) (Ptr SExpr)) -> String))
+    (@pre {ctx != nil})
+    (@pre {field-expr != nil})
+    ;; Get the field name and return appropriate option type
+    ;; Only use named types that are guaranteed to exist (from types.slop imports)
+    (match (deref field-expr)
+      ((symbol field-sym)
+        (let ((field-name (. field-sym name)))
+          ;; For common known field names from types module, return appropriate option types
+          (cond
+            ;; SExprList.items -> (List (Ptr SExpr)) -> slop_option_types_SExpr_ptr
+            ((string-eq field-name "items") "slop_option_types_SExpr_ptr")
+            ;; ResolvedType.variants -> (List ResolvedVariant) -> slop_option_types_ResolvedVariant
+            ((string-eq field-name "variants") "slop_option_types_ResolvedVariant")
+            ;; ResolvedType.fields -> (List ResolvedField) -> slop_option_types_ResolvedField
+            ((string-eq field-name "fields") "slop_option_types_ResolvedField")
+            ;; Default fallback - use empty string to trigger anonymous struct
+            ;; (tokens etc. use anonymous struct since slop_option_parser_Token isn't defined)
+            (else ""))))
+      (_ "")))
+
+  (fn list-type-to-option-type ((ctx (Ptr TranspileContext)) (c-type String))
+    (@intent "Convert slop_list_X to slop_option_X")
+    (@spec (((Ptr TranspileContext) String) -> String))
+    (@pre {ctx != nil})
+    (let ((arena (. (deref ctx) arena)))
+      (cond
+        ((string-eq c-type "slop_list_string") "slop_option_string")
+        ((string-eq c-type "slop_list_int") "slop_option_int")
+        ((string-eq c-type "slop_list_double") "slop_option_double")
+        ((string-eq c-type "slop_list_char") "slop_option_char")
+        ((string-eq c-type "slop_list_u8") "slop_option_u8")
+        ;; For other list types, extract element and build option type
+        ((starts-with c-type "slop_list_")
+          (let ((elem-type (substring-after-prefix arena c-type "slop_list_")))
+            (ctx-str3 ctx "slop_option_" elem-type "")))
+        (else ""))))
+
+  (fn substring-after-prefix ((arena Arena) (s String) (prefix String))
+    (@intent "Extract substring after a prefix")
+    (@spec ((Arena String String) -> String))
+    ;; Use strlib substring
+    (let ((prefix-len (string-len prefix))
+          (s-len (string-len s)))
+      (if (<= s-len prefix-len)
+        ""
+        (let ((start (cast (Int 0 ..) prefix-len))
+              (len (cast (Int 0 ..) (- s-len prefix-len))))
+          (substring arena s start len)))))
+
+  ;; ============================================================
+  ;; Ternary None Fix Helper
+  ;; ============================================================
+
+  (fn fix-ternary-none ((ctx (Ptr TranspileContext)) (other-branch String) (this-branch String))
+    (@intent "Fix type mismatch when one ternary branch is 'none' and other is typed option")
+    (@spec (((Ptr TranspileContext) String String) -> String))
+    (@pre {ctx != nil})
+    ;; If this-branch is "none" and other-branch looks like a typed option,
+    ;; return typed none
+    (if (and (string-eq this-branch "none")
+             (starts-with other-branch "(slop_option_"))
+      ;; Extract option type from other-branch: "(slop_option_X){..."
+      (let ((arena (. (deref ctx) arena)))
+        (match (extract-option-type arena other-branch)
+          ((some opt-type)
+            (ctx-str3 ctx "(" opt-type "){.has_value = false}"))
+          ((none) this-branch)))
+      this-branch))
+
+  (fn extract-option-type ((arena Arena) (s String))
+    (@intent "Extract option type name from '(slop_option_X){...'")
+    (@spec ((Arena String) -> (Option String)))
+    ;; String format: (TYPE){...}
+    ;; We want to extract TYPE without the ( and )
+    (if (< (string-len s) 15)
+      (none)
+      (let ((mut i 1)  ;; skip leading (
+            (len (string-len s))
+            (mut found-brace false)
+            (mut end-idx 0))
+        ;; Find the { that ends the type name (ASCII 123)
+        (while (and (< i len) (not found-brace))
+          (if (== (char-at s (cast (Int 0 ..) i)) 123)  ;; '{' = 123
+            (do
+              (set! found-brace true)
+              (set! end-idx (- i 2)))  ;; exclude both the ) before { and account for 0-index
+            (set! i (+ i 1))))
+        (if found-brace
+          (some (substring arena s 1 (cast (Int 0 ..) end-idx)))
+          (none)))))
+
+  ;; ============================================================
+  ;; Array Index Helper
+  ;; ============================================================
+
+  (fn transpile-array-index ((ctx (Ptr TranspileContext)) (arr-expr (Ptr SExpr)) (arr-c String) (idx-c String))
+    (@intent "Transpile array indexing, handling struct types that need .data access")
+    (@spec (((Ptr TranspileContext) (Ptr SExpr) String String) -> String))
+    (@pre {ctx != nil})
+    (@pre {arr-expr != nil})
+    ;; Check if the array is a variable with a known type
+    (match (deref arr-expr)
+      ((symbol sym)
+        (let ((name (. sym name)))
+          (match (ctx-lookup-var ctx name)
+            ((some var-entry)
+              (let ((c-type (. var-entry c-type)))
+                ;; Check for string/list types that have .data field
+                (if (or (string-eq c-type "slop_string")
+                        (string-eq c-type "string")
+                        (starts-with c-type "slop_list_"))
+                  (ctx-str5 ctx "(" arr-c ").data[" idx-c "]")
+                  (ctx-str4 ctx arr-c "[" idx-c "]"))))
+            ;; No type info - use simple indexing
+            ((none) (ctx-str4 ctx arr-c "[" idx-c "]")))))
+      ;; Non-symbol - just use simple indexing
+      (_ (ctx-str4 ctx arr-c "[" idx-c "]"))))
+
+  ;; ============================================================
+  ;; Pointer Expression Detection
+  ;; ============================================================
+
+  (fn is-pointer-expr ((ctx (Ptr TranspileContext)) (expr (Ptr SExpr)))
+    (@intent "Check if expression evaluates to a pointer type")
+    (@spec (((Ptr TranspileContext) (Ptr SExpr)) -> Bool))
+    (@pre {ctx != nil})
+    (@pre {expr != nil})
+    (match (deref expr)
+      ((symbol sym)
+        ;; Look up variable type in context
+        (let ((name (. sym name)))
+          (match (ctx-lookup-var ctx name)
+            ((some var-entry)
+              (let ((c-type (. var-entry c-type)))
+                (ends-with c-type "*")))
+            ((none) false))))
+      ((list lst)
+        (let ((items (. lst items)))
+          ;; Check for specific pointer-returning forms
+          (if (>= (list-len items) 1)
+            (match (list-get items 0)
+              ((some head-ptr)
+                (match (deref head-ptr)
+                  ((symbol head-sym)
+                    (let ((op (. head-sym name)))
+                      ;; deref returns value, addr returns pointer, cast to Ptr returns pointer
+                      (cond
+                        ((string-eq op "deref") false)
+                        ((string-eq op "addr") true)
+                        ((string-eq op "arena-alloc") true)
+                        ;; cast to pointer type returns pointer
+                        ((and (string-eq op "cast") (>= (list-len items) 2))
+                          (match (list-get items 1)
+                            ((some type-expr) (is-pointer-type-expr type-expr))
+                            ((none) false)))
+                        (else false))))
+                  (_ false)))
+              ((none) false))
+            false)))
+      (_ false)))
+
+  ;; ============================================================
+  ;; sizeof Type Extraction for arena-alloc
+  ;; ============================================================
+
+  (fn extract-sizeof-type ((ctx (Ptr TranspileContext)) (expr (Ptr SExpr)))
+    (@intent "Extract type from (sizeof Type) expression, or return uint8_t")
+    (@spec (((Ptr TranspileContext) (Ptr SExpr)) -> String))
+    (@pre {ctx != nil})
+    (@pre {expr != nil})
+    (let ((arena (. (deref ctx) arena)))
+      (match (deref expr)
+        ((list lst)
+          (let ((items (. lst items)))
+            (if (>= (list-len items) 2)
+              (match (list-get items 0)
+                ((some head-ptr)
+                  (match (deref head-ptr)
+                    ((symbol head-sym)
+                      (if (string-eq (. head-sym name) "sizeof")
+                        (match (list-get items 1)
+                          ((some type-expr)
+                            (to-c-type-prefixed ctx type-expr))
+                          ((none) "uint8_t"))
+                        "uint8_t"))
+                    (_ "uint8_t")))
+                ((none) "uint8_t"))
+              "uint8_t")))
+        (_ "uint8_t"))))
+
+  ;; ============================================================
+  ;; Main Expression Transpilation
+  ;; ============================================================
+
+  (fn transpile-expr ((ctx (Ptr TranspileContext)) (expr (Ptr SExpr)))
+    (@intent "Transpile a SLOP expression to C code")
+    (@spec (((Ptr TranspileContext) (Ptr SExpr)) -> String))
+    (@pre {ctx != nil})
+    (@pre {expr != nil})
+    (match (deref expr)
+      ;; Literals
+      ((number _) (transpile-literal ctx expr))
+      ((string _) (transpile-literal ctx expr))
+      ((symbol _) (transpile-literal ctx expr))
+      ;; List expressions (function calls, operators, etc.)
+      ((list lst)
+        (transpile-list-expr ctx (. lst items)))))
+
+  (fn transpile-list-expr ((ctx (Ptr TranspileContext)) (items (List (Ptr SExpr))))
+    (@intent "Transpile a list expression")
+    (@spec (((Ptr TranspileContext) (List (Ptr SExpr))) -> String))
+    (@pre {ctx != nil})
+    (let ((len (list-len items))
+          (arena (. (deref ctx) arena)))
+      (if (< len 1)
+        "/* empty list */"
+        (match (list-get items 0)
+          ((some head-expr)
+            (match (deref head-expr)
+              ;; Symbol head - could be operator or function call
+              ((symbol head-sym)
+                (let ((op (. head-sym name)))
+                  (cond
+                    ;; Binary operators (variadic for and/or)
+                    ((and (is-binop op) (>= len 3))
+                      ;; Check if this is a variadic and/or with more than 2 operands
+                      (if (and (or (string-eq op "and") (string-eq op "or")) (> len 3))
+                        ;; Variadic: chain all operands
+                        (transpile-variadic-binop ctx op items 1)
+                        ;; Binary: just 2 operands
+                        (match (list-get items 1)
+                          ((some left)
+                            (match (list-get items 2)
+                              ((some right)
+                                (let ((left-c (transpile-expr ctx left))
+                                      (right-c (transpile-expr ctx right)))
+                                  (transpile-binop ctx op left-c right-c)))
+                              ((none) "/* missing right operand */")))
+                          ((none) "/* missing left operand */"))))
+                    ;; Comparison operators
+                    ((and (is-comparison-op op) (>= len 3))
+                      (match (list-get items 1)
+                        ((some left)
+                          (match (list-get items 2)
+                            ((some right)
+                              (let ((left-c (transpile-expr ctx left))
+                                    (right-c (transpile-expr ctx right)))
+                                (transpile-binop ctx op left-c right-c)))
+                            ((none) "/* missing right operand */")))
+                        ((none) "/* missing left operand */")))
+                    ;; not (unary)
+                    ((and (string-eq op "not") (>= len 2))
+                      (match (list-get items 1)
+                        ((some arg)
+                          (ctx-str3 ctx "!(" (transpile-expr ctx arg) ")"))
+                        ((none) "/* missing argument */")))
+                    ;; if expression: (if cond then else) -> (cond) ? then : else
+                    ((and (string-eq op "if") (>= len 4))
+                      (match (list-get items 1)
+                        ((some cond-expr)
+                          (match (list-get items 2)
+                            ((some then-expr)
+                              (match (list-get items 3)
+                                ((some else-expr)
+                                  (let ((cond-c (transpile-expr ctx cond-expr))
+                                        (then-c (transpile-expr ctx then-expr))
+                                        (else-c (transpile-expr ctx else-expr)))
+                                    ;; Fix type mismatch when one branch is typed option and other is none
+                                    (let ((final-else (fix-ternary-none ctx then-c else-c))
+                                          (final-then (fix-ternary-none ctx else-c then-c)))
+                                      (ctx-str5 ctx "((" cond-c ") ? " (ctx-str3 ctx final-then " : " final-else) ")"))))
+                                ((none) "/* missing else */")))
+                            ((none) "/* missing then */")))
+                        ((none) "/* missing condition */")))
+                    ;; let/let* as expression: use GCC statement expression
+                    ((and (or (string-eq op "let") (string-eq op "let*")) (>= len 3))
+                      (transpile-let-expr ctx items))
+                    ;; while as expression (side effect only, returns 0)
+                    ((and (string-eq op "while") (>= len 3))
+                      (transpile-while-expr ctx items))
+                    ;; do as expression: sequence, returns last value
+                    ((and (string-eq op "do") (>= len 1))
+                      (transpile-do-expr ctx items))
+                    ;; when as expression: (when cond body) -> ((cond) ? ({ body; 0; }) : 0)
+                    ((and (string-eq op "when") (>= len 2))
+                      (transpile-when-expr ctx items))
+                    ;; set! as expression (side effect, returns 0)
+                    ((and (string-eq op "set!") (>= len 3))
+                      (transpile-set-expr ctx items))
+                    ;; match expression: use GCC statement expression
+                    ((and (string-eq op "match") (>= len 3))
+                      (transpile-match-expr ctx items))
+                    ;; deref: (deref ptr) -> (*ptr)
+                    ((and (string-eq op "deref") (>= len 2))
+                      (match (list-get items 1)
+                        ((some arg)
+                          (ctx-str3 ctx "(*" (transpile-expr ctx arg) ")"))
+                        ((none) "/* missing argument */")))
+                    ;; Field access: (. obj field)
+                    ((and (string-eq op ".") (>= len 3))
+                      (match (list-get items 1)
+                        ((some obj)
+                          (match (list-get items 2)
+                            ((some field-expr)
+                              (match (deref field-expr)
+                                ((symbol field-sym)
+                                  (let ((obj-c (transpile-expr ctx obj))
+                                        (field-c (to-c-name arena (. field-sym name)))
+                                        (is-ptr (is-pointer-expr ctx obj)))
+                                    (if is-ptr
+                                      (ctx-str3 ctx obj-c "->" field-c)
+                                      (ctx-str3 ctx obj-c "." field-c))))
+                                (_ "/* invalid field */")))
+                            ((none) "/* missing field */")))
+                        ((none) "/* missing object */")))
+                    ;; cast: (cast Type expr)
+                    ((and (string-eq op "cast") (>= len 3))
+                      (match (list-get items 1)
+                        ((some type-expr)
+                          (match (list-get items 2)
+                            ((some val-expr)
+                              (let ((c-type (to-c-type-prefixed ctx type-expr))
+                                    (val-c (transpile-expr ctx val-expr))
+                                    (is-ptr-cast (is-pointer-type-expr type-expr))
+                                    (is-str-literal (is-string-literal val-expr)))
+                                ;; When casting a string literal to pointer, use .data
+                                (if (and is-ptr-cast is-str-literal)
+                                  (ctx-str ctx "((" (ctx-str ctx c-type (ctx-str ctx ")(" (ctx-str ctx val-c ".data))"))))
+                                  (ctx-str5 ctx "((" c-type ")(" val-c "))"))))
+                            ((none) "/* missing cast value */")))
+                        ((none) "/* missing cast type */")))
+                    ;; c-inline: (c-inline "raw C code") -> raw C code
+                    ((and (string-eq op "c-inline") (>= len 2))
+                      (match (list-get items 1)
+                        ((some str-expr)
+                          (match (deref str-expr)
+                            ((string str) (. str value))
+                            (else "/* c-inline requires string */")))
+                        ((none) "/* missing c-inline string */")))
+                    ;; some: (some value) for Option
+                    ((and (string-eq op "some") (>= len 2))
+                      (match (list-get items 1)
+                        ((some val-expr)
+                          (let ((val-c (transpile-expr ctx val-expr))
+                                ;; Use infer-expr-c-type for more accurate type inference
+                                (val-type (infer-expr-c-type ctx val-expr))
+                                (option-type (cond
+                                               ((string-eq val-type "slop_string") "slop_option_string")
+                                               ((string-eq val-type "int64_t") "slop_option_int")
+                                               ((string-eq val-type "double") "slop_option_double")
+                                               ;; For auto/unknown type, emit error - don't guess
+                                               ((string-eq val-type "auto")
+                                                 (ctx-str3 ctx "/* TRANSPILER ERROR: cannot infer Option type for '" val-c "' */"))
+                                               (else (infer-option-type ctx val-expr)))))
+                            ;; Typed option construction
+                            (ctx-str5 ctx "(" option-type "){.has_value = 1, .value = " val-c "}")))
+                        ((none) "/* missing some value */")))
+                    ;; sizeof: (sizeof Type) -> sizeof(c_type)
+                    ((and (string-eq op "sizeof") (>= len 2))
+                      (match (list-get items 1)
+                        ((some type-expr)
+                          (let ((c-type (to-c-type-prefixed ctx type-expr)))
+                            (ctx-str3 ctx "sizeof(" c-type ")")))
+                        ((none) "/* missing sizeof type */")))
+                    ;; addr: (addr x) -> (&x)
+                    ((and (string-eq op "addr") (>= len 2))
+                      (match (list-get items 1)
+                        ((some arg)
+                          (ctx-str3 ctx "(&" (transpile-expr ctx arg) ")"))
+                        ((none) "/* missing addr argument */")))
+                    ;; @ array indexing: (@ arr i) -> arr[i]
+                    ((and (string-eq op "@") (>= len 3))
+                      (match (list-get items 1)
+                        ((some arr-expr)
+                          (match (list-get items 2)
+                            ((some idx-expr)
+                              (let ((arr-c (transpile-expr ctx arr-expr))
+                                    (idx-c (transpile-expr ctx idx-expr)))
+                                ;; Check if array is a struct type (string/list) needing .data
+                                (transpile-array-index ctx arr-expr arr-c idx-c)))
+                            ((none) "/* missing index */")))
+                        ((none) "/* missing array */")))
+                    ;; arena-alloc: (arena-alloc arena size) -> (Type*)slop_arena_alloc(arena, size)
+                    ;; Special case: (arena-alloc arena TypeName) -> (Type*)slop_arena_alloc(arena, sizeof(Type))
+                    ((and (string-eq op "arena-alloc") (>= len 3))
+                      (match (list-get items 1)
+                        ((some arena-expr)
+                          (match (list-get items 2)
+                            ((some size-expr)
+                              (let ((arena-c (transpile-expr ctx arena-expr)))
+                                ;; Check if size-expr is a bare type symbol (known type)
+                                (match (deref size-expr)
+                                  ((symbol sym)
+                                    (let ((type-name (. sym name)))
+                                      (match (ctx-lookup-type ctx type-name)
+                                        ((some entry)
+                                          ;; Known type - generate sizeof(prefixed_type)
+                                          ;; Output: ((TYPE*)slop_arena_alloc(arena, sizeof(TYPE)))
+                                          (let ((c-type (. entry c-name)))
+                                            (ctx-str ctx "((" (ctx-str ctx c-type (ctx-str ctx "*)slop_arena_alloc(" (ctx-str ctx arena-c (ctx-str ctx ", sizeof(" (ctx-str ctx c-type ")))"))))))))
+                                        ((none)
+                                          ;; Not a registered type - use normal transpilation
+                                          (let ((size-c (transpile-expr ctx size-expr))
+                                                (cast-type (extract-sizeof-type ctx size-expr)))
+                                            (ctx-str5 ctx "(" cast-type "*)slop_arena_alloc(" (ctx-str3 ctx arena-c ", " size-c) ")"))))))
+                                  (else
+                                    ;; Not a symbol - use normal transpilation
+                                    (let ((size-c (transpile-expr ctx size-expr))
+                                          (cast-type (extract-sizeof-type ctx size-expr)))
+                                      (ctx-str5 ctx "(" cast-type "*)slop_arena_alloc(" (ctx-str3 ctx arena-c ", " size-c) ")"))))))
+                            ((none) "/* missing arena-alloc size */")))
+                        ((none) "/* missing arena argument */")))
+                    ;; quote: (quote variant) -> EnumType_variant
+                    ((and (string-eq op "quote") (>= len 2))
+                      (match (list-get items 1)
+                        ((some variant-expr)
+                          (match (deref variant-expr)
+                            ((symbol sym)
+                              ;; Enum variant - look up the type and emit prefixed name
+                              (let ((variant-name (. sym name)))
+                                (transpile-enum-variant ctx variant-name)))
+                            (else "/* quote requires symbol */")))
+                        ((none) "/* missing quote argument */")))
+                    ;; record-new: (record-new Type (field1 val1) (field2 val2) ...) -> ((Type){.f1 = v1, ...})
+                    ((and (string-eq op "record-new") (>= len 2))
+                      (transpile-record-new ctx items))
+                    ;; list: (list Type elem1 elem2 ...) -> inline list literal
+                    ((and (string-eq op "list") (>= len 2))
+                      (transpile-list-literal ctx items))
+                    ;; map-new: (map-new arena KeyType ValueType) -> slop_map_new_ptr(arena, 16)
+                    ((and (string-eq op "map-new") (>= len 2))
+                      (transpile-map-new ctx items))
+                    ;; map-put: (map-put map key val) -> slop_map_put(arena, map, key, &val)
+                    ((and (string-eq op "map-put") (>= len 4))
+                      (transpile-map-put ctx items))
+                    ;; map-get: (map-get map key) -> slop_map_get(map, key)
+                    ((and (string-eq op "map-get") (>= len 3))
+                      (transpile-map-get ctx items))
+                    ;; map-has: (map-has map key) -> (slop_map_get(map, key) != NULL)
+                    ((and (string-eq op "map-has") (>= len 3))
+                      (transpile-map-has ctx items))
+                    ;; map-keys: (map-keys map) -> slop_map_keys(map)
+                    ((and (string-eq op "map-keys") (>= len 2))
+                      (transpile-map-keys ctx items))
+                    ;; union-new: (union-new Type tag value?) -> ((Type){ .tag = Type_tag, .data.tag = value })
+                    ((and (string-eq op "union-new") (>= len 3))
+                      (match (list-get items 1)
+                        ((some type-expr)
+                          (match (list-get items 2)
+                            ((some tag-expr)
+                              (match (deref type-expr)
+                                ((symbol type-sym)
+                                  (match (deref tag-expr)
+                                    ((symbol tag-sym)
+                                      ;; Look up registered type to get proper c-name with module prefix
+                                      (let ((raw-type-name (. type-sym name))
+                                            (type-name (match (ctx-lookup-type ctx raw-type-name)
+                                                         ((some entry) (. entry c-name))
+                                                         ((none) (to-c-name arena raw-type-name))))
+                                            (tag-name (to-c-name arena (. tag-sym name)))
+                                            ;; Build tag constant: Type_tag
+                                            (tag-const (ctx-str ctx type-name (ctx-str ctx "_" tag-name))))
+                                        ;; Check for optional value
+                                        (if (>= len 4)
+                                          (match (list-get items 3)
+                                            ((some val-expr)
+                                              (let ((val-c (transpile-expr ctx val-expr)))
+                                                ;; ((Type){ .tag = Type_tag, .data.tag = value })
+                                                (ctx-str3 ctx "((" type-name (ctx-str3 ctx "){ .tag = " tag-const (ctx-str5 ctx ", .data." tag-name " = " val-c " })")))))
+                                            ((none) "/* missing union value */"))
+                                          ;; No value - just tag: ((Type){ .tag = Type_tag })
+                                          (ctx-str3 ctx "((" type-name (ctx-str3 ctx "){ .tag = " tag-const " })")))))
+                                    (_ "/* union-new tag must be symbol */")))
+                                (_ "/* union-new type must be symbol */")))
+                            ((none) "/* missing union tag */")))
+                        ((none) "/* missing union type */")))
+                    ;; ok: (ok value) -> (ResultType){.tag = SLOP_OK, .ok = value}
+                    ((and (string-eq op "ok") (>= len 2))
+                      (match (list-get items 1)
+                        ((some val-expr)
+                          (let ((val-c (transpile-expr ctx val-expr)))
+                            (transpile-ok ctx val-c)))
+                        ((none) "/* missing ok value */")))
+                    ;; error: (error value) -> (ResultType){.tag = SLOP_ERR, .err = value}
+                    ((and (string-eq op "error") (>= len 2))
+                      (match (list-get items 1)
+                        ((some val-expr)
+                          (let ((val-c (transpile-expr ctx val-expr)))
+                            (transpile-error ctx val-c)))
+                        ((none) "/* missing error value */")))
+                    ;; ?: (? result-expr) -> propagation (returns early on error)
+                    ((and (string-eq op "?") (>= len 2))
+                      (match (list-get items 1)
+                        ((some result-expr)
+                          (let ((result-c (transpile-expr ctx result-expr)))
+                            (ctx-str3 ctx "({ __auto_type _tmp = " result-c "; if (!_tmp.is_ok) return _tmp; _tmp.data.ok; })")))
+                        ((none) "/* missing ? argument */")))
+                    ;; list-len: (list-len list) -> ((int64_t)(list.len))
+                    ((and (string-eq op "list-len") (>= len 2))
+                      (match (list-get items 1)
+                        ((some list-expr)
+                          (let ((list-c (transpile-expr ctx list-expr)))
+                            (ctx-str3 ctx "((int64_t)((" list-c ").len))")))
+                        ((none) "/* missing list-len argument */")))
+                    ;; list-get: (list-get list idx) -> inline option expression
+                    ((and (string-eq op "list-get") (>= len 3))
+                      (match (list-get items 1)
+                        ((some list-expr)
+                          (match (list-get items 2)
+                            ((some idx-expr)
+                              (let ((list-c (transpile-expr ctx list-expr))
+                                    (idx-c (transpile-expr ctx idx-expr))
+                                    ;; Try to get the proper named option type for this list's elements
+                                    (option-type (infer-list-element-option-type ctx list-expr)))
+                                ;; If we have a named option type, use it; otherwise use anonymous struct
+                                (if (> (string-len option-type) 0)
+                                  ;; Named option type available
+                                  (ctx-str ctx "({ __auto_type _lst = " (ctx-str ctx list-c
+                                    (ctx-str ctx "; size_t _idx = (size_t)" (ctx-str ctx idx-c
+                                      (ctx-str ctx "; " (ctx-str ctx option-type
+                                        " _r; if (_idx < _lst.len) { _r.has_value = true; _r.value = _lst.data[_idx]; } else { _r.has_value = false; } _r; })"))))))
+                                  ;; Fallback to anonymous struct with __typeof__
+                                  (ctx-str ctx "({ __auto_type _lst = " (ctx-str ctx list-c
+                                    (ctx-str ctx "; size_t _idx = (size_t)" (ctx-str ctx idx-c
+                                      "; struct { bool has_value; __typeof__(_lst.data[0]) value; } _r; if (_idx < _lst.len) { _r.has_value = true; _r.value = _lst.data[_idx]; } else { _r.has_value = false; } _r; })")))))))
+                            ((none) "/* missing list-get index */")))
+                        ((none) "/* missing list-get list argument */")))
+                    ;; list-new: (list-new arena Type) -> compound literal
+                    ((and (string-eq op "list-new") (>= len 3))
+                      (match (list-get items 1)
+                        ((some arena-expr)
+                          (match (list-get items 2)
+                            ((some type-expr)
+                              (let ((arena-c (transpile-expr ctx arena-expr))
+                                    (elem-c-type (to-c-type-prefixed ctx type-expr))
+                                    (elem-id (type-to-identifier arena elem-c-type))
+                                    (list-type (ctx-str ctx "slop_list_" elem-id)))
+                                ;; ((slop_list_Type){ .data = (Type*)slop_arena_alloc(arena, 16 * sizeof(Type)), .len = 0, .cap = 16 })
+                                (ctx-str ctx "(("
+                                  (ctx-str ctx list-type
+                                    (ctx-str ctx "){ .data = ("
+                                      (ctx-str ctx elem-c-type
+                                        (ctx-str ctx "*)slop_arena_alloc("
+                                          (ctx-str ctx arena-c
+                                            (ctx-str ctx ", 16 * sizeof("
+                                              (ctx-str ctx elem-c-type ")), .len = 0, .cap = 16 })"))))))))))
+                            ((none) "/* missing list-new type argument */")))
+                        ((none) "/* missing list-new arena argument */")))
+                    ;; list-push: (list-push list item) -> inline push
+                    ((and (string-eq op "list-push") (>= len 3))
+                      (match (list-get items 1)
+                        ((some list-expr)
+                          (match (list-get items 2)
+                            ((some item-expr)
+                              (let ((list-c (transpile-expr ctx list-expr))
+                                    (item-c (transpile-expr ctx item-expr))
+                                    ;; Determine arena source from the list expression
+                                    ;; If it's a struct field access, use struct->arena
+                                    (arena-c (get-arena-for-list-push-expr ctx list-expr list-c)))
+                                ;; ({ __auto_type _lst_p = &(list); __auto_type _item = item;
+                                ;;    if (_lst_p->len >= _lst_p->cap) { ... grow ... }
+                                ;;    _lst_p->data[_lst_p->len++] = _item; })
+                                (let ((s1 (ctx-str ctx "({ __auto_type _lst_p = &(" list-c))
+                                      (s2 (ctx-str ctx s1 "); __auto_type _item = ("))
+                                      (s3 (ctx-str ctx s2 item-c))
+                                      (s4 (ctx-str ctx s3 "); if (_lst_p->len >= _lst_p->cap) { size_t _new_cap = _lst_p->cap == 0 ? 16 : _lst_p->cap * 2; __typeof__(_lst_p->data) _new_data = (__typeof__(_lst_p->data))slop_arena_alloc("))
+                                      (s5 (ctx-str ctx s4 arena-c))
+                                      (s6 (ctx-str ctx s5 ", _new_cap * sizeof(*_lst_p->data)); if (_lst_p->len > 0) memcpy(_new_data, _lst_p->data, _lst_p->len * sizeof(*_lst_p->data)); _lst_p->data = _new_data; _lst_p->cap = _new_cap; } _lst_p->data[_lst_p->len++] = _item; })")))
+                                  s6)))
+                            ((none) "/* missing list-push item */")))
+                        ((none) "/* missing list-push list */")))
+                    ;; none constructor: (none) -> typed none if return type is known
+                    ((and (string-eq op "none") (= len 1))
+                      ;; Try to use function's return type for typed none
+                      (match (ctx-get-current-return-type ctx)
+                        ((some ret-type)
+                          (if (starts-with ret-type "slop_option_")
+                            (ctx-str3 ctx "((" ret-type "){.has_value = false})")
+                            "none"))
+                        ((none) "none")))
+                    ;; cond expression: (cond (test body) ... (else body)) -> nested ternary
+                    ((string-eq op "cond")
+                      (transpile-cond-expr ctx items))
+                    ;; Default: function call
+                    (else
+                      (transpile-fn-call ctx op items)))))
+              ;; Non-symbol head
+              (_ "/* non-symbol head */")))
+          ((none) "/* empty list */")))))
+
+  (fn transpile-fn-call ((ctx (Ptr TranspileContext)) (fn-name String) (items (List (Ptr SExpr))))
+    (@intent "Transpile a function call with arguments")
+    (@spec (((Ptr TranspileContext) String (List (Ptr SExpr))) -> String))
+    (@pre {ctx != nil})
+    (let ((arena (. (deref ctx) arena))
+          (len (list-len items)))
+      ;; Check for print/println builtins first
+      (cond
+        ((string-eq fn-name "println")
+          (if (< len 2)
+            "printf(\"\\n\")"
+            (match (list-get items 1)
+              ((some arg)
+                (transpile-print ctx arg true))
+              ((none) "printf(\"\\n\")"))))
+        ((string-eq fn-name "print")
+          (if (< len 2)
+            "/* print: missing argument */"
+            (match (list-get items 1)
+              ((some arg)
+                (transpile-print ctx arg false))
+              ((none) "/* print: missing argument */"))))
+        ;; min: (min a b) -> ((a) < (b) ? (a) : (b))
+        ((string-eq fn-name "min")
+          (if (< len 3)
+            "/* min: need 2 arguments */"
+            (match (list-get items 1)
+              ((some a-expr)
+                (match (list-get items 2)
+                  ((some b-expr)
+                    (let ((a-c (transpile-expr ctx a-expr))
+                          (b-c (transpile-expr ctx b-expr))
+                          (s1 (string-concat arena "((" a-c))
+                          (s2 (string-concat arena s1 ") < ("))
+                          (s3 (string-concat arena s2 b-c))
+                          (s4 (string-concat arena s3 ") ? ("))
+                          (s5 (string-concat arena s4 a-c))
+                          (s6 (string-concat arena s5 ") : ("))
+                          (s7 (string-concat arena s6 b-c))
+                          (s8 (string-concat arena s7 "))")))
+                      s8))
+                  ((none) "/* min: missing second argument */")))
+              ((none) "/* min: missing first argument */"))))
+        ;; max: (max a b) -> ((a) > (b) ? (a) : (b))
+        ((string-eq fn-name "max")
+          (if (< len 3)
+            "/* max: need 2 arguments */"
+            (match (list-get items 1)
+              ((some a-expr)
+                (match (list-get items 2)
+                  ((some b-expr)
+                    (let ((a-c (transpile-expr ctx a-expr))
+                          (b-c (transpile-expr ctx b-expr))
+                          (s1 (string-concat arena "((" a-c))
+                          (s2 (string-concat arena s1 ") > ("))
+                          (s3 (string-concat arena s2 b-c))
+                          (s4 (string-concat arena s3 ") ? ("))
+                          (s5 (string-concat arena s4 a-c))
+                          (s6 (string-concat arena s5 ") : ("))
+                          (s7 (string-concat arena s6 b-c))
+                          (s8 (string-concat arena s7 "))")))
+                      s8))
+                  ((none) "/* max: missing second argument */")))
+              ((none) "/* max: missing first argument */"))))
+        (else
+      ;; Check if this is a type constructor (record or union instantiation)
+      (match (ctx-lookup-type ctx fn-name)
+        ((some type-entry)
+          (if (. type-entry is-union)
+            ;; Union type: (UnionType (tag value)) -> ((UnionType){ .tag = UnionType_tag, .data.tag = value })
+            (transpile-union-constructor ctx fn-name (. type-entry c-name) items)
+            ;; Record type: emit compound literal
+            (let ((c-name (. type-entry c-name))
+                  (mut args "")
+                  (mut i 1))
+              (while (< i len)
+                (match (list-get items i)
+                  ((some arg)
+                    (let ((arg-c (transpile-expr ctx arg))
+                          ;; Replace bare "none" with compatible empty option struct
+                          (final-arg (if (string-eq arg-c "none")
+                                       "{.has_value = false}"
+                                       arg-c)))
+                      (if (string-eq args "")
+                        (set! args final-arg)
+                        (set! args (ctx-str3 ctx args ", " final-arg)))))
+                  ((none) (do)))
+                (set! i (+ i 1)))
+              (ctx-str5 ctx "(" c-name "){" args "}"))))
+        ((none)
+          ;; Check for built-in type constructors
+          (let ((builtin-c-name (get-builtin-type-c-name fn-name)))
+            (if (> (string-len builtin-c-name) 0)
+              ;; Built-in type constructor - use special handler for correct field order
+              (transpile-builtin-constructor ctx fn-name items)
+              ;; Regular function call
+              (let ((mut args "")
+                    (mut i 1))
+                (while (< i len)
+                  (match (list-get items i)
+                    ((some arg)
+                      (let ((arg-c (transpile-expr ctx arg)))
+                        (if (string-eq args "")
+                          (set! args arg-c)
+                          (set! args (ctx-str3 ctx args ", " arg-c)))))
+                    ((none) (do)))
+                  (set! i (+ i 1)))
+                (transpile-call ctx fn-name args))))))))))
+
+  (fn transpile-print ((ctx (Ptr TranspileContext)) (arg (Ptr SExpr)) (newline Bool))
+    (@intent "Transpile print/println with type-aware formatting")
+    (@spec (((Ptr TranspileContext) (Ptr SExpr) Bool) -> String))
+    (@pre {ctx != nil})
+    (@pre {arg != nil})
+    (let ((arena (. (deref ctx) arena))
+          (nl (if newline "\\n" "")))
+      ;; Check argument type
+      (match (deref arg)
+        ;; String literal - direct printf
+        ((string s)
+          (ctx-str5 ctx "printf(\"%s" nl "\", \"" (. s value) "\")"))
+        ;; Number literal
+        ((number n)
+          ;; Check if float
+          (if (string-contains (. n raw) ".")
+            (ctx-str5 ctx "printf(\"%f" nl "\", " (. n raw) ")")
+            (ctx-str5 ctx "printf(\"%lld" nl "\", (long long)(" (. n raw) "))")))
+        ;; Other expression - check for known types
+        (_
+          (let ((arg-c (transpile-expr ctx arg)))
+            ;; Try to infer type from variable lookup
+            (match (get-expr-type-hint ctx arg)
+              ((some type-hint)
+                (cond
+                  ((or (string-eq type-hint "String") (string-eq type-hint "slop_string"))
+                    ;; String: use %.*s format since not null-terminated
+                    ;; printf("%.*s\n", (int)(arg).len, (arg).data)
+                    (transpile-print-string ctx arg-c nl))
+                  ((or (string-eq type-hint "Bool") (string-eq type-hint "uint8_t"))
+                    (ctx-str5 ctx "printf(\"%s" nl "\", (" arg-c ") ? \"true\" : \"false\")"))
+                  ((or (string-eq type-hint "Float") (string-eq type-hint "double"))
+                    (ctx-str5 ctx "printf(\"%f" nl "\", " arg-c ")"))
+                  (else
+                    ;; Default to integer
+                    (ctx-str5 ctx "printf(\"%lld" nl "\", (long long)(" arg-c "))"))))
+              ;; No type hint - default to integer for now
+              ((none)
+                (ctx-str5 ctx "printf(\"%lld" nl "\", (long long)(" arg-c "))"))))))))
+
+  (fn transpile-print-string ((ctx (Ptr TranspileContext)) (arg-c String) (nl String))
+    (@intent "Generate printf for string type")
+    (@spec (((Ptr TranspileContext) String String) -> String))
+    (let ((arena (. (deref ctx) arena)))
+      ;; printf("%.*s\n", (int)(arg).len, (arg).data)
+      (string-concat arena
+        (string-concat arena
+          (string-concat arena "printf(\"%.*s" nl)
+          (string-concat arena "\", (int)(" arg-c))
+        (string-concat arena ").len, ("
+          (string-concat arena arg-c ").data)")))))
+
+  (fn string-contains ((s String) (substr String))
+    (@intent "Check if string contains substring")
+    (@spec ((String String) -> Bool))
+    (> (count-occurrences s substr) 0))
+
+  (fn get-expr-type-hint ((ctx (Ptr TranspileContext)) (expr (Ptr SExpr)))
+    (@intent "Try to determine expression type from context")
+    (@spec (((Ptr TranspileContext) (Ptr SExpr)) -> (Option String)))
+    (match (deref expr)
+      ((symbol sym)
+        (match (ctx-lookup-var ctx (. sym name))
+          ((some entry) (some (. entry c-type)))
+          ((none) (none))))
+      ;; For list expressions - could be field access or function call
+      ((list lst)
+        (let ((items (. lst items)))
+          (if (>= (list-len items) 1)
+            (match (list-get items 0)
+              ((some head)
+                (match (deref head)
+                  ((symbol head-sym)
+                    (let ((op (. head-sym name)))
+                      (cond
+                        ;; Field access
+                        ((and (string-eq op ".") (>= (list-len items) 3))
+                          (match (list-get items 2)
+                            ((some field-expr)
+                              (match (deref field-expr)
+                                ((symbol field-sym)
+                                  (let ((field-name (. field-sym name)))
+                                    (cond
+                                      ((string-eq field-name "message") (some "slop_string"))
+                                      ((string-eq field-name "name") (some "slop_string"))
+                                      ((string-eq field-name "value") (some "slop_string"))
+                                      ((string-eq field-name "line") (some "int64_t"))
+                                      ((string-eq field-name "col") (some "int64_t"))
+                                      (else (none)))))
+                                (_ (none))))
+                            ((none) (none))))
+                        ;; Function call - check known functions first, then lookup
+                        (else
+                          ;; Check for known string-returning functions first
+                          (cond
+                            ((string-eq op "pretty-print") (some "slop_string"))
+                            ((string-eq op "string-copy") (some "slop_string"))
+                            ((string-eq op "string-concat") (some "slop_string"))
+                            ((string-eq op "int-to-string") (some "slop_string"))
+                            (else
+                              (match (ctx-lookup-func ctx op)
+                                ((some func-entry)
+                                  (if (. func-entry returns-string)
+                                    (some "slop_string")
+                                    (none)))
+                                ((none) (none)))))))))
+                  (_ (none))))
+              ((none) (none)))
+            (none))))
+      (_ (none))))
+
+  (fn transpile-union-constructor ((ctx (Ptr TranspileContext)) (type-name String) (c-type-name String) (items (List (Ptr SExpr))))
+    (@intent "Transpile a union constructor: (UnionType (tag value)) -> ((UnionType){ .tag = UnionType_tag, .data.tag = value })")
+    (@spec (((Ptr TranspileContext) String String (List (Ptr SExpr))) -> String))
+    (@pre {ctx != nil})
+    (let ((arena (. (deref ctx) arena))
+          (len (list-len items)))
+      ;; First argument should be (tag value) or just (tag)
+      (if (< len 2)
+        (ctx-str3 ctx "((" c-type-name "){})")
+        (match (list-get items 1)
+          ((some tag-expr)
+            (match (deref tag-expr)
+              ((list tag-list)
+                (let ((tag-items (. tag-list items)))
+                  ;; Parse: (tag value) or (tag)
+                  (if (< (list-len tag-items) 1)
+                    (ctx-str3 ctx "((" c-type-name "){})")
+                    (match (list-get tag-items 0)
+                      ((some tag-name-expr)
+                        (match (deref tag-name-expr)
+                          ((symbol tag-sym)
+                            (let ((tag-name (. tag-sym name))
+                                  (c-tag-name (to-c-name arena tag-name))
+                                  (c-tag-enum (ctx-str ctx c-type-name (ctx-str ctx "_" c-tag-name))))
+                              ;; Check if there's a value argument
+                              (if (>= (list-len tag-items) 2)
+                                (match (list-get tag-items 1)
+                                  ((some value-expr)
+                                    (let ((value-c (transpile-expr ctx value-expr)))
+                                      (ctx-str ctx "((" (ctx-str ctx c-type-name (ctx-str ctx "){ .tag = " (ctx-str ctx c-tag-enum (ctx-str ctx ", .data." (ctx-str ctx c-tag-name (ctx-str ctx " = " (ctx-str ctx value-c " })"))))))))))
+                                  ((none) (ctx-str ctx "((" (ctx-str ctx c-type-name (ctx-str ctx "){ .tag = " (ctx-str ctx c-tag-enum " })"))))))
+                                ;; No value - just tag
+                                (ctx-str ctx "((" (ctx-str ctx c-type-name (ctx-str ctx "){ .tag = " (ctx-str ctx c-tag-enum " })")))))))
+                          (_ (ctx-str3 ctx "((" c-type-name "){})/* tag not symbol */"))))
+                      ((none) (ctx-str3 ctx "((" c-type-name "){})/* no tag */"))))))
+              ;; Not a list - might be bare symbol like (some x) or (none)
+              ((symbol sym)
+                (let ((tag-name (. sym name))
+                      (c-tag-name (to-c-name arena tag-name))
+                      (c-tag-enum (ctx-str ctx c-type-name (ctx-str ctx "_" c-tag-name))))
+                  (ctx-str ctx "((" (ctx-str ctx c-type-name (ctx-str ctx "){ .tag = " (ctx-str ctx c-tag-enum " })"))))))
+              (_ (ctx-str3 ctx "((" c-type-name "){})/* unknown tag form */"))))
+          ((none) (ctx-str3 ctx "((" c-type-name "){})/* no args */"))))))
+
+  ;; ============================================================
+  ;; Cond Expression (nested ternary)
+  ;; ============================================================
+
+  (fn transpile-cond-expr ((ctx (Ptr TranspileContext)) (items (List (Ptr SExpr))))
+    (@intent "Transpile a cond expression as nested ternary: (cond (t1 v1) (t2 v2) (else v3)) -> t1 ? v1 : t2 ? v2 : v3")
+    (@spec (((Ptr TranspileContext) (List (Ptr SExpr))) -> String))
+    (@pre {ctx != nil})
+    (let ((arena (. (deref ctx) arena))
+          (len (list-len items))
+          (result-type (infer-cond-result-c-type ctx items))
+          (mut result "")
+          (mut i 1))
+      ;; Process each clause (test body...) or (else body...)
+      (while (< i len)
+        (match (list-get items i)
+          ((some clause-expr)
+            (match (deref clause-expr)
+              ((list clause-lst)
+                (let ((clause-items (. clause-lst items))
+                      (clause-len (list-len clause-items)))
+                  (when (>= clause-len 2)
+                    (match (list-get clause-items 0)
+                      ((some test-expr)
+                        (match (deref test-expr)
+                          ;; else clause
+                          ((symbol sym)
+                            (if (string-eq (. sym name) "else")
+                              ;; else clause - get the body value (last expression)
+                              (match (list-get clause-items (- clause-len 1))
+                                ((some body-expr)
+                                  (let ((body-c (transpile-expr ctx body-expr)))
+                                    (set! result (ctx-str ctx result (typed-none ctx result-type body-c)))))
+                                ((none) (set! result (ctx-str ctx result "0"))))
+                              ;; Regular test - evaluate as condition
+                              (let ((test-c (transpile-expr ctx test-expr)))
+                                (match (list-get clause-items (- clause-len 1))
+                                  ((some body-expr)
+                                    (let ((body-c (typed-none ctx result-type (transpile-expr ctx body-expr))))
+                                      (set! result (ctx-str ctx result (ctx-str ctx "(" (ctx-str ctx test-c (ctx-str ctx " ? " (ctx-str ctx body-c " : "))))))))
+                                  ((none) (set! result (ctx-str ctx result (ctx-str ctx "(" (ctx-str ctx test-c " ? 0 : ")))))))))
+                          ;; Non-symbol test
+                          (_
+                            (let ((test-c (transpile-expr ctx test-expr)))
+                              (match (list-get clause-items (- clause-len 1))
+                                ((some body-expr)
+                                  (let ((body-c (typed-none ctx result-type (transpile-expr ctx body-expr))))
+                                    (set! result (ctx-str ctx result (ctx-str ctx "(" (ctx-str ctx test-c (ctx-str ctx " ? " (ctx-str ctx body-c " : "))))))))
+                                ((none) (set! result (ctx-str ctx result (ctx-str ctx "(" (ctx-str ctx test-c " ? 0 : "))))))))))
+                      ((none) (do))))))
+              (else (do))))
+          ((none) (do)))
+        (set! i (+ i 1)))
+      ;; Close any open ternaries with default 0
+      (if (string-eq result "")
+        "0"
+        ;; Count open parens and close them
+        (let ((mut open-count 0)
+              (mut j 0)
+              (rlen (string-len result)))
+          (while (< j (cast Int rlen))
+            (let ((c (char-at result (cast (Int 0 ..) j))))
+              (cond
+                ((== c 40) (set! open-count (+ open-count 1)))  ;; '('
+                ((== c 41) (set! open-count (- open-count 1)))  ;; ')'
+                (else (do))))
+            (set! j (+ j 1)))
+          ;; Add closing parens for unclosed ternaries
+          (while (> open-count 0)
+            (set! result (ctx-str ctx result ")"))
+            (set! open-count (- open-count 1)))
+          result))))
+
+  ;; ============================================================
+  ;; Match Expression (GCC statement expression)
+  ;; ============================================================
+
+  (fn transpile-match-expr ((ctx (Ptr TranspileContext)) (items (List (Ptr SExpr))))
+    (@intent "Transpile a match expression, returning a GCC statement expression string")
+    (@spec (((Ptr TranspileContext) (List (Ptr SExpr))) -> String))
+    (@pre {ctx != nil})
+    (let ((arena (. (deref ctx) arena))
+          (len (list-len items)))
+      (if (< len 3)
+        "/* invalid match expr */"
+        (match (list-get items 1)
+          ((some scrutinee)
+            (let ((scrutinee-c (transpile-expr ctx scrutinee))
+                  (patterns (collect-match-patterns ctx items)))
+              (cond
+                ((is-option-patterns patterns)
+                  (build-option-match-expr ctx scrutinee-c items))
+                ((is-result-patterns patterns)
+                  (build-result-match-expr ctx scrutinee-c items))
+                ((is-union-expr-patterns ctx patterns)
+                  (build-union-match-expr ctx scrutinee-c items))
+                (else
+                  (build-ternary-match-expr ctx scrutinee-c items)))))
+          ((none) "/* missing match scrutinee */")))))
+
+  (fn collect-match-patterns ((ctx (Ptr TranspileContext)) (items (List (Ptr SExpr))))
+    (@intent "Collect pattern expressions from match branches")
+    (@spec (((Ptr TranspileContext) (List (Ptr SExpr))) -> (List (Ptr SExpr))))
+    (@pre {ctx != nil})
+    (let ((arena (. (deref ctx) arena))
+          (len (list-len items))
+          (mut result (list-new arena (Ptr SExpr)))
+          (mut i 2))
+      (while (< i len)
+        (match (list-get items i)
+          ((some branch)
+            (match (deref branch)
+              ((list branch-lst)
+                (let ((branch-items (. branch-lst items)))
+                  (when (>= (list-len branch-items) 1)
+                    (match (list-get branch-items 0)
+                      ((some pattern) (list-push result pattern))
+                      ((none) (do))))))
+              (else (do))))
+          ((none) (do)))
+        (set! i (+ i 1)))
+      result))
+
+  (fn get-expr-pattern-tag ((pat-expr (Ptr SExpr)))
+    (@intent "Get the tag from a pattern expression")
+    (@spec (((Ptr SExpr)) -> String))
+    (@pre {pat-expr != nil})
+    (match (deref pat-expr)
+      ((list lst)
+        (let ((items (. lst items)))
+          (if (< (list-len items) 1)
+            ""
+            (match (list-get items 0)
+              ((some head)
+                (match (deref head)
+                  ((symbol sym) (. sym name))
+                  (else "")))
+              ((none) "")))))
+      ((symbol sym) (. sym name))
+      (else "")))
+
+  (fn is-option-patterns ((patterns (List (Ptr SExpr))))
+    (@intent "Check if patterns are option match")
+    (@spec (((List (Ptr SExpr))) -> Bool))
+    (let ((len (list-len patterns))
+          (mut found false)
+          (mut i 0))
+      (while (and (< i len) (not found))
+        (match (list-get patterns i)
+          ((some pat)
+            (let ((tag (get-expr-pattern-tag pat)))
+              (when (or (string-eq tag "some") (string-eq tag "none"))
+                (set! found true))))
+          ((none) (do)))
+        (set! i (+ i 1)))
+      found))
+
+  (fn is-result-patterns ((patterns (List (Ptr SExpr))))
+    (@intent "Check if patterns are result match")
+    (@spec (((List (Ptr SExpr))) -> Bool))
+    (let ((len (list-len patterns))
+          (mut found false)
+          (mut i 0))
+      (while (and (< i len) (not found))
+        (match (list-get patterns i)
+          ((some pat)
+            (let ((tag (get-expr-pattern-tag pat)))
+              (when (or (string-eq tag "ok") (string-eq tag "error"))
+                (set! found true))))
+          ((none) (do)))
+        (set! i (+ i 1)))
+      found))
+
+  (fn is-union-expr-patterns ((ctx (Ptr TranspileContext)) (patterns (List (Ptr SExpr))))
+    (@intent "Check if patterns are union match (tagged union variants)")
+    (@spec (((Ptr TranspileContext) (List (Ptr SExpr))) -> Bool))
+    (@pre {ctx != nil})
+    ;; Union patterns are lists like (variant-name binding) where variant-name
+    ;; is registered as an enum/union variant (and not one of special forms)
+    (let ((len (list-len patterns))
+          (mut has-union-variant false)
+          (mut i 0))
+      (while (and (< i len) (not has-union-variant))
+        (match (list-get patterns i)
+          ((some pat-expr)
+            (let ((tag (get-expr-pattern-tag pat-expr)))
+              ;; Check if it's a registered variant (not special forms)
+              (when (and (not (string-eq tag ""))
+                         (not (string-eq tag "some"))
+                         (not (string-eq tag "none"))
+                         (not (string-eq tag "ok"))
+                         (not (string-eq tag "error"))
+                         (not (string-eq tag "else"))
+                         (not (string-eq tag "_")))
+                (match (ctx-lookup-enum-variant ctx tag)
+                  ((some _) (set! has-union-variant true))
+                  ((none) (do))))))
+          ((none) (do)))
+        (set! i (+ i 1)))
+      has-union-variant))
+
+  (fn get-expr-binding-name ((pat-expr (Ptr SExpr)))
+    (@intent "Extract binding name from pattern like (ok x)")
+    (@spec (((Ptr SExpr)) -> (Option String)))
+    (@pre {pat-expr != nil})
+    (match (deref pat-expr)
+      ((list lst)
+        (let ((items (. lst items)))
+          (if (< (list-len items) 2)
+            none
+            (match (list-get items 1)
+              ((some binding)
+                (match (deref binding)
+                  ((symbol sym) (some (. sym name)))
+                  (else none)))
+              ((none) none)))))
+      (else none)))
+
+  (fn get-match-branch-body ((ctx (Ptr TranspileContext)) (branch-items (List (Ptr SExpr))))
+    (@intent "Get the body expression from a match branch")
+    (@spec (((Ptr TranspileContext) (List (Ptr SExpr))) -> String))
+    (@pre {ctx != nil})
+    (let ((len (list-len branch-items)))
+      (if (< len 2)
+        "0"
+        (match (list-get branch-items (- len 1))
+          ((some body-expr)
+            (transpile-expr ctx body-expr))
+          ((none) "0")))))
+
+  (fn transpile-branch-body-with-binding ((ctx (Ptr TranspileContext)) (branch-items (List (Ptr SExpr)))
+                                          (binding-name String))
+    (@intent "Transpile branch body with proper variable binding in scope")
+    (@spec (((Ptr TranspileContext) (List (Ptr SExpr)) String) -> String))
+    (@pre {ctx != nil})
+    ;; Push scope to contain the binding
+    (ctx-push-scope ctx)
+    ;; Bind the variable if non-empty
+    (when (not (string-eq binding-name ""))
+      (let ((arena (. (deref ctx) arena))
+            (c-name (to-c-name arena binding-name)))
+        (ctx-bind-var ctx (VarEntry binding-name c-name "auto" false false))))
+    ;; Transpile body expression
+    (let ((result (get-match-branch-body ctx branch-items)))
+      ;; Pop scope
+      (ctx-pop-scope ctx)
+      result))
+
+  (fn build-option-match-expr ((ctx (Ptr TranspileContext)) (scrutinee-c String) (items (List (Ptr SExpr))))
+    (@intent "Build Option match as GCC statement expression")
+    (@spec (((Ptr TranspileContext) String (List (Ptr SExpr))) -> String))
+    (@pre {ctx != nil})
+    (let ((arena (. (deref ctx) arena))
+          (len (list-len items))
+          (mut some-body "0")
+          (mut none-body "0")
+          (mut some-binding "")
+          (mut i 2))
+      (while (< i len)
+        (match (list-get items i)
+          ((some branch)
+            (match (deref branch)
+              ((list branch-lst)
+                (let ((branch-items (. branch-lst items)))
+                  (when (>= (list-len branch-items) 2)
+                    (match (list-get branch-items 0)
+                      ((some pattern)
+                        (let ((tag (get-expr-pattern-tag pattern)))
+                          (cond
+                            ((string-eq tag "some")
+                              (match (get-expr-binding-name pattern)
+                                ((some name)
+                                  (set! some-binding name)
+                                  ;; Transpile body with binding in scope
+                                  (set! some-body (transpile-branch-body-with-binding ctx branch-items name)))
+                                ((none)
+                                  ;; No binding - transpile normally
+                                  (set! some-body (get-match-branch-body ctx branch-items)))))
+                            ((string-eq tag "none")
+                              (set! none-body (get-match-branch-body ctx branch-items)))
+                            (else (do)))))
+                      ((none) (do))))))
+              (else (do))))
+          ((none) (do)))
+        (set! i (+ i 1)))
+      ;; Infer result type for proper none handling
+      (let ((result-type (infer-match-result-c-type ctx items)))
+        ;; Build the output string based on whether there's a binding
+        (if (string-eq some-binding "")
+          ;; No binding - use simple ternary
+          (build-option-match-no-binding ctx scrutinee-c some-body none-body result-type)
+          ;; Has binding - use if/else
+          (build-option-match-with-binding ctx arena scrutinee-c some-binding some-body none-body result-type)))))
+
+  (fn build-option-match-no-binding ((ctx (Ptr TranspileContext)) (scrutinee-c String) (some-body String) (none-body String) (result-type String))
+    (@intent "Build Option match without binding using ternary")
+    (@spec (((Ptr TranspileContext) String String String String) -> String))
+    (@pre {ctx != nil})
+    ;; ({ __auto_type _mv = scrutinee; _mv.has_value ? (some_body) : (none_body); })
+    ;; Convert none to typed none if needed
+    (let ((typed-none-body (typed-none ctx result-type none-body))
+          (s1 (ctx-str ctx "({ __auto_type _mv = " scrutinee-c))
+          (s2 (ctx-str ctx s1 "; _mv.has_value ? ("))
+          (s3 (ctx-str ctx s2 some-body))
+          (s4 (ctx-str ctx s3 ") : ("))
+          (s5 (ctx-str ctx s4 typed-none-body))
+          (s6 (ctx-str ctx s5 "); })")))
+      s6))
+
+  (fn build-option-match-with-binding ((ctx (Ptr TranspileContext)) (arena Arena) (scrutinee-c String)
+                                       (binding String) (some-body String) (none-body String) (result-type String))
+    (@intent "Build Option match with binding using ternary for type inference")
+    (@spec (((Ptr TranspileContext) Arena String String String String String) -> String))
+    (@pre {ctx != nil})
+    ;; Use ternary to let compiler infer result type:
+    ;; ({ __auto_type _mv = scrutinee; _mv.has_value ? ({ __auto_type v = _mv.value; some_body; }) : (none_body); })
+    ;; Convert none to typed none if needed
+    (let ((var-c (to-c-name arena binding))
+          (typed-none-body (typed-none ctx result-type none-body))
+          (s1 (ctx-str ctx "({ __auto_type _mv = " scrutinee-c))
+          (s2 (ctx-str ctx s1 "; _mv.has_value ? ({ __auto_type "))
+          (s3 (ctx-str ctx s2 var-c))
+          (s4 (ctx-str ctx s3 " = _mv.value; "))
+          (s5 (ctx-str ctx s4 some-body))
+          (s6 (ctx-str ctx s5 "; }) : ("))
+          (s7 (ctx-str ctx s6 typed-none-body))
+          (s8 (ctx-str ctx s7 "); })")))
+      s8))
+
+  (fn infer-cond-result-c-type ((ctx (Ptr TranspileContext)) (items (List (Ptr SExpr))))
+    (@intent "Infer C result type for cond expression from first clause's body")
+    (@spec (((Ptr TranspileContext) (List (Ptr SExpr))) -> String))
+    (@pre {ctx != nil})
+    ;; Look at first clause (index 1) to determine result type
+    (let ((len (list-len items)))
+      (if (< len 2)
+        "int64_t"
+        (match (list-get items 1)
+          ((some first-clause)
+            (match (deref first-clause)
+              ((list clause-lst)
+                (let ((clause-items (. clause-lst items))
+                      (clause-len (list-len clause-items)))
+                  (if (< clause-len 2)
+                    "int64_t"
+                    ;; Body is last element in clause
+                    (match (list-get clause-items (- clause-len 1))
+                      ((some body-expr)
+                        (infer-expr-c-type ctx body-expr))
+                      ((none) "int64_t")))))
+              (else "int64_t")))
+          ((none) "int64_t")))))
+
+  (fn infer-match-result-c-type ((ctx (Ptr TranspileContext)) (items (List (Ptr SExpr))))
+    (@intent "Infer C result type for match expression from first branch body")
+    (@spec (((Ptr TranspileContext) (List (Ptr SExpr))) -> String))
+    (@pre {ctx != nil})
+    ;; Look at first branch (index 2) to determine result type
+    (let ((len (list-len items)))
+      (if (< len 3)
+        "int64_t"
+        (match (list-get items 2)
+          ((some first-branch)
+            (match (deref first-branch)
+              ((list branch-lst)
+                (let ((branch-items (. branch-lst items))
+                      (branch-len (list-len branch-items)))
+                  (if (< branch-len 2)
+                    "int64_t"
+                    ;; Body is last element
+                    (match (list-get branch-items (- branch-len 1))
+                      ((some body-expr)
+                        (infer-expr-c-type ctx body-expr))
+                      ((none) "int64_t")))))
+              (else "int64_t")))
+          ((none) "int64_t")))))
+
+  (fn infer-expr-c-type ((ctx (Ptr TranspileContext)) (expr (Ptr SExpr)))
+    (@intent "Infer C type of an expression")
+    (@spec (((Ptr TranspileContext) (Ptr SExpr)) -> String))
+    (@pre {ctx != nil})
+    (@pre {expr != nil})
+    (match (deref expr)
+      ;; String literal -> slop_string
+      ((string _) "slop_string")
+      ;; Number -> int64_t or double
+      ((number num)
+        (if (. num is-float) "double" "int64_t"))
+      ;; Symbol -> look up type
+      ((symbol sym)
+        (let ((name (. sym name)))
+          (match (ctx-lookup-var ctx name)
+            ((some entry) (. entry c-type))
+            ((none) "int64_t"))))
+      ;; List -> check for known patterns
+      ((list lst)
+        (let ((items (. lst items)))
+          (if (< (list-len items) 1)
+            "int64_t"
+            (match (list-get items 0)
+              ((some head)
+                (match (deref head)
+                  ((symbol sym)
+                    (let ((op (. sym name)))
+                      (cond
+                        ;; First check function registry - this handles prescanned functions
+                        ((match (ctx-lookup-func ctx op)
+                           ((some func-entry) (. func-entry returns-string))
+                           ((none) false))
+                          "slop_string")
+                        ;; String operations (hardcoded fallback)
+                        ((or (string-eq op "ctx-str")
+                             (or (string-eq op "ctx-str3")
+                                 (or (string-eq op "ctx-str4")
+                                     (or (string-eq op "ctx-str5")
+                                         (or (string-eq op "string-concat")
+                                             (or (string-eq op "substring")
+                                                 (or (string-eq op "to-c-name")
+                                                     (or (string-eq op "to-c-type")
+                                                         (or (string-eq op "to-c-type-prefixed")
+                                                             (or (string-eq op "transpile-expr")
+                                                                 (or (string-eq op "transpile-literal")
+                                                                     (or (string-eq op "ctx-prefix-type")
+                                                                         (or (string-eq op "type-to-identifier")
+                                                                             (or (string-eq op "fix-ternary-none")
+                                                                                (or (string-eq op "transpile-enum-variant")
+                                                                                    (string-eq op "extract-module-name"))))))))))))))))
+                          "slop_string")
+                        ;; Field access - check known string fields
+                        ((string-eq op ".")
+                          (if (< (list-len items) 3)
+                            "int64_t"
+                            (match (list-get items 2)
+                              ((some field-expr)
+                                (match (deref field-expr)
+                                  ((symbol field-sym)
+                                    (let ((field-name (. field-sym name)))
+                                      (cond
+                                        ((or (string-eq field-name "name")
+                                             (or (string-eq field-name "value")
+                                                 (or (string-eq field-name "c-name")
+                                                     (or (string-eq field-name "c-type")
+                                                         (string-eq field-name "message")))))
+                                          "slop_string")
+                                        (else "int64_t"))))
+                                  (else "int64_t")))
+                              ((none) "int64_t"))))
+                        ;; Let expression - infer from body (last element after bindings)
+                        ((or (string-eq op "let") (string-eq op "let*"))
+                          (if (< (list-len items) 3)
+                            "int64_t"
+                            ;; Body is last element
+                            (match (list-get items (- (list-len items) 1))
+                              ((some body) (infer-expr-c-type ctx body))
+                              ((none) "int64_t"))))
+                        ;; Cond expression - infer from first clause's body
+                        ((string-eq op "cond")
+                          (infer-cond-result-c-type ctx items))
+                        ;; Match expression - infer from first branch's body
+                        ((string-eq op "match")
+                          (infer-match-result-c-type ctx items))
+                        ;; If expression - infer from then branch
+                        ((string-eq op "if")
+                          (if (< (list-len items) 3)
+                            "int64_t"
+                            (match (list-get items 2)
+                              ((some then-expr) (infer-expr-c-type ctx then-expr))
+                              ((none) "int64_t"))))
+                        ;; some constructor - infer Option type from value
+                        ((string-eq op "some")
+                          (if (< (list-len items) 2)
+                            "slop_option_int"
+                            (match (list-get items 1)
+                              ((some val-expr)
+                                (let ((val-type (infer-expr-c-type ctx val-expr)))
+                                  (cond
+                                    ((string-eq val-type "slop_string") "slop_option_string")
+                                    ((string-eq val-type "int64_t") "slop_option_int")
+                                    ((string-eq val-type "double") "slop_option_double")
+                                    (else "slop_option_int"))))
+                              ((none) "slop_option_int"))))
+                        ;; none constructor - generic option
+                        ((string-eq op "none")
+                          "slop_option_int")
+                        ;; Function call - check registry for return type
+                        (else
+                          (match (ctx-lookup-func ctx op)
+                            ((some func-entry)
+                              (if (. func-entry returns-string)
+                                "slop_string"
+                                "int64_t"))
+                            ((none) "int64_t"))))))
+                  (else "int64_t")))
+              ((none) "int64_t")))))
+      (else "int64_t")))
+
+  (fn build-result-match-expr ((ctx (Ptr TranspileContext)) (scrutinee-c String) (items (List (Ptr SExpr))))
+    (@intent "Build Result match as GCC statement expression")
+    (@spec (((Ptr TranspileContext) String (List (Ptr SExpr))) -> String))
+    (@pre {ctx != nil})
+    (let ((arena (. (deref ctx) arena))
+          (len (list-len items))
+          (mut ok-body "0")
+          (mut err-body "0")
+          (mut ok-binding "")
+          (mut err-binding "")
+          (mut i 2))
+      (while (< i len)
+        (match (list-get items i)
+          ((some branch)
+            (match (deref branch)
+              ((list branch-lst)
+                (let ((branch-items (. branch-lst items)))
+                  (when (>= (list-len branch-items) 2)
+                    (match (list-get branch-items 0)
+                      ((some pattern)
+                        (let ((tag (get-expr-pattern-tag pattern)))
+                          (cond
+                            ((string-eq tag "ok")
+                              (match (get-expr-binding-name pattern)
+                                ((some name)
+                                  (set! ok-binding name)
+                                  ;; Transpile body with binding in scope
+                                  (set! ok-body (transpile-branch-body-with-binding ctx branch-items name)))
+                                ((none)
+                                  ;; No binding - transpile normally
+                                  (set! ok-body (get-match-branch-body ctx branch-items)))))
+                            ((string-eq tag "error")
+                              (match (get-expr-binding-name pattern)
+                                ((some name)
+                                  (set! err-binding name)
+                                  ;; Transpile body with binding in scope
+                                  (set! err-body (transpile-branch-body-with-binding ctx branch-items name)))
+                                ((none)
+                                  ;; No binding - transpile normally
+                                  (set! err-body (get-match-branch-body ctx branch-items)))))
+                            (else (do)))))
+                      ((none) (do))))))
+              (else (do))))
+          ((none) (do)))
+        (set! i (+ i 1)))
+      ;; Build GCC statement expression with if/else
+      ;; ({ __auto_type _mv = scrutinee; __auto_type _mr;
+      ;;    if (_mv.is_ok) { ok_bind _mr = ok_body; } else { err_bind _mr = err_body; } _mr; })
+      (let ((ok-bind (if (string-eq ok-binding "")
+                        ""
+                        (ctx-str3 ctx "__auto_type " (to-c-name arena ok-binding) " = _mv.data.ok; ")))
+            (err-bind (if (string-eq err-binding "")
+                         ""
+                         (ctx-str3 ctx "__auto_type " (to-c-name arena err-binding) " = _mv.data.err; "))))
+        (ctx-str ctx
+          (ctx-str ctx "({ __auto_type _mv = " scrutinee-c)
+          (ctx-str ctx "; int64_t _mr; if (_mv.is_ok) { "
+            (ctx-str ctx ok-bind
+              (ctx-str ctx "_mr = "
+                (ctx-str ctx ok-body
+                  (ctx-str ctx "; } else { "
+                    (ctx-str ctx err-bind
+                      (ctx-str ctx "_mr = "
+                        (ctx-str ctx err-body "; } _mr; })"))))))))))))
+
+  (fn build-union-match-expr ((ctx (Ptr TranspileContext)) (scrutinee-c String) (items (List (Ptr SExpr))))
+    (@intent "Build union (tagged union) match as GCC statement expression with switch")
+    (@spec (((Ptr TranspileContext) String (List (Ptr SExpr))) -> String))
+    (@pre {ctx != nil})
+    ;; Generate: ({ __auto_type _mv = scrutinee; <type> _mr = {0};
+    ;;              switch (_mv.tag) { case T_v: { __auto_type b = _mv.data.v; _mr = body; break; } ... } _mr; })
+    (let ((arena (. (deref ctx) arena))
+          (len (list-len items))
+          (result-type (infer-match-result-c-type ctx items))
+          (mut cases "")
+          (mut i 2))
+      ;; Build switch cases
+      (while (< i len)
+        (match (list-get items i)
+          ((some branch)
+            (match (deref branch)
+              ((list branch-lst)
+                (let ((branch-items (. branch-lst items)))
+                  (when (>= (list-len branch-items) 2)
+                    (match (list-get branch-items 0)
+                      ((some pattern)
+                        (set! cases (build-union-case-expr ctx arena cases pattern branch-items result-type)))
+                      ((none) (do))))))
+              (else (do))))
+          ((none) (do)))
+        (set! i (+ i 1)))
+      ;; Build the full expression with inferred result type
+      (let ((s1 (ctx-str ctx "({ __auto_type _mv = " scrutinee-c))
+            (s2 (ctx-str ctx s1 (ctx-str ctx "; " (ctx-str ctx result-type " _mr = {0}; switch (_mv.tag) { "))))
+            (s3 (ctx-str ctx s2 cases))
+            (s4 (ctx-str ctx s3 " } _mr; })")))
+        s4)))
+
+  (fn typed-none ((ctx (Ptr TranspileContext)) (result-type String) (body String))
+    (@intent "Convert 'none' to typed none if result type is an Option type")
+    (@spec (((Ptr TranspileContext) String String) -> String))
+    (@pre {ctx != nil})
+    (if (and (string-eq body "none")
+             (starts-with result-type "slop_option_"))
+      (ctx-str3 ctx "(" result-type "){.has_value = false}")
+      body))
+
+  (fn build-union-case-expr ((ctx (Ptr TranspileContext)) (arena Arena) (cases String)
+                             (pattern (Ptr SExpr)) (branch-items (List (Ptr SExpr))) (result-type String))
+    (@intent "Build a single union case for expression-level match")
+    (@spec (((Ptr TranspileContext) Arena String (Ptr SExpr) (List (Ptr SExpr)) String) -> String))
+    (@pre {ctx != nil})
+    (let ((tag (get-expr-pattern-tag pattern)))
+      (cond
+        ((or (string-eq tag "else") (string-eq tag "_"))
+          ;; Default case
+          (let ((body (typed-none ctx result-type (get-match-branch-body ctx branch-items))))
+            (ctx-str ctx cases (ctx-str3 ctx "default: { _mr = " body "; break; } "))))
+        (else
+          ;; Regular variant case
+          (match (ctx-lookup-enum-variant ctx tag)
+            ((some type-name)
+              (let ((case-label (ctx-str4 ctx type-name "_" tag ""))
+                    (binding-opt (get-expr-binding-name pattern)))
+                (match binding-opt
+                  ((some binding-name)
+                    ;; Has binding - need to bind variable and transpile body with scope
+                    (let ((c-binding (to-c-name arena binding-name))
+                          (body (typed-none ctx result-type (transpile-branch-body-with-binding ctx branch-items binding-name)))
+                          (s1 (ctx-str ctx cases "case "))
+                          (s2 (ctx-str ctx s1 case-label))
+                          (s3 (ctx-str ctx s2 ": { __auto_type "))
+                          (s4 (ctx-str ctx s3 c-binding))
+                          (s5 (ctx-str ctx s4 " = _mv.data."))
+                          (s6 (ctx-str ctx s5 tag))
+                          (s7 (ctx-str ctx s6 "; _mr = "))
+                          (s8 (ctx-str ctx s7 body))
+                          (s9 (ctx-str ctx s8 "; break; } ")))
+                      s9))
+                  ((none)
+                    ;; No binding
+                    (let ((body (typed-none ctx result-type (get-match-branch-body ctx branch-items)))
+                          (s1 (ctx-str ctx cases "case "))
+                          (s2 (ctx-str ctx s1 case-label))
+                          (s3 (ctx-str ctx s2 ": { _mr = "))
+                          (s4 (ctx-str ctx s3 body))
+                          (s5 (ctx-str ctx s4 "; break; } ")))
+                      s5)))))
+            ((none) cases))))))
+
+  (fn build-ternary-match-expr ((ctx (Ptr TranspileContext)) (scrutinee-c String) (items (List (Ptr SExpr))))
+    (@intent "Build match as ternary chain for literals/enums")
+    (@spec (((Ptr TranspileContext) String (List (Ptr SExpr))) -> String))
+    (@pre {ctx != nil})
+    ;; For exhaustive matches (no else), use last branch as default to avoid type mismatch
+    ;; Build chain in reverse: last branch becomes innermost fallback
+    (let ((arena (. (deref ctx) arena))
+          (len (list-len items))
+          (mut result "")
+          (mut has-else false)
+          (mut first-branch true)
+          (mut i (- len 1)))
+      (while (>= i 2)
+        (match (list-get items i)
+          ((some branch)
+            (match (deref branch)
+              ((list branch-lst)
+                (let ((branch-items (. branch-lst items)))
+                  (when (>= (list-len branch-items) 2)
+                    (match (list-get branch-items 0)
+                      ((some pattern)
+                        (let ((tag (get-expr-pattern-tag pattern))
+                              (body (get-match-branch-body ctx branch-items)))
+                          (cond
+                            ;; else/_ clause - use as default
+                            ((or (string-eq tag "else") (string-eq tag "_"))
+                              (set! result body)
+                              (set! has-else true)
+                              (set! first-branch false))
+                            ;; First non-else branch in reverse order - use as default for exhaustive matches
+                            (first-branch
+                              (set! result body)
+                              (set! first-branch false))
+                            ;; Subsequent branches - wrap in ternary
+                            (else
+                              (let ((pattern-c (transpile-expr ctx pattern)))
+                                ;; Build: ((scrutinee == pattern) ? body : result)
+                                (set! result (ctx-str ctx
+                                  (ctx-str ctx "((" scrutinee-c)
+                                  (ctx-str ctx " == "
+                                    (ctx-str ctx pattern-c
+                                      (ctx-str ctx ") ? "
+                                        (ctx-str ctx body
+                                          (ctx-str ctx " : " (ctx-str ctx result ")")))))))))))))
+                      ((none) (do))))))
+              (else (do))))
+          ((none) (do)))
+        (set! i (- i 1)))
+      ;; If no branches at all, return 0
+      (if (string-eq result "")
+        "0"
+        result)))
+
+  ;; ============================================================
+  ;; Expression-position statement forms (GCC statement expressions)
+  ;; ============================================================
+
+  (fn transpile-let-expr ((ctx (Ptr TranspileContext)) (items (List (Ptr SExpr))))
+    (@intent "Transpile let as expression using GCC statement expression")
+    (@spec (((Ptr TranspileContext) (List (Ptr SExpr))) -> String))
+    (@pre {ctx != nil})
+    ;; (let ((bindings...)) body...) -> ({ binding1; binding2; ...; result; })
+    (let ((arena (. (deref ctx) arena))
+          (len (list-len items)))
+      (if (< len 3)
+        "({ 0; })"
+        (match (list-get items 1)
+          ((some bindings-expr)
+            (match (deref bindings-expr)
+              ((list bindings-lst)
+                (let ((mut result "({ ")
+                      (bindings-items (. bindings-lst items))
+                      (bindings-len (list-len bindings-items))
+                      (mut bi 0))
+                  ;; Emit bindings
+                  (while (< bi bindings-len)
+                    (match (list-get bindings-items bi)
+                      ((some binding)
+                        (let ((binding-c (transpile-binding-expr ctx binding)))
+                          (set! result (ctx-str3 ctx result binding-c " "))))
+                      ((none) (do)))
+                    (set! bi (+ bi 1)))
+                  ;; Emit body expressions (all but last as statements)
+                  (let ((mut i 2))
+                    (while (< i (- len 1))
+                      (match (list-get items i)
+                        ((some body-expr)
+                          (let ((body-c (transpile-expr ctx body-expr)))
+                            (set! result (ctx-str3 ctx result body-c "; "))))
+                        ((none) (do)))
+                      (set! i (+ i 1)))
+                    ;; Last body expression is the result
+                    (match (list-get items (- len 1))
+                      ((some last-expr)
+                        (let ((last-c (transpile-expr ctx last-expr)))
+                          (ctx-str3 ctx result last-c "; })")))
+                      ((none) (ctx-str ctx result "0; })"))))))
+              (else "({ 0; })")))
+          ((none) "({ 0; })")))))
+
+  (fn transpile-binding-expr ((ctx (Ptr TranspileContext)) (binding (Ptr SExpr)))
+    (@intent "Transpile a single let binding for expression context")
+    (@spec (((Ptr TranspileContext) (Ptr SExpr)) -> String))
+    (@pre {ctx != nil})
+    (@pre {binding != nil})
+    (let ((arena (. (deref ctx) arena)))
+      (match (deref binding)
+        ((list lst)
+          (let ((items (. lst items))
+                (len (list-len items)))
+            (if (< len 2)
+              ""
+              ;; Check for mut: (mut name init) or (mut name Type init)
+              (let ((has-mut (binding-has-mut items))
+                    (name-idx (if has-mut 1 0)))
+                (match (list-get items name-idx)
+                  ((some name-expr)
+                    (match (deref name-expr)
+                      ((symbol name-sym)
+                        (let ((var-name (to-c-name arena (. name-sym name)))
+                              ;; Determine init index: (name init) or (name Type init) or (mut name init) or (mut name Type init)
+                              (has-type (if has-mut (>= len 4) (>= len 3)))
+                              (type-idx (+ name-idx 1))
+                              (init-idx (if has-mut (if has-type 3 2) (if has-type 2 1))))
+                          ;; Use explicit type if provided, otherwise __auto_type
+                          (if has-type
+                            (match (list-get items type-idx)
+                              ((some type-expr)
+                                (let ((c-type (to-c-type-prefixed ctx type-expr)))
+                                  (match (list-get items init-idx)
+                                    ((some init-expr)
+                                      ;; Check if init is (some ...) and use annotated type
+                                      (let ((init-c (transpile-typed-init ctx init-expr c-type)))
+                                        (ctx-str5 ctx c-type " " (ctx-str3 ctx var-name " = " init-c) ";" "")))
+                                    ((none) (ctx-str5 ctx c-type " " var-name " = {0};" "")))))
+                              ((none)
+                                (match (list-get items init-idx)
+                                  ((some init-expr)
+                                    (let ((init-c (transpile-expr ctx init-expr)))
+                                      (ctx-str5 ctx "__auto_type " var-name " = " init-c ";")))
+                                  ((none) (ctx-str3 ctx "__auto_type " var-name " = 0;")))))
+                            ;; No explicit type - use __auto_type
+                            (match (list-get items init-idx)
+                              ((some init-expr)
+                                (let ((init-c (transpile-expr ctx init-expr)))
+                                  (ctx-str5 ctx "__auto_type " var-name " = " init-c ";")))
+                              ((none) (ctx-str3 ctx "__auto_type " var-name " = 0;"))))))
+                      (else "")))
+                  ((none) ""))))))
+        (else ""))))
+
+  (fn binding-has-mut ((items (List (Ptr SExpr))))
+    (@intent "Check if binding starts with mut keyword")
+    (@spec (((List (Ptr SExpr))) -> Bool))
+    (if (< (list-len items) 1)
+      false
+      (match (list-get items 0)
+        ((some first)
+          (match (deref first)
+            ((symbol sym) (string-eq (. sym name) "mut"))
+            (else false)))
+        ((none) false))))
+
+  (fn transpile-typed-init ((ctx (Ptr TranspileContext)) (init-expr (Ptr SExpr)) (target-type String))
+    (@intent "Transpile init expression with known target type (handles some/none)")
+    (@spec (((Ptr TranspileContext) (Ptr SExpr) String) -> String))
+    (@pre {ctx != nil})
+    (@pre {init-expr != nil})
+    ;; Check if init is (some ...) or (none) and target is an Option type
+    (match (deref init-expr)
+      ((list lst)
+        (let ((items (. lst items)))
+          (if (< (list-len items) 1)
+            (transpile-expr ctx init-expr)
+            (match (list-get items 0)
+              ((some head)
+                (match (deref head)
+                  ((symbol sym)
+                    (let ((op (. sym name)))
+                      (cond
+                        ;; (some value) with known Option type
+                        ((string-eq op "some")
+                          (if (< (list-len items) 2)
+                            (transpile-expr ctx init-expr)
+                            (match (list-get items 1)
+                              ((some val-expr)
+                                (let ((val-c (transpile-expr ctx val-expr)))
+                                  ;; Use target type for Option construction
+                                  (ctx-str5 ctx "(" target-type "){.has_value = 1, .value = " val-c "}")))
+                              ((none) (transpile-expr ctx init-expr)))))
+                        ;; (none) with known Option type
+                        ((string-eq op "none")
+                          (ctx-str3 ctx "(" target-type "){.has_value = false}"))
+                        ;; Other expressions - default transpilation
+                        (else (transpile-expr ctx init-expr)))))
+                  (else (transpile-expr ctx init-expr))))
+              ((none) (transpile-expr ctx init-expr))))))
+      (else (transpile-expr ctx init-expr))))
+
+  (fn transpile-while-expr ((ctx (Ptr TranspileContext)) (items (List (Ptr SExpr))))
+    (@intent "Transpile while as expression (side effect only, returns 0)")
+    (@spec (((Ptr TranspileContext) (List (Ptr SExpr))) -> String))
+    (@pre {ctx != nil})
+    ;; (while cond body) -> ({ while (cond) { body; } 0; })
+    (let ((len (list-len items)))
+      (if (< len 3)
+        "({ 0; })"
+        (match (list-get items 1)
+          ((some cond-expr)
+            (let ((cond-c (transpile-expr ctx cond-expr))
+                  (mut body-str ""))
+              ;; Emit body statements
+              (let ((mut i 2))
+                (while (< i len)
+                  (match (list-get items i)
+                    ((some body-expr)
+                      (let ((body-c (transpile-expr ctx body-expr)))
+                        (set! body-str (ctx-str3 ctx body-str body-c "; "))))
+                    ((none) (do)))
+                  (set! i (+ i 1))))
+              ;; Build result string
+              (let ((part1 (ctx-str3 ctx "({ while (" cond-c ") { "))
+                    (part2 (ctx-str ctx body-str "} 0; })")))
+                (ctx-str ctx part1 part2))))
+          ((none) "({ 0; })")))))
+
+  (fn transpile-do-expr ((ctx (Ptr TranspileContext)) (items (List (Ptr SExpr))))
+    (@intent "Transpile do as expression (sequence, returns last value)")
+    (@spec (((Ptr TranspileContext) (List (Ptr SExpr))) -> String))
+    (@pre {ctx != nil})
+    ;; (do e1 e2 ... en) -> ({ e1; e2; ...; en; })
+    (let ((len (list-len items)))
+      (if (<= len 1)
+        "({ 0; })"
+        (let ((mut result "({ ")
+              (mut i 1))
+          (while (< i len)
+            (match (list-get items i)
+              ((some expr)
+                (let ((expr-c (transpile-expr ctx expr))
+                      (is-last (== i (- len 1))))
+                  (set! result (ctx-str3 ctx result expr-c "; "))))
+              ((none) (do)))
+            (set! i (+ i 1)))
+          (ctx-str ctx result "})")))))
+
+  (fn transpile-when-expr ((ctx (Ptr TranspileContext)) (items (List (Ptr SExpr))))
+    (@intent "Transpile when as expression (side effect, returns 0)")
+    (@spec (((Ptr TranspileContext) (List (Ptr SExpr))) -> String))
+    (@pre {ctx != nil})
+    ;; (when cond body...) -> ((cond) ? ({ body...; 0; }) : ({ 0; }))
+    (let ((len (list-len items)))
+      (if (< len 2)
+        "({ 0; })"
+        (match (list-get items 1)
+          ((some cond-expr)
+            (let ((cond-c (transpile-expr ctx cond-expr))
+                  (mut body-c "({ "))
+              ;; Transpile body expressions (items 2..n)
+              (let ((mut i 2))
+                (while (< i len)
+                  (match (list-get items i)
+                    ((some body-expr)
+                      (set! body-c (ctx-str3 ctx body-c (transpile-expr ctx body-expr) "; ")))
+                    ((none) (do)))
+                  (set! i (+ i 1))))
+              (set! body-c (ctx-str ctx body-c "0; })"))
+              (ctx-str5 ctx "((" cond-c ") ? " body-c " : ({ 0; }))")))
+          ((none) "({ 0; })")))))
+
+  (fn transpile-set-expr ((ctx (Ptr TranspileContext)) (items (List (Ptr SExpr))))
+    (@intent "Transpile set! as expression (side effect, returns 0)")
+    (@spec (((Ptr TranspileContext) (List (Ptr SExpr))) -> String))
+    (@pre {ctx != nil})
+    ;; (set! target value) -> ({ target = value; 0; })
+    ;; or (set! (@ arr idx) value) -> ({ arr[idx] = value; 0; })
+    (let ((arena (. (deref ctx) arena))
+          (len (list-len items)))
+      (if (< len 3)
+        "({ 0; })"
+        (match (list-get items 1)
+          ((some target-expr)
+            (match (list-get items 2)
+              ((some val-expr)
+                (let ((val-c (transpile-expr ctx val-expr)))
+                  ;; Check if target is array indexing (@ arr idx)
+                  (match (deref target-expr)
+                    ((list target-lst)
+                      (let ((target-items (. target-lst items)))
+                        (if (< (list-len target-items) 1)
+                          (ctx-str5 ctx "({ " (transpile-expr ctx target-expr) " = " val-c "; 0; })")
+                          (match (list-get target-items 0)
+                            ((some head)
+                              (match (deref head)
+                                ((symbol sym)
+                                  (let ((op (. sym name)))
+                                    (cond
+                                      ;; Array indexing: (@ arr idx) = value
+                                      ((string-eq op "@")
+                                        (if (< (list-len target-items) 3)
+                                          "({ 0; })"
+                                          (match (list-get target-items 1)
+                                            ((some arr-expr)
+                                              (match (list-get target-items 2)
+                                                ((some idx-expr)
+                                                  (let ((arr-c (transpile-expr ctx arr-expr))
+                                                        (idx-c (transpile-expr ctx idx-expr)))
+                                                    (ctx-str ctx "({ " (ctx-str ctx arr-c (ctx-str ctx "[" (ctx-str ctx idx-c (ctx-str ctx "] = " (ctx-str ctx val-c "; 0; })"))))))))
+                                                ((none) "({ 0; })")))
+                                            ((none) "({ 0; })"))))
+                                      ;; Field assignment: (. obj field) = value
+                                      ((string-eq op ".")
+                                        (let ((target-c (transpile-expr ctx target-expr)))
+                                          (ctx-str5 ctx "({ " target-c " = " val-c "; 0; })")))
+                                      (else
+                                        (let ((target-c (transpile-expr ctx target-expr)))
+                                          (ctx-str5 ctx "({ " target-c " = " val-c "; 0; })"))))))
+                                (_ (let ((target-c (transpile-expr ctx target-expr)))
+                                     (ctx-str5 ctx "({ " target-c " = " val-c "; 0; })")))))
+                            ((none) "({ 0; })")))))
+                    ;; Simple variable assignment
+                    ((symbol sym)
+                      (let ((target-c (to-c-name arena (. sym name))))
+                        (ctx-str5 ctx "({ " target-c " = " val-c "; 0; })")))
+                    (else
+                      (let ((target-c (transpile-expr ctx target-expr)))
+                        (ctx-str5 ctx "({ " target-c " = " val-c "; 0; })"))))))
+              ((none) "({ 0; })")))
+          ((none) "({ 0; })")))))
+
+  ;; ============================================================
+  ;; Arena Detection for list-push
+  ;; ============================================================
+
+  (fn get-arena-for-list-push-expr ((ctx (Ptr TranspileContext)) (list-expr (Ptr SExpr)) (list-c String))
+    (@intent "Get arena source for list-push by analyzing list expression")
+    (@spec (((Ptr TranspileContext) (Ptr SExpr) String) -> String))
+    (@pre {ctx != nil})
+    (@pre {list-expr != nil})
+    ;; First priority: check if "arena" variable is in scope (most functions have arena param)
+    (match (ctx-lookup-var ctx "arena")
+      ((some arena-var)
+        ;; arena is in scope - use it directly
+        (. arena-var c-name))
+      ((none)
+        ;; Second priority: check for "ctx" variable which has arena field
+        (match (ctx-lookup-var ctx "ctx")
+          ((some ctx-var)
+            ;; ctx is in scope - use ctx->arena
+            (ctx-str ctx (. ctx-var c-name) "->arena"))
+          ((none)
+            ;; Fallback to "arena" - will error if not available
+            "arena")))))
+
+  (fn get-arena-from-base ((ctx (Ptr TranspileContext)) (base-expr (Ptr SExpr)))
+    (@intent "Extract arena from a base expression - return base->arena or base.arena")
+    (@spec (((Ptr TranspileContext) (Ptr SExpr)) -> String))
+    (@pre {ctx != nil})
+    (@pre {base-expr != nil})
+    (match (deref base-expr)
+      ;; Simple symbol - check if it's a pointer variable
+      ((symbol sym)
+        (let ((var-name (. sym name)))
+          (match (ctx-lookup-var ctx var-name)
+            ((some entry)
+              ;; Check if it's a pointer variable
+              (if (. entry is-pointer)
+                (ctx-str ctx (. entry c-name) "->arena")
+                (ctx-str ctx (. entry c-name) ".arena")))
+            ((none)
+              ;; Unknown variable - assume pointer access
+              (let ((arena (. (deref ctx) arena))
+                    (c-name (to-c-name arena var-name)))
+                (ctx-str ctx c-name "->arena"))))))
+      ;; Deref expression: (deref ptr)
+      ((list lst)
+        (let ((items (. lst items)))
+          (if (< (list-len items) 2)
+            "arena"
+            (match (list-get items 0)
+              ((some head-expr)
+                (match (deref head-expr)
+                  ((symbol sym)
+                    (if (string-eq (. sym name) "deref")
+                      ;; (deref ptr) -> ptr->arena
+                      (match (list-get items 1)
+                        ((some ptr-expr)
+                          (let ((ptr-c (transpile-expr ctx ptr-expr)))
+                            (ctx-str ctx ptr-c "->arena")))
+                        ((none) "arena"))
+                      ;; Not a deref
+                      "arena"))
+                  (else "arena")))
+              ((none) "arena")))))
+      (else "arena")))
+
+  ;; Keep old function for compatibility
+  (fn get-arena-for-list-push ((ctx (Ptr TranspileContext)) (list-c String))
+    (@intent "Get arena source for list-push - use arena from scope")
+    (@spec (((Ptr TranspileContext) String) -> String))
+    (@pre {ctx != nil})
+    ;; Fallback - use arena from scope
+    "arena")
+
+  ;; ============================================================
+  ;; Map Type Helpers
+  ;; ============================================================
+
+  (fn is-ptr-to-ptr-map ((ctx (Ptr TranspileContext)) (expr (Ptr SExpr)))
+    (@intent "Check if expression is a pointer-to-pointer map (Ptr (Map ...)) -> slop_map**")
+    (@spec (((Ptr TranspileContext) (Ptr SExpr)) -> Bool))
+    (@pre {ctx != nil})
+    (@pre {expr != nil})
+    ;; Check if expr is a symbol with type ending in **
+    (match (deref expr)
+      ((symbol sym)
+        (let ((name (. sym name)))
+          (match (ctx-lookup-var ctx name)
+            ((some entry)
+              (let ((c-type (. entry c-type)))
+                (ends-with c-type "**")))
+            ((none) false))))
+      (else false)))
+
+  ;; ============================================================
+  ;; Record-new, List Literal, and Map Operations
+  ;; ============================================================
+
+  (fn transpile-record-new ((ctx (Ptr TranspileContext)) (items (List (Ptr SExpr))))
+    (@intent "Transpile record-new expression to C compound literal")
+    (@spec (((Ptr TranspileContext) (List (Ptr SExpr))) -> String))
+    (@pre {ctx != nil})
+    (let ((arena (. (deref ctx) arena))
+          (len (list-len items)))
+      (if (< len 2)
+        "/* record-new: missing type */"
+        (match (list-get items 1)
+          ((some type-expr)
+            (match (deref type-expr)
+              ;; Named type: (record-new TypeName (field1 val1) ...)
+              ((symbol type-sym)
+                (let ((raw-type-name (. type-sym name))
+                      (type-name (match (ctx-lookup-type ctx raw-type-name)
+                                   ((some entry) (. entry c-name))
+                                   ((none) (ctx-prefix-type ctx (to-c-name arena raw-type-name))))))
+                  (transpile-record-fields ctx type-name items 2)))
+              ;; Inline record type: (record-new (record (f1 T1) (f2 T2)) (f1 v1) (f2 v2))
+              ((list type-lst)
+                (let ((type-items (. type-lst items)))
+                  (if (< (list-len type-items) 1)
+                    "/* record-new: invalid inline type */"
+                    (match (list-get type-items 0)
+                      ((some head)
+                        (match (deref head)
+                          ((symbol head-sym)
+                            (if (string-eq (. head-sym name) "record")
+                              ;; Use to-c-type-prefixed to get the registered typedef name
+                              (let ((type-name (to-c-type-prefixed ctx type-expr)))
+                                (transpile-record-fields ctx type-name items 2))
+                              "/* record-new: expected record keyword */"))
+                          (else "/* record-new: invalid type head */")))
+                      ((none) "/* record-new: empty type */")))))
+              (else "/* record-new: invalid type */")))
+          ((none) "/* record-new: missing type */")))))
+
+  (fn transpile-record-fields ((ctx (Ptr TranspileContext)) (type-name String) (items (List (Ptr SExpr))) (start-idx Int))
+    (@intent "Build field assignments for record compound literal")
+    (@spec (((Ptr TranspileContext) String (List (Ptr SExpr)) Int) -> String))
+    (@pre {ctx != nil})
+    (let ((arena (. (deref ctx) arena))
+          (len (list-len items))
+          (mut result (ctx-str ctx "((" (ctx-str ctx type-name "){")))
+          (mut i start-idx)
+          (mut first true))
+      (while (< i len)
+        (match (list-get items i)
+          ((some field-expr)
+            (match (deref field-expr)
+              ((list field-lst)
+                (let ((field-items (. field-lst items)))
+                  (when (>= (list-len field-items) 2)
+                    (match (list-get field-items 0)
+                      ((some name-expr)
+                        (match (deref name-expr)
+                          ((symbol name-sym)
+                            (match (list-get field-items 1)
+                              ((some val-expr)
+                                (let ((field-name (to-c-name arena (. name-sym name)))
+                                      (field-val (transpile-expr ctx val-expr)))
+                                  (if first
+                                    (set! result (ctx-str ctx result (ctx-str ctx "." (ctx-str ctx field-name (ctx-str ctx " = " field-val)))))
+                                    (set! result (ctx-str ctx result (ctx-str ctx ", ." (ctx-str ctx field-name (ctx-str ctx " = " field-val))))))
+                                  (set! first false)))
+                              ((none) (do))))
+                          (else (do))))
+                      ((none) (do))))))
+              (else (do))))
+          ((none) (do)))
+        (set! i (+ i 1)))
+      (ctx-str ctx result "})")))
+
+  (fn build-inline-struct-type ((ctx (Ptr TranspileContext)) (type-items (List (Ptr SExpr))))
+    (@intent "Build anonymous struct type definition from inline record")
+    (@spec (((Ptr TranspileContext) (List (Ptr SExpr))) -> String))
+    (@pre {ctx != nil})
+    (let ((arena (. (deref ctx) arena))
+          (len (list-len type-items))
+          (mut result "struct { ")
+          (mut i 1))  ;; Skip 'record' keyword
+      (while (< i len)
+        (match (list-get type-items i)
+          ((some field-expr)
+            (match (deref field-expr)
+              ((list field-lst)
+                (let ((field-items (. field-lst items)))
+                  (when (>= (list-len field-items) 2)
+                    (match (list-get field-items 0)
+                      ((some name-expr)
+                        (match (deref name-expr)
+                          ((symbol name-sym)
+                            (match (list-get field-items 1)
+                              ((some type-expr)
+                                (let ((field-name (to-c-name arena (. name-sym name)))
+                                      (field-type (to-c-type-prefixed ctx type-expr)))
+                                  (set! result (ctx-str ctx result (ctx-str ctx field-type (ctx-str ctx " " (ctx-str ctx field-name "; ")))))))
+                              ((none) (do))))
+                          (else (do))))
+                      ((none) (do))))))
+              (else (do))))
+          ((none) (do)))
+        (set! i (+ i 1)))
+      (ctx-str ctx result "}")))
+
+  (fn transpile-inline-record-fields ((ctx (Ptr TranspileContext)) (struct-def String) (items (List (Ptr SExpr))) (start-idx Int))
+    (@intent "Build field assignments for inline record compound literal")
+    (@spec (((Ptr TranspileContext) String (List (Ptr SExpr)) Int) -> String))
+    (@pre {ctx != nil})
+    (let ((arena (. (deref ctx) arena))
+          (len (list-len items))
+          (mut result (ctx-str ctx "((" (ctx-str ctx struct-def "){")))
+          (mut i start-idx)
+          (mut first true))
+      (while (< i len)
+        (match (list-get items i)
+          ((some field-expr)
+            (match (deref field-expr)
+              ((list field-lst)
+                (let ((field-items (. field-lst items)))
+                  (when (>= (list-len field-items) 2)
+                    (match (list-get field-items 0)
+                      ((some name-expr)
+                        (match (deref name-expr)
+                          ((symbol name-sym)
+                            (match (list-get field-items 1)
+                              ((some val-expr)
+                                (let ((field-name (to-c-name arena (. name-sym name)))
+                                      (field-val (transpile-expr ctx val-expr)))
+                                  (if first
+                                    (set! result (ctx-str ctx result (ctx-str ctx "." (ctx-str ctx field-name (ctx-str ctx " = " field-val)))))
+                                    (set! result (ctx-str ctx result (ctx-str ctx ", ." (ctx-str ctx field-name (ctx-str ctx " = " field-val))))))
+                                  (set! first false)))
+                              ((none) (do))))
+                          (else (do))))
+                      ((none) (do))))))
+              (else (do))))
+          ((none) (do)))
+        (set! i (+ i 1)))
+      (ctx-str ctx result "})")))
+
+  (fn transpile-list-literal ((ctx (Ptr TranspileContext)) (items (List (Ptr SExpr))))
+    (@intent "Transpile list literal to inline array")
+    (@spec (((Ptr TranspileContext) (List (Ptr SExpr))) -> String))
+    (@pre {ctx != nil})
+    (let ((arena (. (deref ctx) arena))
+          (len (list-len items)))
+      (if (< len 2)
+        "/* list: missing type */"
+        (match (list-get items 1)
+          ((some type-expr)
+            (let ((elem-type (to-c-type-prefixed ctx type-expr))
+                  (elem-count (- len 2)))
+              ;; Generate: (slop_list_TYPE){.len = N, .cap = N, .data = (TYPE[]){e1, e2, ...}}
+              (let ((type-id (type-to-identifier arena elem-type))
+                    (count-str (int-to-string arena elem-count))
+                    (mut result (ctx-str ctx "((slop_list_" (ctx-str ctx type-id "){")))
+                    (mut data-part (ctx-str ctx ".len = " (ctx-str ctx count-str (ctx-str ctx ", .cap = " (ctx-str ctx count-str (ctx-str ctx ", .data = (" (ctx-str ctx elem-type "[]){")))))))
+                    (mut i 2)
+                    (mut first true))
+                (while (< i len)
+                  (match (list-get items i)
+                    ((some elem-expr)
+                      (let ((elem-c (transpile-expr ctx elem-expr)))
+                        (if first
+                          (set! data-part (ctx-str ctx data-part elem-c))
+                          (set! data-part (ctx-str ctx data-part (ctx-str ctx ", " elem-c))))
+                        (set! first false)))
+                    ((none) (do)))
+                  (set! i (+ i 1)))
+                (ctx-str ctx result (ctx-str ctx data-part "}})")))))
+          ((none) "/* list: missing type */")))))
+
+  (fn transpile-map-new ((ctx (Ptr TranspileContext)) (items (List (Ptr SExpr))))
+    (@intent "Transpile map-new to slop_map_new_ptr")
+    (@spec (((Ptr TranspileContext) (List (Ptr SExpr))) -> String))
+    (@pre {ctx != nil})
+    (let ((len (list-len items)))
+      (if (< len 2)
+        "/* map-new: missing arena */"
+        (match (list-get items 1)
+          ((some arena-expr)
+            (let ((arena-c (transpile-expr ctx arena-expr)))
+              ;; Generate: slop_map_new_ptr(arena, 16)
+              (ctx-str ctx "slop_map_new_ptr(" (ctx-str ctx arena-c ", 16)"))))
+          ((none) "/* map-new: missing arena */")))))
+
+  (fn transpile-map-put ((ctx (Ptr TranspileContext)) (items (List (Ptr SExpr))))
+    (@intent "Transpile map-put to slop_map_put")
+    (@spec (((Ptr TranspileContext) (List (Ptr SExpr))) -> String))
+    (@pre {ctx != nil})
+    (let ((len (list-len items)))
+      (if (< len 4)
+        "/* map-put: needs map, key, val */"
+        (match (list-get items 1)
+          ((some map-expr)
+            (match (list-get items 2)
+              ((some key-expr)
+                (match (list-get items 3)
+                  ((some val-expr)
+                    (let ((map-c (transpile-expr ctx map-expr))
+                          (key-c (transpile-expr ctx key-expr))
+                          (val-c (transpile-expr ctx val-expr))
+                          ;; Check if map is a pointer-to-pointer (Ptr Map -> slop_map**)
+                          (needs-deref (is-ptr-to-ptr-map ctx map-expr)))
+                      ;; slop_map_put expects slop_map*
+                      ;; If we have slop_map**, dereference once
+                      (if needs-deref
+                        (let ((s1 (ctx-str ctx "({ __auto_type _tmp = " val-c))
+                              (s2 (ctx-str ctx s1 "; slop_map_put(NULL, (*"))
+                              (s3 (ctx-str ctx s2 map-c))
+                              (s4 (ctx-str ctx s3 "), "))
+                              (s5 (ctx-str ctx s4 key-c))
+                              (s6 (ctx-str ctx s5 ", &_tmp); })")))
+                          s6)
+                        (let ((s1 (ctx-str ctx "({ __auto_type _tmp = " val-c))
+                              (s2 (ctx-str ctx s1 "; slop_map_put(NULL, "))
+                              (s3 (ctx-str ctx s2 map-c))
+                              (s4 (ctx-str ctx s3 ", "))
+                              (s5 (ctx-str ctx s4 key-c))
+                              (s6 (ctx-str ctx s5 ", &_tmp); })")))
+                          s6))))
+                  ((none) "/* map-put: missing val */")))
+              ((none) "/* map-put: missing key */")))
+          ((none) "/* map-put: missing map */")))))
+
+  (fn transpile-map-get ((ctx (Ptr TranspileContext)) (items (List (Ptr SExpr))))
+    (@intent "Transpile map-get to slop_map_get")
+    (@spec (((Ptr TranspileContext) (List (Ptr SExpr))) -> String))
+    (@pre {ctx != nil})
+    (let ((len (list-len items)))
+      (if (< len 3)
+        "/* map-get: needs map, key */"
+        (match (list-get items 1)
+          ((some map-expr)
+            (match (list-get items 2)
+              ((some key-expr)
+                (let ((map-c (transpile-expr ctx map-expr))
+                      (key-c (transpile-expr ctx key-expr)))
+                  ;; Generate: slop_map_get(MAP, KEY)
+                  (ctx-str ctx "slop_map_get(" (ctx-str ctx map-c (ctx-str ctx ", " (ctx-str ctx key-c ")"))))))
+              ((none) "/* map-get: missing key */")))
+          ((none) "/* map-get: missing map */")))))
+
+  (fn transpile-map-has ((ctx (Ptr TranspileContext)) (items (List (Ptr SExpr))))
+    (@intent "Transpile map-has to check for non-NULL")
+    (@spec (((Ptr TranspileContext) (List (Ptr SExpr))) -> String))
+    (@pre {ctx != nil})
+    (let ((len (list-len items)))
+      (if (< len 3)
+        "/* map-has: needs map, key */"
+        (match (list-get items 1)
+          ((some map-expr)
+            (match (list-get items 2)
+              ((some key-expr)
+                (let ((map-c (transpile-expr ctx map-expr))
+                      (key-c (transpile-expr ctx key-expr)))
+                  ;; Generate: (slop_map_get(MAP, KEY) != NULL)
+                  (ctx-str ctx "(slop_map_get(" (ctx-str ctx map-c (ctx-str ctx ", " (ctx-str ctx key-c ") != NULL)"))))))
+              ((none) "/* map-has: missing key */")))
+          ((none) "/* map-has: missing map */")))))
+
+  (fn transpile-map-keys ((ctx (Ptr TranspileContext)) (items (List (Ptr SExpr))))
+    (@intent "Transpile map-keys to slop_map_keys")
+    (@spec (((Ptr TranspileContext) (List (Ptr SExpr))) -> String))
+    (@pre {ctx != nil})
+    (let ((len (list-len items)))
+      (if (< len 2)
+        "/* map-keys: needs map */"
+        (match (list-get items 1)
+          ((some map-expr)
+            (let ((map-c (transpile-expr ctx map-expr)))
+              ;; Generate: slop_map_keys(arena, MAP)
+              ;; arena is assumed to be in scope
+              (ctx-str ctx "slop_map_keys(arena, " (ctx-str ctx map-c ")"))))
+          ((none) "/* map-keys: missing map */")))))
+
+) ;; end module

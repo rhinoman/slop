@@ -1,0 +1,49 @@
+;; ============================================================
+;; Simple Result type test (no nested match)
+;; ============================================================
+
+(module test-result-simple
+
+  (type TestError (enum
+    not_found
+    invalid_input
+    overflow))
+
+  (fn safe-divide ((a Int) (b Int))
+    (@intent "Divide a by b, returning error if b is zero")
+    (@spec ((Int Int) -> (Result Int TestError)))
+    (if (== b 0)
+      (error (quote overflow))
+      (ok (/ a b))))
+
+  (fn test-ok-result ()
+    (@intent "Test ok result construction")
+    (@spec (() -> Int))
+    (match (safe-divide 10 2)
+      ((ok val) (if (== val 5) 1 0))
+      ((error _) 0)))
+
+  (fn test-error-result ()
+    (@intent "Test error result construction")
+    (@spec (() -> Int))
+    (match (safe-divide 10 0)
+      ((ok _) 0)
+      ((error e) (if (== e (quote overflow)) 1 0))))
+
+  (fn main ()
+    (@intent "Run simple Result type tests")
+    (@spec (() -> Int))
+    (let ((mut passed 0)
+          (mut failed 0))
+
+      (if (== (test-ok-result) 1)
+        (set! passed (+ passed 1))
+        (set! failed (+ failed 1)))
+
+      (if (== (test-error-result) 1)
+        (set! passed (+ passed 1))
+        (set! failed (+ failed 1)))
+
+      (if (== failed 0)
+        0
+        1))))

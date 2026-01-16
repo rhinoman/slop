@@ -1,0 +1,12 @@
+;; Test case: Main module importing from multiple sources
+;; This creates the multi-module scenario that exposed bugs
+
+(module import-main
+  (import import-a (Foo Token))
+  (import import-b (Bar Container))
+
+  (fn main ()
+    (@intent "Entry point for import test")
+    (@spec (() -> Int))
+    0)
+)

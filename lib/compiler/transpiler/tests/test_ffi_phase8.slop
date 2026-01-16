@@ -1,0 +1,88 @@
+;; ============================================================
+;; Phase 8 Tests: FFI declarations and header includes
+;; ============================================================
+
+(module test-ffi-phase8
+
+  ;; ============================================================
+  ;; FFI declarations
+  ;; ============================================================
+
+  ;; Use standard C library functions via FFI
+  (ffi "string.h"
+    (strlen ((s (Ptr U8))) Int)
+    (memset ((s (Ptr U8)) (c Int) (n Int)) (Ptr U8)))
+
+  ;; Use stdio for printf
+  (ffi "stdio.h"
+    (puts ((s (Ptr U8))) Int))
+
+  ;; ============================================================
+  ;; FFI struct declaration (use timespec from time.h)
+  ;; ============================================================
+
+  ;; Note: ffi-struct just tells the transpiler about the type
+  ;; The actual struct definition comes from the C header
+  (ffi-struct "time.h" timespec
+    (tv_sec Int)
+    (tv_nsec Int))
+
+  ;; ============================================================
+  ;; Test functions using FFI
+  ;; ============================================================
+
+  (fn test-strlen ()
+    (@intent "Test calling strlen via FFI")
+    (@spec (() -> Int))
+    (let ((s "hello"))
+      ;; strlen returns 5 for "hello"
+      ;; Use . to get the data pointer from the String struct
+      (if (== (strlen (. s data)) 5)
+        1
+        0)))
+
+  (fn test-memset ()
+    (@intent "Test calling memset via FFI")
+    (@spec (() -> Int))
+    (with-arena 256
+      (let ((buf (arena-alloc arena 16)))
+        ;; Set all bytes to 'A' (65)
+        (memset buf 65 4)
+        ;; Check first byte
+        (if (== (deref buf) 65)
+          1
+          0))))
+
+  (fn test-ffi-function-call ()
+    (@intent "Test that FFI functions are callable")
+    (@spec (() -> Int))
+    ;; Test using strlen again with a different string
+    (let ((s "world"))
+      (if (== (strlen (. s data)) 5)
+        1
+        0)))
+
+  ;; ============================================================
+  ;; Main runner
+  ;; ============================================================
+
+  (fn main ()
+    (@intent "Run Phase 8 FFI tests")
+    (@spec (() -> Int))
+    (let ((mut passed 0)
+          (mut failed 0))
+
+      ;; strlen test
+      (if (== (test-strlen) 1)
+        (set! passed (+ passed 1))
+        (set! failed (+ failed 1)))
+
+      ;; memset test
+      (if (== (test-memset) 1)
+        (set! passed (+ passed 1))
+        (set! failed (+ failed 1)))
+
+      ;; Return 0 if all passed, 1 otherwise
+      (if (== failed 0)
+        0
+        1))))

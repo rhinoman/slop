@@ -1,8 +1,0 @@
-;; Test: Let bindings - should transpile with proper variable declarations
-
-(fn main ()
-  (@intent "Test let bindings")
-  (@spec (() -> Int))
-  (let ((x 42)
-        (y 10))
-    (+ x y)))

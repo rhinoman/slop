@@ -1,0 +1,147 @@
+;; ============================================================
+;; Phase 6 Tests: match expressions
+;; ============================================================
+
+(module test-phase6
+
+  ;; ============================================================
+  ;; Option match tests
+  ;; ============================================================
+
+  (fn test-option-some ()
+    (@intent "Test match on Some value")
+    (@spec (() -> Int))
+    (let ((opt (Option Int) (some 42)))
+      (match opt
+        ((some x) x)
+        ((none) 0))))
+
+  (fn test-option-none ()
+    (@intent "Test match on None value")
+    (@spec (() -> Int))
+    (let ((opt (Option Int) none))
+      (match opt
+        ((some x) x)
+        ((none) -1))))
+
+  (fn test-option-expr ()
+    (@intent "Test match with expression in some branch")
+    (@spec (() -> Int))
+    (let ((opt (Option Int) (some 10)))
+      (match opt
+        ((some x) (* x 2))
+        ((none) 0))))
+
+  (fn make-option ((val Int))
+    (@intent "Helper to create Option")
+    (@spec ((Int) -> (Option Int)))
+    (if (> val 0)
+      (some val)
+      none))
+
+  (fn test-option-from-fn ()
+    (@intent "Test match on Option from function")
+    (@spec (() -> Int))
+    (let ((opt (make-option 5)))
+      (match opt
+        ((some x) (+ x 1))
+        ((none) 0))))
+
+  ;; ============================================================
+  ;; Literal match tests
+  ;; ============================================================
+
+  (fn test-literal-match ((n Int))
+    (@intent "Test literal value matching")
+    (@spec ((Int) -> Int))
+    (match n
+      (0 100)
+      (1 200)
+      (2 300)
+      (else 0)))
+
+  (fn test-literal-first ((n Int))
+    (@intent "Test matching first literal")
+    (@spec ((Int) -> Int))
+    (match n
+      (0 10)
+      (1 20)
+      (else 99)))
+
+  (fn test-literal-else ((n Int))
+    (@intent "Test matching else clause")
+    (@spec ((Int) -> Int))
+    (match n
+      (1 10)
+      (2 20)
+      (else 30)))
+
+  ;; ============================================================
+  ;; Nested match tests (simplified due to statement limitation)
+  ;; ============================================================
+
+  (fn test-match-return ()
+    (@intent "Test match as return expression")
+    (@spec (() -> Int))
+    (let ((opt (Option Int) (some 7)))
+      (match opt
+        ((some x) (+ x 3))
+        ((none) 0))))
+
+  ;; ============================================================
+  ;; Main runner
+  ;; ============================================================
+
+  (fn main ()
+    (@intent "Run Phase 6 match tests")
+    (@spec (() -> Int))
+    (let ((mut passed 0)
+          (mut failed 0))
+
+      ;; Option tests
+      (if (== (test-option-some) 42)
+        (set! passed (+ passed 1))
+        (set! failed (+ failed 1)))
+
+      (if (== (test-option-none) -1)
+        (set! passed (+ passed 1))
+        (set! failed (+ failed 1)))
+
+      (if (== (test-option-expr) 20)
+        (set! passed (+ passed 1))
+        (set! failed (+ failed 1)))
+
+      (if (== (test-option-from-fn) 6)
+        (set! passed (+ passed 1))
+        (set! failed (+ failed 1)))
+
+      ;; Literal tests
+      (if (== (test-literal-match 0) 100)
+        (set! passed (+ passed 1))
+        (set! failed (+ failed 1)))
+
+      (if (== (test-literal-match 1) 200)
+        (set! passed (+ passed 1))
+        (set! failed (+ failed 1)))
+
+      (if (== (test-literal-match 5) 0)
+        (set! passed (+ passed 1))
+        (set! failed (+ failed 1)))
+
+      (if (== (test-literal-first 0) 10)
+        (set! passed (+ passed 1))
+        (set! failed (+ failed 1)))
+
+      (if (== (test-literal-else 99) 30)
+        (set! passed (+ passed 1))
+        (set! failed (+ failed 1)))
+
+      ;; Match return test
+      (if (== (test-match-return) 10)
+        (set! passed (+ passed 1))
+        (set! failed (+ failed 1)))
+
+      ;; Return 0 if all passed, 1 otherwise
+      (if (== failed 0)
+        0
+        1))))

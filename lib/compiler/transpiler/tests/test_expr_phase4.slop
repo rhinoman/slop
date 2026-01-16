@@ -1,0 +1,150 @@
+;; ============================================================
+;; Phase 4 Tests: sizeof, addr, @ expressions
+;; ============================================================
+
+(module test-phase4
+
+  ;; ============================================================
+  ;; sizeof tests
+  ;; ============================================================
+
+  (fn test-sizeof-int ()
+    (@intent "Test sizeof with Int type")
+    (@spec (() -> Int))
+    (sizeof Int))
+
+  (fn test-sizeof-i8 ()
+    (@intent "Test sizeof with I8 type")
+    (@spec (() -> Int))
+    (sizeof I8))
+
+  (fn test-sizeof-u64 ()
+    (@intent "Test sizeof with U64 type")
+    (@spec (() -> Int))
+    (sizeof U64))
+
+  (fn test-sizeof-float ()
+    (@intent "Test sizeof with Float type")
+    (@spec (() -> Int))
+    (sizeof Float))
+
+  (fn test-sizeof-char ()
+    (@intent "Test sizeof with Char type")
+    (@spec (() -> Int))
+    (sizeof Char))
+
+  (fn test-sizeof-ptr ()
+    (@intent "Test sizeof with pointer type")
+    (@spec (() -> Int))
+    (sizeof (Ptr Int)))
+
+  ;; ============================================================
+  ;; addr tests
+  ;; ============================================================
+
+  (fn test-addr-local ((x Int))
+    (@intent "Test addr of local variable")
+    (@spec ((Int) -> (Ptr Int)))
+    (addr x))
+
+  (fn test-addr-deref ((p (Ptr Int)))
+    (@intent "Test addr of dereferenced pointer - should give back p")
+    (@spec (((Ptr Int)) -> (Ptr Int)))
+    (addr (deref p)))
+
+  ;; ============================================================
+  ;; @ array indexing tests
+  ;; ============================================================
+
+  (fn test-index-ptr ((arr (Ptr Int)) (i Int))
+    (@intent "Test array indexing on pointer")
+    (@spec (((Ptr Int) Int) -> Int))
+    (@ arr i))
+
+  (fn test-index-zero ((arr (Ptr Int)))
+    (@intent "Test array indexing at zero")
+    (@spec (((Ptr Int)) -> Int))
+    (@ arr 0))
+
+  (fn test-index-expr ((arr (Ptr Int)) (n Int))
+    (@intent "Test array indexing with expression")
+    (@spec (((Ptr Int) Int) -> Int))
+    (@ arr (- n 1)))
+
+  ;; ============================================================
+  ;; Combined tests
+  ;; ============================================================
+
+  (fn test-addr-and-index ((x Int))
+    (@intent "Get addr of x, then index it at 0 (should give x)")
+    (@spec ((Int) -> Int))
+    (let ((p (addr x)))
+      (@ p 0)))
+
+  (fn test-sizeof-in-alloc ()
+    (@intent "Test sizeof in arena-alloc pattern")
+    (@spec (() -> Int))
+    (with-arena 4096
+      (let ((buf (arena-alloc arena (* 10 (sizeof Int)))))
+        (if (!= buf nil) 1 0))))
+
+  (fn test-sizeof-comparison ()
+    (@intent "Test sizeof in comparison")
+    (@spec (() -> Bool))
+    (> (sizeof Int) (sizeof I8)))
+
+  ;; ============================================================
+  ;; Main runner
+  ;; ============================================================
+
+  (fn main ()
+    (@intent "Run Phase 4 expression tests")
+    (@spec (() -> Int))
+    (let ((mut passed 0)
+          (mut failed 0))
+
+      ;; sizeof tests
+      (if (== (test-sizeof-int) 8)
+        (set! passed (+ passed 1))
+        (set! failed (+ failed 1)))
+
+      (if (== (test-sizeof-i8) 1)
+        (set! passed (+ passed 1))
+        (set! failed (+ failed 1)))
+
+      (if (== (test-sizeof-u64) 8)
+        (set! passed (+ passed 1))
+        (set! failed (+ failed 1)))
+
+      (if (== (test-sizeof-float) 8)
+        (set! passed (+ passed 1))
+        (set! failed (+ failed 1)))
+
+      (if (== (test-sizeof-char) 1)
+        (set! passed (+ passed 1))
+        (set! failed (+ failed 1)))
+
+      ;; Test pointer sizeof (typically 8 on 64-bit)
+      (if (== (test-sizeof-ptr) 8)
+        (set! passed (+ passed 1))
+        (set! failed (+ failed 1)))
+
+      ;; addr + index test
+      (if (== (test-addr-and-index 42) 42)
+        (set! passed (+ passed 1))
+        (set! failed (+ failed 1)))
+
+      ;; sizeof in alloc
+      (if (== (test-sizeof-in-alloc) 1)
+        (set! passed (+ passed 1))
+        (set! failed (+ failed 1)))
+
+      ;; sizeof comparison
+      (if (test-sizeof-comparison)
+        (set! passed (+ passed 1))
+        (set! failed (+ failed 1)))
+
+      ;; Return 0 if all passed, 1 otherwise
+      (if (== failed 0)
+        0
+        1))))
