@@ -25,6 +25,8 @@
                    ctx-set-current-result-type ctx-get-current-result-type ctx-clear-current-result-type
                    ctx-register-option-type ctx-has-option-type ctx-get-option-types OptionType
                    ctx-register-list-type ctx-has-list-type ctx-get-list-types ListType
+                   ctx-register-chan-type ctx-has-chan-type ctx-get-chan-types ChanType
+                   ctx-register-thread-type ctx-has-thread-type ctx-get-thread-types ThreadType
                    ctx-register-result-type-alias ctx-lookup-result-type-alias ResultTypeAlias
                    ctx-get-inline-records InlineRecord
                    ctx-add-import ctx-get-imports
@@ -703,28 +705,62 @@
     (do))
 
   (fn register-ffi-function ((ctx (Ptr TranspileContext)) (func-decl (Ptr SExpr)))
-    (@intent "Register an FFI function declaration")
+    (@intent "Register an FFI function declaration with optional :c-name alias")
     (@spec (((Ptr TranspileContext) (Ptr SExpr)) -> Unit))
     (@pre {ctx != nil})
     (@pre {func-decl != nil})
+    ;; FFI form: (func-name ((param Type)) ReturnType [:c-name actual_c_name])
     (let ((arena (. (deref ctx) arena)))
       (match (deref func-decl)
         ((list lst)
-          (let ((items (. lst items)))
-            (when (>= (list-len items) 1)
+          (let ((items (. lst items))
+                (len (list-len items)))
+            (when (>= len 1)
               ;; First item is function name
               (match (list-get items 0)
                 ((some name-expr)
                   (match (deref name-expr)
                     ((symbol sym)
                       (let ((fn-name (. sym name))
-                            (c-name (to-c-name arena fn-name))
+                            ;; Look for :c-name keyword and extract actual C name
+                            (c-name (extract-ffi-c-name ctx items fn-name))
                             (empty-params (list-new arena (Ptr FuncParamType))))
                         ;; Register as external function (no param types for FFI)
                         (ctx-register-func ctx (FuncEntry fn-name c-name "" true false empty-params))))
                     (else (do))))
                 ((none) (do))))))
         (else (do)))))
+
+  (fn extract-ffi-c-name ((ctx (Ptr TranspileContext)) (items (List (Ptr SExpr))) (fn-name String))
+    (@intent "Extract C name from FFI declaration - use :c-name value if present, else convert fn-name")
+    (@spec (((Ptr TranspileContext) (List (Ptr SExpr)) String) -> String))
+    (@pre {ctx != nil})
+    (let ((arena (. (deref ctx) arena))
+          (len (list-len items))
+          (mut i 0)
+          (mut found-c-name false)
+          (mut c-name ""))
+      ;; Scan for :c-name keyword
+      (while (< i len)
+        (match (list-get items i)
+          ((some item-expr)
+            (match (deref item-expr)
+              ((symbol sym)
+                (when (string-eq (. sym name) ":c-name")
+                  ;; Next item is the actual C name
+                  (match (list-get items (+ i 1))
+                    ((some c-name-expr)
+                      (match (deref c-name-expr)
+                        ((symbol c-sym)
+                          (set! c-name (. c-sym name))
+                          (set! found-c-name true))
+                        (else (do))))
+                    ((none) (do)))))
+              (else (do))))
+          ((none) (do)))
+        (set! i (+ i 1)))
+      ;; Return found C name or convert from SLOP name
+      (if found-c-name c-name (to-c-name arena fn-name))))
 
   (fn prescan-ffi-struct ((ctx (Ptr TranspileContext)) (items (List (Ptr SExpr))))
     (@intent "Prescan an FFI struct declaration with optional :c-name modifier")
@@ -1058,6 +1094,10 @@
                 (emit-list-types-header ctx)
                 ;; Emit pointer-element Option types (only need forward decls)
                 (emit-option-types-header ctx)
+                ;; Emit Chan types (require slop_thread.h)
+                (emit-chan-types-header ctx)
+                ;; Emit Thread types (require slop_thread.h)
+                (emit-thread-types-header ctx)
                 ;; Emit simple type aliases (range types, etc.) before struct types that may use them
                 (emit-simple-type-aliases-header ctx items body-start)
                 ;; Emit simple struct/union types (those without value List/Option fields)
@@ -1190,6 +1230,28 @@
                             (when (>= len 3)
                               (match (list-get items 2)
                                 ((some err) (scan-type-for-generics ctx err))
+                                ((none) (do)))))
+                          ;; Chan type
+                          ((string-eq op "Chan")
+                            (when (>= len 2)
+                              (match (list-get items 1)
+                                ((some elem)
+                                  (let ((elem-c (to-c-type-prefixed ctx elem))
+                                        (elem-id (type-to-identifier arena elem-c))
+                                        (c-name (ctx-str ctx "slop_chan_" elem-id)))
+                                    (ctx-register-chan-type ctx elem-c c-name)
+                                    (scan-type-for-generics ctx elem)))
+                                ((none) (do)))))
+                          ;; Thread type
+                          ((string-eq op "Thread")
+                            (when (>= len 2)
+                              (match (list-get items 1)
+                                ((some result)
+                                  (let ((result-c (to-c-type-prefixed ctx result))
+                                        (result-id (type-to-identifier arena result-c))
+                                        (c-name (ctx-str ctx "slop_thread_" result-id)))
+                                    (ctx-register-thread-type ctx result-c c-name)
+                                    (scan-type-for-generics ctx result)))
                                 ((none) (do)))))
                           (else (do)))))
                     (else (do))))
@@ -1734,8 +1796,10 @@
       ;; #define GUARD_DEFINED
       (ctx-emit ctx (ctx-str ctx "#define " guard-name))
       ;; typedef struct { bool is_ok; union { ok_type ok; err_type err; } data; } NAME;
+      ;; Note: C doesn't allow void in a union, so we use uint8_t as placeholder
       (let ((part1 "typedef struct { bool is_ok; union { ")
-            (part2 (ctx-str3 ctx ok-type " ok; " err-type))
+            (actual-ok-type (if (string-eq ok-type "void") "uint8_t" ok-type))
+            (part2 (ctx-str3 ctx actual-ok-type " ok; " err-type))
             (part3 (ctx-str3 ctx " err; } data; } " c-name ";")))
         (ctx-emit ctx (ctx-str3 ctx part1 part2 part3)))
       ;; #endif
@@ -1770,8 +1834,10 @@
       ;; #define GUARD_DEFINED
       (ctx-emit-header ctx (ctx-str ctx "#define " guard-name))
       ;; typedef struct { bool is_ok; union { ok_type ok; err_type err; } data; } NAME;
+      ;; Note: C doesn't allow void in a union, so we use uint8_t as placeholder
       (let ((part1 "typedef struct { bool is_ok; union { ")
-            (part2 (ctx-str3 ctx ok-type " ok; " err-type))
+            (actual-ok-type (if (string-eq ok-type "void") "uint8_t" ok-type))
+            (part2 (ctx-str3 ctx actual-ok-type " ok; " err-type))
             (part3 (ctx-str3 ctx " err; } data; } " c-name ";")))
         (ctx-emit-header ctx (ctx-str3 ctx part1 part2 part3)))
       ;; #endif
@@ -1931,6 +1997,99 @@
         (or (string-eq name "slop_list_float")
             (or (string-eq name "slop_list_string")
                 (string-eq name "slop_list_ptr")))))
+
+  (fn emit-chan-types-header ((ctx (Ptr TranspileContext)))
+    (@intent "Emit Chan types to header with direct struct definitions")
+    (@spec (((Ptr TranspileContext)) -> Unit))
+    (@pre {ctx != nil})
+    (let ((chan-types (ctx-get-chan-types ctx))
+          (len (list-len chan-types))
+          (mut i 0))
+      (while (< i len)
+        (match (list-get chan-types i)
+          ((some ct)
+            (let ((elem-type (. ct elem-type))
+                  (c-name (. ct c-name)))
+              ;; Skip runtime built-in types
+              (when (not (is-runtime-chan-type c-name))
+                (let ((guard-name (ctx-str3 ctx (uppercase-name ctx c-name) "_DEFINED" "")))
+                  ;; #ifndef GUARD_DEFINED
+                  (ctx-emit-header ctx (ctx-str ctx "#ifndef " guard-name))
+                  ;; #define GUARD_DEFINED
+                  (ctx-emit-header ctx (ctx-str ctx "#define " guard-name))
+                  ;; Emit channel state struct directly
+                  (ctx-emit-header ctx (ctx-str3 ctx "typedef struct " c-name " {"))
+                  (ctx-emit-header ctx "    uint8_t mutex[64];       /* pthread_mutex_t storage */")
+                  (ctx-emit-header ctx "    uint8_t not_empty[64];   /* pthread_cond_t storage */")
+                  (ctx-emit-header ctx "    uint8_t not_full[64];    /* pthread_cond_t storage */")
+                  (ctx-emit-header ctx (ctx-str3 ctx "    " elem-type "* buffer;         /* Ring buffer */"))
+                  (ctx-emit-header ctx "    size_t capacity;         /* Buffer capacity (0 = unbuffered) */")
+                  (ctx-emit-header ctx "    size_t count;            /* Current item count */")
+                  (ctx-emit-header ctx "    size_t head;             /* Read index */")
+                  (ctx-emit-header ctx "    size_t tail;             /* Write index */")
+                  (ctx-emit-header ctx "    bool closed;             /* Channel closed flag */")
+                  (ctx-emit-header ctx (ctx-str3 ctx "} " c-name ";"))
+                  ;; #endif
+                  (ctx-emit-header ctx "#endif")
+                  (ctx-emit-header ctx "")))))
+          ((none) (do)))
+        (set! i (+ i 1)))))
+
+  (fn emit-thread-types-header ((ctx (Ptr TranspileContext)))
+    (@intent "Emit Thread types to header with direct struct definitions and trampoline")
+    (@spec (((Ptr TranspileContext)) -> Unit))
+    (@pre {ctx != nil})
+    (let ((thread-types (ctx-get-thread-types ctx))
+          (len (list-len thread-types))
+          (mut i 0))
+      (while (< i len)
+        (match (list-get thread-types i)
+          ((some tt)
+            (let ((result-type (. tt result-type))
+                  (c-name (. tt c-name)))
+              ;; Skip runtime built-in types
+              (when (not (is-runtime-thread-type c-name))
+                (let ((guard-name (ctx-str3 ctx (uppercase-name ctx c-name) "_DEFINED" ""))
+                      (entry-name (ctx-str ctx c-name "_entry")))
+                  ;; #ifndef GUARD_DEFINED
+                  (ctx-emit-header ctx (ctx-str ctx "#ifndef " guard-name))
+                  ;; #define GUARD_DEFINED
+                  (ctx-emit-header ctx (ctx-str ctx "#define " guard-name))
+                  ;; Emit thread state struct directly
+                  (ctx-emit-header ctx (ctx-str3 ctx "typedef struct " c-name " {"))
+                  (ctx-emit-header ctx "    pthread_t id;            /* pthread handle */")
+                  (ctx-emit-header ctx (ctx-str3 ctx "    " result-type " result;          /* Thread return value */"))
+                  (ctx-emit-header ctx "    void* func;              /* Function pointer */")
+                  (ctx-emit-header ctx "    bool done;               /* Completion flag */")
+                  (ctx-emit-header ctx (ctx-str3 ctx "} " c-name ";"))
+                  ;; Emit trampoline function
+                  (ctx-emit-header ctx (ctx-str3 ctx "static void* " entry-name "(void* arg) {"))
+                  ;; "    slop_thread_int* s = (slop_thread_int*)arg;"
+                  (ctx-emit-header ctx (ctx-str5 ctx "    " c-name "* s = (" c-name "*)arg;"))
+                  ;; "    s->result = ((int64_t(*)(void))(s->func))();"
+                  (ctx-emit-header ctx (ctx-str3 ctx "    s->result = ((" result-type "(*)(void))(s->func))();"))
+                  (ctx-emit-header ctx "    s->done = true;")
+                  (ctx-emit-header ctx "    return NULL;")
+                  (ctx-emit-header ctx "}")
+                  ;; #endif
+                  (ctx-emit-header ctx "#endif")
+                  (ctx-emit-header ctx "")))))
+          ((none) (do)))
+        (set! i (+ i 1)))))
+
+  (fn is-runtime-chan-type ((name String))
+    (@intent "Check if Chan type is already defined in slop_thread.h")
+    (@spec ((String) -> Bool))
+    (or (string-eq name "slop_chan_int64_t")
+        (or (string-eq name "slop_chan_double")
+            (string-eq name "slop_chan_ptr"))))
+
+  (fn is-runtime-thread-type ((name String))
+    (@intent "Check if Thread type is already defined in slop_thread.h")
+    (@spec ((String) -> Bool))
+    (or (string-eq name "slop_thread_int64_t")
+        (or (string-eq name "slop_thread_double")
+            (string-eq name "slop_thread_ptr"))))
 
   (fn uppercase-name ((ctx (Ptr TranspileContext)) (name String))
     (@intent "Convert name to uppercase for use in guard macros")

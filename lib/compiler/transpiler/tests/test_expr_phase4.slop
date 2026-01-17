@@ -28,10 +28,10 @@
     (@spec (() -> Int))
     (sizeof Float))
 
-  (fn test-sizeof-char ()
-    (@intent "Test sizeof with Char type")
+  (fn test-sizeof-u8 ()
+    (@intent "Test sizeof with U8 type")
     (@spec (() -> Int))
-    (sizeof Char))
+    (sizeof U8))
 
   (fn test-sizeof-ptr ()
     (@intent "Test sizeof with pointer type")

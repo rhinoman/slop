@@ -291,6 +291,49 @@
                             (string-concat arena (to-c-type arena inner) "*"))
                           ((none) "void*"))))
 
+                    ;; (Chan T) -> slop_chan_<inner>
+                    ((string-eq head "Chan")
+                      (if (< len 2)
+                        "slop_chan_void"
+                        (match (list-get items 1)
+                          ((some inner)
+                            (let ((inner-c (to-c-type arena inner))
+                                  (inner-id (type-to-identifier arena inner-c)))
+                              (string-concat arena "slop_chan_" inner-id)))
+                          ((none) "slop_chan_void"))))
+
+                    ;; (Thread T) -> slop_thread_<inner>
+                    ((string-eq head "Thread")
+                      (if (< len 2)
+                        "slop_thread_void"
+                        (match (list-get items 1)
+                          ((some inner)
+                            (let ((inner-c (to-c-type arena inner))
+                                  (inner-id (type-to-identifier arena inner-c)))
+                              (string-concat arena "slop_thread_" inner-id)))
+                          ((none) "slop_thread_void"))))
+
+                    ;; (Fn (args...) return) -> return_type(*)(arg_types...)
+                    ((string-eq head "Fn")
+                      (if (< len 2)
+                        "void*"
+                        ;; Return type is the last item
+                        (let ((ret-type (match (list-get items (- len 1))
+                                          ((some ret) (to-c-type arena ret))
+                                          ((none) "void"))))
+                          ;; Build argument list from items 1 to len-2
+                          (if (= len 2)
+                            ;; (Fn RetType) - no args list
+                            (string-concat arena ret-type "(*)(void)")
+                            ;; (Fn (args...) RetType)
+                            (match (list-get items 1)
+                              ((some args-expr)
+                                (let ((args-str (build-fn-args-str arena args-expr)))
+                                  (string-concat arena
+                                    (string-concat arena ret-type "(*)")
+                                    args-str)))
+                              ((none) (string-concat arena ret-type "(*)(void)")))))))
+
                     ;; Default: treat as type name
                     (else
                       (match (builtin-type-c arena head)
@@ -299,5 +342,30 @@
               ;; Not a symbol head
               (_ "void*")))
           ((none) "void*")))))
+
+(fn build-fn-args-str ((arena Arena) (args-expr (Ptr SExpr)))
+  (@intent "Build C function argument string from SLOP Fn args list")
+  (@spec ((Arena (Ptr SExpr)) -> String))
+  (match (deref args-expr)
+    ((list args-list)
+      (let ((arg-items (. args-list items))
+            (arg-count (list-len arg-items)))
+        (if (= arg-count 0)
+          "(void)"
+          ;; Build comma-separated args
+          (let ((mut result "(")
+                (mut i 0))
+            (while (< i arg-count)
+              (match (list-get arg-items i)
+                ((some arg-expr)
+                  (let ((arg-type (to-c-type arena arg-expr)))
+                    (if (> i 0)
+                      (set! result (string-concat arena result (string-concat arena ", " arg-type)))
+                      (set! result (string-concat arena result arg-type)))))
+                ((none) ()))
+              (set! i (+ i 1)))
+            (string-concat arena result ")")))))
+    ;; Not a list - treat as void
+    (_ "(void)")))
 
 ) ;; end module

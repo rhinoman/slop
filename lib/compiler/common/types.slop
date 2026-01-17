@@ -19,9 +19,10 @@
     ;; Predicates
     range-contains is-primitive-kind is-container-kind
     resolved-type-is-pointer resolved-type-is-union resolved-type-is-record
+    resolved-type-is-function
     ;; Accessors
     resolved-type-get-variant-index resolved-type-get-variant-payload
-    resolved-type-has-field
+    resolved-type-has-field resolved-type-get-field-type
     ;; Setters
     resolved-type-set-inner)
 
@@ -404,6 +405,15 @@
     (@post (== $result (== (. (deref t) kind) 'rk-record)))
     (== (. (deref t) kind) 'rk-record))
 
+  (fn resolved-type-is-function ((t (Ptr ResolvedType)))
+    (@intent "Check if resolved type is a function type")
+    (@spec (((Ptr ResolvedType)) -> Bool))
+    (@pure)
+    (@pre (!= t nil))
+    (@post (== $result (== (. (deref t) kind) 'rk-function)))
+    (== (. (deref t) kind) 'rk-function))
+
+
   ;; ============================================================
   ;; Resolved Type Accessors
   ;; ============================================================
@@ -474,4 +484,24 @@
           ((none) (do)))
         (set! i (+ i 1)))
       found))
+
+  (fn resolved-type-get-field-type ((t (Ptr ResolvedType)) (name String))
+    (@intent "Get the type of a field by name, or none if not found")
+    (@spec (((Ptr ResolvedType) String) -> (Option (Ptr ResolvedType))))
+    (@pure)
+    (@pre (!= t nil))
+    (let ((fields (. (deref t) fields))
+          (len (list-len fields))
+          (mut i 0)
+          (mut found false)
+          (mut result (Option (Ptr ResolvedType)) (none)))
+      (while (and (< i len) (not found))
+        (match (list-get fields i)
+          ((some f)
+            (when (string-eq (. f name) name)
+              (set! found true)
+              (set! result (some (. f field-type)))))
+          ((none) (do)))
+        (set! i (+ i 1)))
+      result))
 )

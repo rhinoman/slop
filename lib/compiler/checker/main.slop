@@ -5,22 +5,29 @@
 ;; 1. Collect type definitions
 ;; 2. Resolve imports
 ;; 3. Infer expression types
+;;
+;; Supports multi-file builds with shared type environment.
+;; Outputs JSON with per-module diagnostics.
 ;; ============================================================
 
 (module checker
   (export
-    type-check TypeCheckResult (main 2))
+    type-check type-check-with-env TypeCheckResult (main 2))
 
   (import parser (SExpr parse is-form))
   (import types (TypeError TypeErrorKind type-error-new
                  Diagnostic DiagnosticLevel))
-  (import env (TypeEnv env-new env-get-diagnostics))
+  (import env (TypeEnv env-new env-get-diagnostics env-clear-diagnostics))
   (import collect (collect-module))
   (import resolve (resolve-imports))
   (import infer (infer-fn-body))
   (import file (FileMode FileError File
                 file-open file-close file-read-all))
   (import strlib (cstring-to-string))
+
+  ;; FFI for stdio functions
+  (ffi "stdio.h"
+    (putchar ((c Int)) Int))
 
   ;; ============================================================
   ;; Result Type
@@ -47,6 +54,18 @@
       (check-all-functions env ast)
       ;; Return populated environment
       (ok env)))
+
+  (fn type-check-with-env ((env (Ptr TypeEnv)) (ast (List (Ptr SExpr))))
+    (@intent "Type check an AST using existing environment (for multi-module)")
+    (@spec (((Ptr TypeEnv) (List (Ptr SExpr))) -> Unit))
+    (@pre (!= env nil))
+    (@pre (> (list-len ast) 0))
+    ;; Phase 1: Collect all type and function definitions
+    (collect-module env ast)
+    ;; Phase 2: Resolve imports
+    (resolve-imports env ast)
+    ;; Phase 3: Type check function bodies
+    (check-all-functions env ast))
 
   (fn check-all-functions ((env (Ptr TypeEnv)) (ast (List (Ptr SExpr))))
     (@intent "Type check all function bodies in the AST")
@@ -87,7 +106,100 @@
       (_ (do))))
 
   ;; ============================================================
-  ;; Diagnostic Printing
+  ;; Output Helpers
+  ;; ============================================================
+
+  (fn print-str ((s (Ptr U8)))
+    (@intent "Print null-terminated C string to stdout")
+    (@spec (((Ptr U8)) -> Unit))
+    (@pre (!= s nil))
+    (let ((mut i 0))
+      (while (!= (@ s i) 0)
+        (putchar (cast Int (@ s i)))
+        (set! i (+ i 1))))
+    (do))
+
+  (fn print-string ((s String))
+    (@intent "Print String to stdout")
+    (@spec ((String) -> Unit))
+    (let ((len (cast Int (. s len)))
+          (data (. s data))
+          (mut i 0))
+      (while (< i len)
+        (putchar (cast Int (@ data i)))
+        (set! i (+ i 1))))
+    (do))
+
+  (fn print-json-string ((arena Arena) (s String))
+    (@intent "Print JSON-escaped string with quotes")
+    (@spec ((Arena String) -> Unit))
+    ;; Print opening quote
+    (putchar 34)  ;; "
+    ;; Escape and print content
+    (let ((len (cast Int (. s len)))
+          (data (. s data))
+          (mut i 0))
+      (while (< i len)
+        (let ((c (cast Int (@ data i))))
+          (cond
+            ((== c 34)   ;; " -> \"
+              (putchar 92)
+              (putchar 34))
+            ((== c 92)   ;; \ -> \\
+              (putchar 92)
+              (putchar 92))
+            ((== c 10)   ;; \n -> \n
+              (putchar 92)
+              (putchar 110))
+            ((== c 13)   ;; \r -> \r
+              (putchar 92)
+              (putchar 114))
+            ((== c 9)    ;; \t -> \t
+              (putchar 92)
+              (putchar 116))
+            (else
+              (putchar c))))
+        (set! i (+ i 1))))
+    ;; Print closing quote
+    (putchar 34)
+    (do))
+
+  ;; ============================================================
+  ;; Module Name Extraction
+  ;; ============================================================
+
+  (fn extract-module-name ((exprs (List (Ptr SExpr))))
+    (@intent "Extract module name from parsed expressions")
+    (@spec (((List (Ptr SExpr))) -> String))
+    ;; Look for (module name ...) in first expression
+    (if (< (list-len exprs) 1)
+      "unknown"
+      (match (list-get exprs 0)
+        ((some first-expr)
+          (match (deref first-expr)
+            ((list lst)
+              (let ((items (. lst items)))
+                (if (< (list-len items) 2)
+                  "unknown"
+                  (match (list-get items 0)
+                    ((some head)
+                      (match (deref head)
+                        ((symbol sym)
+                          (if (string-eq (. sym name) "module")
+                            (match (list-get items 1)
+                              ((some name-expr)
+                                (match (deref name-expr)
+                                  ((symbol name-sym) (. name-sym name))
+                                  (_ "unknown")))
+                              ((none) "unknown"))
+                            "unknown"))
+                        (_ "unknown")))
+                    ((none) "unknown")))))
+            (_ "unknown")))
+        ((none) "unknown"))))
+
+  ;; ============================================================
+  ;; Diagnostic Printing (for stderr)
   ;; ============================================================
 
   (fn print-diagnostic ((arena Arena) (filename String) (diag Diagnostic))
@@ -109,85 +221,166 @@
       (println msg)))
 
   ;; ============================================================
+  ;; JSON Output for Multi-Module
+  ;; ============================================================
+
+  (fn output-diagnostics-json ((arena Arena) (diagnostics (List Diagnostic)))
+    (@intent "Output diagnostics as JSON array")
+    (@spec ((Arena (List Diagnostic)) -> Unit))
+    ;; Output array opening
+    (putchar 91)  ;; [
+    (let ((len (list-len diagnostics))
+          (mut i 0))
+      (while (< i len)
+        (when (> i 0)
+          (putchar 44))  ;; ,
+        (match (list-get diagnostics i)
+          ((some diag)
+            (output-single-diagnostic-json arena diag))
+          ((none) (do)))
+        (set! i (+ i 1))))
+    (putchar 93)  ;; ]
+    (do))
+
+  (fn output-single-diagnostic-json ((arena Arena) (diag Diagnostic))
+    (@intent "Output a single diagnostic as JSON object")
+    (@spec ((Arena Diagnostic) -> Unit))
+    (putchar 123)  ;; {
+    ;; level
+    (print-str (cast (Ptr U8) "\"level\":"))
+    (match (. diag level)
+      ('diag-warning (print-str (cast (Ptr U8) "\"warning\"")))
+      ('diag-error (print-str (cast (Ptr U8) "\"error\""))))
+    (putchar 44)  ;; ,
+    ;; line
+    (print-str (cast (Ptr U8) "\"line\":"))
+    (print-string (int-to-string arena (. diag line)))
+    (putchar 44)  ;; ,
+    ;; col
+    (print-str (cast (Ptr U8) "\"col\":"))
+    (print-string (int-to-string arena (. diag col)))
+    (putchar 44)  ;; ,
+    ;; message
+    (print-str (cast (Ptr U8) "\"message\":"))
+    (print-json-string arena (. diag message))
+    (putchar 125)  ;; }
+    (do))
+
+  (fn output-module-json ((arena Arena) (mod-name String) (diagnostics (List Diagnostic)) (first Bool))
+    (@intent "Output JSON for a single module's diagnostics")
+    (@spec ((Arena String (List Diagnostic) Bool) -> Unit))
+    ;; Add comma if not first
+    (when (not first)
+      (putchar 44))  ;; ,
+    ;; Output: "mod-name": {"diagnostics": [...]}
+    (print-json-string arena mod-name)
+    (putchar 58)   ;; :
+    (putchar 123)  ;; {
+    (print-str (cast (Ptr U8) "\"diagnostics\":"))
+    (output-diagnostics-json arena diagnostics)
+    (putchar 125)  ;; }
+    (do))
+
+  ;; ============================================================
+  ;; Single File Processing
+  ;; ============================================================
+
+  (fn check-single-file ((env (Ptr TypeEnv)) (arena Arena) (filename (Ptr U8)) (first Bool))
+    (@intent "Type check a single file using shared environment, output JSON")
+    (@spec (((Ptr TypeEnv) Arena (Ptr U8) Bool) -> Int))
+    (@pre (!= env nil))
+    (@pre (!= filename nil))
+    (let ((filename-str (cstring-to-string filename)))
+      (match (file-open filename-str 'read)
+        ((error e)
+          (do
+            (print-str (cast (Ptr U8) "Error: Could not open file: "))
+            (print-str filename)
+            (putchar 10)
+            1))
+        ((ok f)
+          (match (file-read-all arena (addr f))
+            ((error e)
+              (do
+                (file-close (addr f))
+                (print-str (cast (Ptr U8) "Error: Could not read file: "))
+                (print-str filename)
+                (putchar 10)
+                1))
+            ((ok source)
+              (do
+                (file-close (addr f))
+                (match (parse arena source)
+                  ((ok ast)
+                    (let ((mod-name (extract-module-name ast)))
+                      ;; Clear diagnostics before checking this module
+                      (env-clear-diagnostics env)
+                      ;; Type check with shared env
+                      (type-check-with-env env ast)
+                      ;; Get diagnostics for this module
+                      (let ((diagnostics (env-get-diagnostics env)))
+                        ;; Output JSON for this module
+                        (output-module-json arena mod-name diagnostics first)
+                        ;; Return error count
+                        (count-errors diagnostics))))
+                  ((error parse-err)
+                    (do
+                      (print-str (cast (Ptr U8) "Parse error in "))
+                      (print-str filename)
+                      (print-str (cast (Ptr U8) " at line "))
+                      (print-string (int-to-string arena (. parse-err line)))
+                      (print-str (cast (Ptr U8) ", col "))
+                      (print-string (int-to-string arena (. parse-err col)))
+                      (print-str (cast (Ptr U8) ": "))
+                      (print-string (. parse-err message))
+                      (putchar 10)
+                      1))))))))))
+
+  (fn count-errors ((diagnostics (List Diagnostic)))
+    (@intent "Count number of error diagnostics")
+    (@spec (((List Diagnostic)) -> Int))
+    (let ((len (list-len diagnostics))
+          (mut errors 0)
+          (mut i 0))
+      (while (< i len)
+        (match (list-get diagnostics i)
+          ((some diag)
+            (match (. diag level)
+              ('diag-error (set! errors (+ errors 1)))
+              ('diag-warning (do))))
+          ((none) (do)))
+        (set! i (+ i 1)))
+      errors))
+
+  ;; ============================================================
   ;; Main - CLI Entry Point
   ;; ============================================================
 
   (fn main ((argc Int) (argv (Ptr (Ptr U8))))
-    (@intent "Entry point for the type checker CLI")
+    (@intent "Entry point for the type checker CLI - supports multiple files")
     (@spec ((Int (Ptr (Ptr U8))) -> Int))
     (if (< argc 2)
       (do
-        (println "Usage: slop-checker <file.slop>")
+        (print-str (cast (Ptr U8) "Usage: slop-checker <file.slop> [file2.slop ...]\n"))
         1)
-      (with-arena 2097152
-        (let ((filename (cstring-to-string (@ argv 1))))
-          (match (file-open filename 'read)
-            ((error e)
-              (do
-                (println "Error: Could not open file")
-                1))
-            ((ok f)
-              (match (file-read-all arena (addr f))
-                ((error e)
-                  (do
-                    (file-close (addr f))
-                    (println "Error: Could not read file")
-                    1))
-                ((ok source)
-                  (do
-                    (file-close (addr f))
-                    (match (parse arena source)
-                      ((ok ast)
-                        (match (type-check arena ast)
-                          ((ok env)
-                            (let ((diagnostics (env-get-diagnostics env))
-                                  (num-diags (list-len diagnostics))
-                                  (mut num-warnings 0)
-                                  (mut num-errors 0))
-                              ;; Count and print diagnostics
-                              (for (i 0 num-diags)
-                                (match (list-get diagnostics i)
-                                  ((some diag)
-                                    (do
-                                      (print-diagnostic arena filename diag)
-                                      (match (. diag level)
-                                        ('diag-warning
-                                          (set! num-warnings (+ num-warnings 1)))
-                                        ('diag-error
-                                          (set! num-errors (+ num-errors 1))))))
-                                  ((none) (do))))
-                              ;; Print summary
-                              (if (> num-errors 0)
-                                (do
-                                  (print "Type check failed: ")
-                                  (print num-errors)
-                                  (println " error(s)")
-                                  1)
-                                (if (> num-warnings 0)
-                                  (do
-                                    (print "OK with ")
-                                    (print num-warnings)
-                                    (println " warning(s)")
-                                    0)
-                                  (do
-                                    (println "Type check passed")
-                                    0)))))
-                          ((error err)
-                            (do
-                              (print "Type error at line ")
-                              (print (. err line))
-                              (print ", col ")
-                              (print (. err col))
-                              (print ": ")
-                              (println (. err message))
-                              1))))
-                      ((error parse-err)
-                        (do
-                          (print "Parse error at line ")
-                          (print (. parse-err line))
-                          (print ", col ")
-                          (print (. parse-err col))
-                          (print ": ")
-                          (println (. parse-err message))
-                          1))))))))))))
+      (with-arena 4194304  ;; 4MB arena for multi-file builds
+        ;; Create a single shared environment for all modules
+        (let ((env (env-new arena))
+              (mut total-errors 0))
+          ;; Output JSON object opening
+          (putchar 123)  ;; {
+          ;; Process each input file using the shared environment
+          (let ((mut i 1)
+                (mut first true))
+            (while (< i argc)
+              (let ((filename (@ argv i))
+                    (errors (check-single-file env arena filename first)))
+                (set! total-errors (+ total-errors errors))
+                (set! first false))
+              (set! i (+ i 1))))
+          ;; Output JSON object closing
+          (putchar 125)  ;; }
+          (putchar 10)   ;; newline
+          ;; Return non-zero if any errors
+          (if (> total-errors 0) 1 0)))))
 )

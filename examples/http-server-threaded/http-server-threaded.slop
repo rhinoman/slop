@@ -1,0 +1,163 @@
+;; ============================================================
+;; Multi-Threaded HTTP Server - Worker Pool Pattern
+;;
+;; Demonstrates the thread library with a worker pool:
+;; - Main thread accepts connections and pushes to channel
+;; - Worker threads pull connections from channel and handle them
+;;
+;; Uses a shared buffered channel for work distribution.
+;; ============================================================
+
+(module http-server-threaded
+  (export (main 0))
+
+  ;; Import thread library
+  (import thread (chan-buffered send recv spawn-with-chan ChanError))
+
+  ;; FFI for sockets - use :c-name to alias to actual C functions
+  ;; Channel send/recv from thread import become thread_send/thread_recv in C
+  (ffi "sys/socket.h"
+    (socket ((domain Int) (type Int) (protocol Int)) Int)
+    (bind ((fd Int) (addr (Ptr Void)) (len U32)) Int)
+    (listen ((fd Int) (backlog Int)) Int)
+    (accept ((fd Int) (addr (Ptr Void)) (len (Ptr U32))) Int)
+    (setsockopt ((fd Int) (level Int) (opt Int) (val (Ptr Void)) (len U32)) Int)
+    (sock-recv ((fd Int) (buf (Ptr U8)) (len U64) (flags Int)) I64 :c-name recv)
+    (sock-send ((fd Int) (buf (Ptr Void)) (len U64) (flags Int)) I64 :c-name send))
+
+  (ffi "unistd.h"
+    (close ((fd Int)) Int))
+
+  (ffi "string.h"
+    (strstr ((haystack (Ptr U8)) (needle (Ptr U8))) (Ptr U8))
+    (memset ((ptr (Ptr Void)) (val Int) (len U64)) (Ptr Void)))
+
+  (ffi "arpa/inet.h"
+    (htons ((port U16)) U16))
+
+  ;; Struct mappings for socket addresses
+  (ffi-struct "sys/socket.h" sockaddr
+    (sa_family U16)
+    (sa_data (Array U8 14)))
+
+  (ffi-struct "netinet/in.h" sockaddr_in
+    (sin_family U16)
+    (sin_port U16)
+    (sin_addr (ffi-struct in_addr (s_addr U32)))
+    (sin_zero (Array U8 8)))
+
+  ;; ============================================================
+  ;; HTTP Responses
+  ;; ============================================================
+
+  (fn response-ok ()
+    (@intent "Return 200 OK with greeting")
+    (@spec (() -> String))
+    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 13\r\nConnection: close\r\n\r\nHello, SLOP!")
+
+  (fn response-404 ()
+    (@intent "Return 404 Not Found")
+    (@spec (() -> String))
+    "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found")
+
+  ;; ============================================================
+  ;; Worker Thread
+  ;;
+  ;; Each worker loops forever, receiving client file descriptors
+  ;; from the work channel and handling HTTP requests.
+  ;;
+  ;; The channel is passed as an argument via spawn-with-chan,
+  ;; avoiding the need for global mutable state.
+  ;; ============================================================
+
+  (fn worker ((ch (Ptr (Chan Int))))
+    (@intent "Worker thread that handles HTTP requests from channel")
+    (@spec (((Ptr (Chan Int))) -> Int))
+
+    ;; Loop forever handling requests from the channel
+    (while true
+      (match (recv ch)
+        ((ok client)
+          ;; Handle this client request
+          (with-arena 4096
+            (let ((buf (arena-alloc arena 4096)))
+              ;; Read HTTP request
+              (sock-recv client buf 4095 0)
+
+              ;; Route and send response
+              (let ((resp (if (!= (strstr buf (. "GET /health" data)) nil)
+                            (response-ok)
+                            (response-404))))
+                (sock-send client (cast (Ptr Void) (. resp data)) (. resp len) 0))
+
+              ;; Close client connection
+              (close client))))
+
+        ;; Channel closed (shouldn't happen in this demo)
+        ((error _)
+          (return 0))))
+    0)
+
+  ;; ============================================================
+  ;; Main - Accept Loop with Worker Pool
+  ;; ============================================================
+
+  (fn main ()
+    (@intent "Run multi-threaded HTTP server on port 8080")
+    (@spec (() -> Int))
+
+    ;; Create socket (AF_INET=2, SOCK_STREAM=1)
+    (let ((sock (socket 2 1 0)))
+      (if (< sock 0)
+        (do
+          (println "Failed to create socket")
+          1)
+
+        (with-arena 8192
+          (let ((addr (arena-alloc arena (sizeof sockaddr_in)))
+                (opt (cast (Ptr Int) (arena-alloc arena (sizeof Int)))))
+
+            ;; Set SO_REUSEADDR (SOL_SOCKET=1, SO_REUSEADDR=2)
+            (set! (deref opt) 1)
+            (setsockopt sock 1 2 (cast (Ptr Void) opt) 4)
+
+            ;; Zero out sockaddr_in
+            (memset addr 0 (cast U64 (sizeof sockaddr_in)))
+
+            ;; Configure address (AF_INET=2, INADDR_ANY=0)
+            (set! addr.sin_family 2)
+            (set! addr.sin_port (htons 8080))
+            (set! addr.sin_addr.s_addr 0)
+
+            ;; Bind
+            (if (< (bind sock (cast (Ptr Void) addr) (cast U32 (sizeof sockaddr_in))) 0)
+              (do
+                (println "Failed to bind")
+                (close sock)
+                1)
+
+              (do
+                ;; Listen
+                (listen sock 10)
+
+                ;; Create buffered channel for work queue (capacity 100)
+                (let ((ch (chan-buffered arena 100)))
+                  ;; Spawn worker pool (4 threads), passing channel to each
+                  (spawn-with-chan arena worker ch)
+                  (spawn-with-chan arena worker ch)
+                  (spawn-with-chan arena worker ch)
+                  (spawn-with-chan arena worker ch)
+
+                  (println "Listening on http://localhost:8080")
+                  (println "  GET /health -> 200 OK")
+                  (println "  4 worker threads ready")
+                  (println "  Press Ctrl+C to stop")
+
+                  ;; Accept loop - push client fds to channel
+                  (while true
+                    (let ((client (accept sock nil nil)))
+                      (when (>= client 0)
+                        (send ch client))))
+
+                  0))))))))
+)

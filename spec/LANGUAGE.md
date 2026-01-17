@@ -126,6 +126,10 @@ literal     = number | string | 'true | 'false | 'nil
 (Option T)               ; T or none - sugar for (union (some T) (none))
 (Result T E)             ; Success or error - sugar for (union (ok T) (error E))
 
+; Concurrency types (requires thread library)
+(Chan T)                 ; Typed channel for inter-thread communication
+(Thread T)               ; Thread handle with result type T
+
 ; Type aliases
 (alias Name Type)
 ```
@@ -503,6 +507,8 @@ SLOP                    C
 (Ptr T)                 T*
 (ScopedPtr T)           T* (with cleanup)
 (Fn (A B) -> R)         R (*)(A, B)
+(Chan T)                slop_chan_T (via SLOP_CHAN_DEFINE macro)
+(Thread T)              slop_thread_T (via SLOP_THREAD_DEFINE macro)
 ```
 
 #### Range Type Optimization
@@ -612,6 +618,66 @@ operations (starts-with, contains, trim, parse-int, etc.), import from strlib:
 (import strlib (starts-with ends-with contains trim parse-int float-to-string))
 ```
 
+### 8.1 Concurrency (thread library)
+
+For concurrency primitives, import from the thread library (requires `-lpthread`):
+
+```
+(import thread (chan chan-buffered chan-close send recv try-recv spawn join))
+```
+
+**Types:**
+
+```
+(Chan T)                 ; Typed channel for inter-thread communication
+(Thread T)               ; Thread handle returning T when joined
+
+ChanError                ; Error enum: closed, would-block, send-on-closed
+```
+
+**Channel Operations:**
+
+```
+; Channel creation
+(chan arena) -> (Ptr (Chan T))              ; Unbuffered channel (synchronous)
+(chan-buffered arena capacity) -> (Ptr (Chan T))  ; Buffered channel
+(chan-close ch) -> Unit                     ; Close channel
+
+; Send/receive
+(send ch value) -> (Result Unit ChanError)  ; Blocking send
+(recv ch) -> (Result T ChanError)           ; Blocking receive
+(try-recv ch) -> (Result T ChanError)       ; Non-blocking receive
+```
+
+**Thread Operations:**
+
+```
+(spawn arena func) -> (Ptr (Thread T))      ; Spawn thread running func()
+(join thread) -> T                          ; Wait for thread, return result
+```
+
+**Usage Pattern:**
+
+```lisp
+(with-arena 4096
+  (let ((ch (chan-buffered arena 10)))  ;; Buffered channel for Int
+    (let ((producer (spawn arena (fn ()
+        (for i 1 10 (send ch i))
+        (chan-close ch)
+        0))))
+      ;; Consume in main thread
+      (let ((sum 0))
+        (loop
+          (match (recv ch)
+            ((ok val) (set! sum (+ sum val)))
+            ((error closed) (break))))
+        (join producer)
+        sum))))  ;; Returns 55
+```
+
+**Memory:** All channel and thread allocations use arenas. Channels should be
+created within `with-arena` blocks and will be cleaned up when the arena is freed.
+
 ## 9. FFI
 
 SLOP provides direct access to C libraries through FFI declarations. C libraries are the SLOP ecosystem.
@@ -693,7 +759,31 @@ For C expressions SLOP doesn't model yet:
 (c-inline "((struct foo){.x = 1})")        ; Compound literal
 ```
 
-### 9.4 Build Integration
+### 9.4 FFI-Only Types
+
+#### Char
+
+The `Char` type exists solely for FFI interop with C functions that use `char*`.
+
+In C, `char`, `signed char`, and `unsigned char` are three distinct types:
+- `I8` maps to `int8_t` (typically `signed char`)
+- `U8` maps to `uint8_t` (typically `unsigned char`)
+- `Char` maps to `char` (distinct from both)
+
+Use `(Ptr Char)` when declaring FFI functions that expect `char*`:
+
+```lisp
+;; C stdlib functions require char*, not uint8_t*
+(ffi "stdlib.h"
+  (strtol ((s (Ptr Char)) (endptr (Ptr (Ptr Char))) (base Int)) I64))
+
+;; Calling with a cast from String.data
+(strtol (cast (Ptr Char) (. my-string data)) ...)
+```
+
+**Important:** `Char` should only be used at FFI boundaries. For general SLOP programming, use `U8` for byte data and `String` for text.
+
+### 9.5 Build Integration
 
 Link required libraries when building:
 

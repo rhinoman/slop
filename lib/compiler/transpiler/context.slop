@@ -43,6 +43,10 @@
     OptionType ListType
     ctx-register-option-type ctx-has-option-type ctx-get-option-types
     ctx-register-list-type ctx-has-list-type ctx-get-list-types
+    ;; Chan/Thread type tracking
+    ChanType ThreadType
+    ctx-register-chan-type ctx-has-chan-type ctx-get-chan-types
+    ctx-register-thread-type ctx-has-thread-type ctx-get-thread-types
     ;; Result type alias tracking
     ResultTypeAlias ctx-register-result-type-alias ctx-lookup-result-type-alias
     ;; Inline record tracking
@@ -154,6 +158,10 @@
       (option-types (List OptionType))
       ;; List types to generate
       (list-types (List ListType))
+      ;; Chan types to generate
+      (chan-types (List ChanType))
+      ;; Thread types to generate
+      (thread-types (List ThreadType))
       ;; Type aliases to Result types (for ok/error expression type tracking)
       (result-type-aliases (List ResultTypeAlias))
       ;; Inline record types (anonymous struct types)
@@ -177,6 +185,14 @@
   (type ListType (record
     (elem-type String)    ;; C type of list elements
     (c-name String)))     ;; Generated C type name like slop_list_SExpr_ptr
+
+  (type ChanType (record
+    (elem-type String)    ;; C type of channel elements
+    (c-name String)))     ;; Generated C type name like slop_chan_int
+
+  (type ThreadType (record
+    (result-type String)  ;; C type of thread result
+    (c-name String)))     ;; Generated C type name like slop_thread_int
 
   (type ResultTypeAlias (record
     (alias-name String)   ;; SLOP type alias name (e.g., "ComputeResult")
@@ -223,6 +239,8 @@
       (set! (deref ctx) imported-modules (list-new arena String))
       (set! (deref ctx) option-types (list-new arena OptionType))
       (set! (deref ctx) list-types (list-new arena ListType))
+      (set! (deref ctx) chan-types (list-new arena ChanType))
+      (set! (deref ctx) thread-types (list-new arena ThreadType))
       (set! (deref ctx) result-type-aliases (list-new arena ResultTypeAlias))
       (set! (deref ctx) inline-records (list-new arena InlineRecord))
       (set! (deref ctx) gensym-counter 0)
@@ -255,6 +273,8 @@
       (set! (deref ctx) result-types (list-new arena ResultType))
       (set! (deref ctx) option-types (list-new arena OptionType))
       (set! (deref ctx) list-types (list-new arena ListType))
+      (set! (deref ctx) chan-types (list-new arena ChanType))
+      (set! (deref ctx) thread-types (list-new arena ThreadType))
       (set! (deref ctx) inline-records (list-new arena InlineRecord))
       ;; Set new module name
       (set! (deref ctx) current-module (Option String) (some mod-name))
@@ -783,6 +803,74 @@
     (. (deref ctx) list-types))
 
   ;; ============================================================
+  ;; Chan Type Tracking
+  ;; ============================================================
+
+  (fn ctx-register-chan-type ((ctx (Ptr TranspileContext)) (elem-type String) (c-name String))
+    (@intent "Register a Chan type for generation")
+    (@spec (((Ptr TranspileContext) String String) -> Unit))
+    (@pre {ctx != nil})
+    (when (not (ctx-has-chan-type ctx c-name))
+      (list-push (. (deref ctx) chan-types) (ChanType elem-type c-name))))
+
+  (fn ctx-has-chan-type ((ctx (Ptr TranspileContext)) (c-name String))
+    (@intent "Check if a Chan type is already registered")
+    (@spec (((Ptr TranspileContext) String) -> Bool))
+    (@pre {ctx != nil})
+    (let ((types (. (deref ctx) chan-types))
+          (len (list-len types))
+          (mut i 0)
+          (mut found false))
+      (while (and (< i len) (not found))
+        (match (list-get types i)
+          ((some entry)
+            (when (string-eq (. entry c-name) c-name)
+              (set! found true)))
+          ((none) (do)))
+        (set! i (+ i 1)))
+      found))
+
+  (fn ctx-get-chan-types ((ctx (Ptr TranspileContext)))
+    (@intent "Get all registered Chan types")
+    (@spec (((Ptr TranspileContext)) -> (List ChanType)))
+    (@pre {ctx != nil})
+    (. (deref ctx) chan-types))
+
+  ;; ============================================================
+  ;; Thread Type Tracking
+  ;; ============================================================
+
+  (fn ctx-register-thread-type ((ctx (Ptr TranspileContext)) (result-type String) (c-name String))
+    (@intent "Register a Thread type for generation")
+    (@spec (((Ptr TranspileContext) String String) -> Unit))
+    (@pre {ctx != nil})
+    (when (not (ctx-has-thread-type ctx c-name))
+      (list-push (. (deref ctx) thread-types) (ThreadType result-type c-name))))
+
+  (fn ctx-has-thread-type ((ctx (Ptr TranspileContext)) (c-name String))
+    (@intent "Check if a Thread type is already registered")
+    (@spec (((Ptr TranspileContext) String) -> Bool))
+    (@pre {ctx != nil})
+    (let ((types (. (deref ctx) thread-types))
+          (len (list-len types))
+          (mut i 0)
+          (mut found false))
+      (while (and (< i len) (not found))
+        (match (list-get types i)
+          ((some entry)
+            (when (string-eq (. entry c-name) c-name)
+              (set! found true)))
+          ((none) (do)))
+        (set! i (+ i 1)))
+      found))
+
+  (fn ctx-get-thread-types ((ctx (Ptr TranspileContext)))
+    (@intent "Get all registered Thread types")
+    (@spec (((Ptr TranspileContext)) -> (List ThreadType)))
+    (@pre {ctx != nil})
+    (. (deref ctx) thread-types))
+
+  ;; ============================================================
   ;; Result Type Alias Tracking
   ;; ============================================================
 
@@ -1074,6 +1162,28 @@
                           ((some inner) (set! result (ctx-str ctx (to-c-type-prefixed ctx inner) "*")))
                           ((none) (do)))))
 
+                    ;; (Chan T) -> slop_chan_<inner>
+                    ((string-eq head "Chan")
+                      (set! result "slop_chan_void")
+                      (when (>= len 2)
+                        (match (list-get items 1)
+                          ((some inner)
+                            (let ((inner-c (to-c-type-prefixed ctx inner))
+                                  (inner-id (type-to-identifier arena inner-c)))
+                              (set! result (ctx-str ctx "slop_chan_" inner-id))))
+                          ((none) (do)))))
+
+                    ;; (Thread T) -> slop_thread_<inner>
+                    ((string-eq head "Thread")
+                      (set! result "slop_thread_void")
+                      (when (>= len 2)
+                        (match (list-get items 1)
+                          ((some inner)
+                            (let ((inner-c (to-c-type-prefixed ctx inner))
+                                  (inner-id (type-to-identifier arena inner-c)))
+                              (set! result (ctx-str ctx "slop_thread_" inner-id))))
+                          ((none) (do)))))
+
                     ;; (record (field1 Type1) (field2 Type2) ...) -> _anon_record_<hash>
                     ((string-eq head "record")
                       ;; Build struct field string for hashing and emission
@@ -1107,6 +1217,24 @@
                           (ctx-register-inline-record ctx type-name field-str)
                           (set! result type-name))))
 
+                    ;; (Fn (args...) return) -> return_type(*)(arg_types...)
+                    ((string-eq head "Fn")
+                      (if (< len 2)
+                        (set! result "void*")
+                        ;; Return type is the last item
+                        (let ((ret-type (match (list-get items (- len 1))
+                                          ((some ret) (to-c-type-prefixed ctx ret))
+                                          ((none) "void"))))
+                          (if (= len 2)
+                            ;; (Fn RetType) - no args list
+                            (set! result (ctx-str ctx ret-type "(*)(void)"))
+                            ;; (Fn (args...) RetType)
+                            (match (list-get items 1)
+                              ((some args-expr)
+                                (let ((args-str (build-fn-args-str-prefixed ctx args-expr)))
+                                  (set! result (ctx-str ctx (ctx-str ctx ret-type "(*)") args-str))))
+                              ((none) (set! result (ctx-str ctx ret-type "(*)(void)"))))))))
+
                     ;; Default: treat as type name
                     (else
                       (let ((base-c-type (to-c-type arena first-expr)))
@@ -1124,6 +1252,33 @@
   ;; ============================================================
   ;; Gensym for Unique Variable Names
   ;; ============================================================
+
+  (fn build-fn-args-str-prefixed ((ctx (Ptr TranspileContext)) (args-expr (Ptr SExpr)))
+    (@intent "Build C function argument string from SLOP Fn args list with prefixed types")
+    (@spec (((Ptr TranspileContext) (Ptr SExpr)) -> String))
+    (@pre {ctx != nil})
+    (let ((arena (. (deref ctx) arena)))
+      (match (deref args-expr)
+        ((list args-list)
+          (let ((arg-items (. args-list items))
+                (arg-count (list-len arg-items)))
+            (if (= arg-count 0)
+              "(void)"
+              ;; Build comma-separated args
+              (let ((mut result "(")
+                    (mut i 0))
+                (while (< i arg-count)
+                  (match (list-get arg-items i)
+                    ((some arg-expr)
+                      (let ((arg-type (to-c-type-prefixed ctx arg-expr)))
+                        (if (> i 0)
+                          (set! result (ctx-str ctx result (ctx-str ctx ", " arg-type)))
+                          (set! result (ctx-str ctx result arg-type)))))
+                    ((none) ()))
+                  (set! i (+ i 1)))
+                (ctx-str ctx result ")")))))
+        ;; Not a list - treat as void
+        (_ "(void)"))))
 
   (fn ctx-gensym ((ctx (Ptr TranspileContext)) (prefix String))
     (@intent "Generate a unique variable name with the given prefix")

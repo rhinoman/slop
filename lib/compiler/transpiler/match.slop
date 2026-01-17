@@ -15,11 +15,12 @@
 
   (import types (SExpr SExprList SExprSymbol SExprString SExprNumber))
   (import context (TranspileContext ctx-emit ctx-indent ctx-dedent ctx-push-scope ctx-pop-scope
-                   ctx-bind-var ctx-lookup-var ctx-str ctx-str3 ctx-str4 ctx-str5 VarEntry
-                   ctx-lookup-enum-variant ctx-get-current-return-type ctx-gensym))
-  (import strlib (starts-with char-at))
+                   ctx-bind-var ctx-lookup-var ctx-lookup-type ctx-str ctx-str3 ctx-str4 ctx-str5 VarEntry
+                   ctx-lookup-enum-variant ctx-get-current-return-type ctx-gensym
+                   to-c-type-prefixed))
+  (import strlib (starts-with ends-with char-at))
   (import ctype (to-c-name to-c-type))
-  (import expr (transpile-expr))
+  (import expr (transpile-expr infer-expr-c-type))
 
   ;; ============================================================
   ;; Pattern Type Detection
@@ -675,6 +676,12 @@
                           ;; match - nested match (recurse)
                           ((string-eq op "match")
                             (transpile-match ctx body-expr is-return))
+                          ;; with-arena - emit arena block
+                          ((string-eq op "with-arena")
+                            (emit-inline-with-arena ctx items is-return))
+                          ;; return - explicit return statement
+                          ((string-eq op "return")
+                            (emit-inline-return ctx items))
                           ;; Default: treat as expression
                           (else
                             (if (and is-return is-last)
@@ -770,26 +777,49 @@
                                     ;; Typed: (name Type init)
                                     (match (list-get items val-idx)
                                       ((some val-expr)
-                                        (let ((c-type (to-c-type-simple arena type-expr))
-                                              (val-c (transpile-expr ctx val-expr)))
+                                        (let ((c-type (to-c-type-prefixed ctx type-expr))
+                                              (val-c (transpile-expr ctx val-expr))
+                                              (is-ptr (ends-with c-type "*")))
                                           (ctx-emit ctx (ctx-str5 ctx c-type " " c-name " = " (ctx-str ctx val-c ";")))
-                                          (ctx-bind-var ctx (VarEntry raw-name c-name c-type false false))))
+                                          (ctx-bind-var ctx (VarEntry raw-name c-name c-type is-ptr has-mut))))
                                       ((none) (ctx-emit ctx "/* missing value */")))
-                                    ;; Not typed - middle is actually value
+                                    ;; Not typed - middle is actually value - infer type
                                     (match (list-get items type-idx)
                                       ((some val-expr)
-                                        (let ((val-c (transpile-expr ctx val-expr)))
-                                          (ctx-emit ctx (ctx-str4 ctx "__auto_type " c-name " = " (ctx-str ctx val-c ";")))
-                                          (ctx-bind-var ctx (VarEntry raw-name c-name "auto" false false))))
+                                        (let ((val-c (transpile-expr ctx val-expr))
+                                              ;; Check if init is arena-alloc to get proper pointer type
+                                              (ptr-type-opt (get-arena-alloc-ptr-type-inline ctx val-expr)))
+                                          (match ptr-type-opt
+                                            ((some ptr-type)
+                                              ;; Arena-alloc returns pointer
+                                              (ctx-emit ctx (ctx-str4 ctx "__auto_type " c-name " = " (ctx-str ctx val-c ";")))
+                                              (ctx-bind-var ctx (VarEntry raw-name c-name ptr-type true has-mut)))
+                                            ((none)
+                                              ;; Infer type from expression
+                                              (let ((inferred-type (infer-expr-c-type ctx val-expr))
+                                                    (is-ptr (ends-with inferred-type "*")))
+                                                (ctx-emit ctx (ctx-str4 ctx "__auto_type " c-name " = " (ctx-str ctx val-c ";")))
+                                                (ctx-bind-var ctx (VarEntry raw-name c-name inferred-type is-ptr has-mut)))))))
                                       ((none) (ctx-emit ctx "/* missing value */")))))
                                 ((none) (ctx-emit ctx "/* missing type/value */"))))
                             ;; Simple: (name init)
                             (let ((val-idx (+ start-idx 1)))
                               (match (list-get items val-idx)
                                 ((some val-expr)
-                                  (let ((val-c (transpile-expr ctx val-expr)))
-                                    (ctx-emit ctx (ctx-str4 ctx "__auto_type " c-name " = " (ctx-str ctx val-c ";")))
-                                    (ctx-bind-var ctx (VarEntry raw-name c-name "auto" false false))))
+                                  (let ((val-c (transpile-expr ctx val-expr))
+                                        ;; Check if init is arena-alloc to get proper pointer type
+                                        (ptr-type-opt (get-arena-alloc-ptr-type-inline ctx val-expr)))
+                                    (match ptr-type-opt
+                                      ((some ptr-type)
+                                        ;; Arena-alloc returns pointer
+                                        (ctx-emit ctx (ctx-str4 ctx "__auto_type " c-name " = " (ctx-str ctx val-c ";")))
+                                        (ctx-bind-var ctx (VarEntry raw-name c-name ptr-type true has-mut)))
+                                      ((none)
+                                        ;; Infer type from expression
+                                        (let ((inferred-type (infer-expr-c-type ctx val-expr))
+                                              (is-ptr (ends-with inferred-type "*")))
+                                          (ctx-emit ctx (ctx-str4 ctx "__auto_type " c-name " = " (ctx-str ctx val-c ";")))
+                                          (ctx-bind-var ctx (VarEntry raw-name c-name inferred-type is-ptr has-mut)))))))
                                 ((none) (ctx-emit ctx "/* missing value */")))))))
                       (else (ctx-emit ctx "/* binding name must be symbol */"))))
                   ((none) (ctx-emit ctx "/* missing binding name */")))))))
@@ -830,6 +860,71 @@
     (@pre {type-expr != nil})
     ;; Delegate to ctype module
     (to-c-type arena type-expr))
+
+  ;; ============================================================
+  ;; Arena-alloc Pointer Type Detection (inline version)
+  ;; ============================================================
+
+  (fn get-arena-alloc-ptr-type-inline ((ctx (Ptr TranspileContext)) (expr (Ptr SExpr)))
+    (@intent "Extract pointer type from arena-alloc call: (arena-alloc arena (sizeof Type)) -> Some(Type*)")
+    (@spec (((Ptr TranspileContext) (Ptr SExpr)) -> (Option String)))
+    (@pre {ctx != nil})
+    (@pre {expr != nil})
+    (let ((arena (. (deref ctx) arena)))
+      (match (deref expr)
+        ((list lst)
+          (let ((items (. lst items)))
+            (if (>= (list-len items) 3)
+              (match (list-get items 0)
+                ((some head-ptr)
+                  (match (deref head-ptr)
+                    ((symbol head-sym)
+                      (if (string-eq (. head-sym name) "arena-alloc")
+                        ;; Found arena-alloc, check size arg for sizeof
+                        (match (list-get items 2)
+                          ((some size-expr)
+                            (extract-sizeof-type-inline ctx size-expr))
+                          ((none) none))
+                        none))
+                    (else none)))
+                ((none) none))
+              none)))
+        (else none))))
+
+  (fn extract-sizeof-type-inline ((ctx (Ptr TranspileContext)) (expr (Ptr SExpr)))
+    (@intent "Extract type from (sizeof Type) or bare type symbol and return Some(Type*)")
+    (@spec (((Ptr TranspileContext) (Ptr SExpr)) -> (Option String)))
+    (@pre {ctx != nil})
+    (@pre {expr != nil})
+    (let ((arena (. (deref ctx) arena)))
+      (match (deref expr)
+        ;; Check for bare type symbol (arena-alloc arena TypeName)
+        ((symbol sym)
+          (let ((type-name (. sym name)))
+            (match (ctx-lookup-type ctx type-name)
+              ((some entry)
+                ;; Known type - return pointer type
+                (some (ctx-str ctx (. entry c-name) "*")))
+              ((none) none))))
+        ;; Check for (sizeof Type) expression
+        ((list lst)
+          (let ((items (. lst items)))
+            (if (>= (list-len items) 2)
+              (match (list-get items 0)
+                ((some head-ptr)
+                  (match (deref head-ptr)
+                    ((symbol head-sym)
+                      (if (string-eq (. head-sym name) "sizeof")
+                        (match (list-get items 1)
+                          ((some type-expr)
+                            (let ((c-type (to-c-type-prefixed ctx type-expr)))
+                              (some (ctx-str ctx c-type "*"))))
+                          ((none) none))
+                        none))
+                    (else none)))
+                ((none) none))
+              none)))
+        (else none))))
 
   (fn emit-inline-do ((ctx (Ptr TranspileContext)) (items (List (Ptr SExpr))) (is-return Bool) (is-last Bool))
     (@intent "Emit inline do block")
@@ -1147,6 +1242,73 @@
               (emit-branch-body-item ctx body-expr is-return (and is-last body-is-last))))
           ((none) (do)))
         (set! i (+ i 1)))))
+
+  ;; ============================================================
+  ;; With-Arena Block (inline)
+  ;; ============================================================
+
+  (fn emit-inline-with-arena ((ctx (Ptr TranspileContext)) (items (List (Ptr SExpr))) (is-return Bool))
+    (@intent "Emit with-arena block in match branch")
+    (@spec (((Ptr TranspileContext) (List (Ptr SExpr)) Bool) -> Unit))
+    (@pre {ctx != nil})
+    ;; (with-arena size body...)
+    ;; Generates:
+    ;; {
+    ;;     slop_arena _arena = slop_arena_new(size);
+    ;;     slop_arena* arena = &_arena;
+    ;;     <body statements>
+    ;;     slop_arena_free(arena);
+    ;; }
+    (let ((arena (. (deref ctx) arena))
+          (len (list-len items)))
+      (if (< len 2)
+        (ctx-emit ctx "/* invalid with-arena: need size */")
+        (do
+          ;; Open block
+          (ctx-emit ctx "{")
+          (ctx-indent ctx)
+          (ctx-push-scope ctx)
+          ;; Get size expression
+          (match (list-get items 1)
+            ((some size-expr)
+              (let ((size-c (transpile-expr ctx size-expr)))
+                ;; Emit arena creation
+                (ctx-emit ctx (ctx-str3 ctx "slop_arena _arena = slop_arena_new(" size-c ");"))
+                (ctx-emit ctx "slop_arena* arena = &_arena;")))
+            ((none) (ctx-emit ctx "/* missing size */")))
+          ;; Bind arena variable in scope
+          (ctx-bind-var ctx (VarEntry "arena" "arena" "slop_arena*" true false))
+          ;; Process body statements (items 2 onwards)
+          (let ((mut i 2))
+            (while (< i len)
+              (match (list-get items i)
+                ((some body-expr)
+                  (let ((is-last (== i (- len 1))))
+                    (emit-branch-body-item ctx body-expr (and is-return is-last) is-last)))
+                ((none) (do)))
+              (set! i (+ i 1))))
+          ;; Free arena
+          (ctx-emit ctx "slop_arena_free(arena);")
+          ;; Close scope
+          (ctx-pop-scope ctx)
+          (ctx-dedent ctx)
+          (ctx-emit ctx "}")))))
+
+  ;; ============================================================
+  ;; Return Statement (inline)
+  ;; ============================================================
+
+  (fn emit-inline-return ((ctx (Ptr TranspileContext)) (items (List (Ptr SExpr))))
+    (@intent "Emit explicit return statement")
+    (@spec (((Ptr TranspileContext) (List (Ptr SExpr))) -> Unit))
+    (@pre {ctx != nil})
+    (let ((len (list-len items)))
+      (if (< len 2)
+        (ctx-emit ctx "return;")
+        (match (list-get items 1)
+          ((some val-expr)
+            (emit-typed-return-expr ctx val-expr))
+          ((none) (ctx-emit ctx "return;"))))))
 
   ;; ============================================================
   ;; Helper for typed none in returns

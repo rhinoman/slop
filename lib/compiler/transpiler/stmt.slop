@@ -252,7 +252,8 @@
                                       ;; Regular binding - infer type from init expression
                                       (let ((inferred-type (infer-expr-c-type ctx init-expr)))
                                         (ctx-emit ctx (ctx-str5 ctx "__auto_type " var-name " = " init-c ";"))
-                                        (ctx-bind-var ctx (VarEntry raw-name var-name inferred-type false has-mut)))))))
+                                        ;; Check if inferred type is a pointer (ends with *)
+                                        (ctx-bind-var ctx (VarEntry raw-name var-name inferred-type (ends-with inferred-type "*") has-mut)))))))
                               ((none) (ctx-emit ctx "/* missing init */"))))))
                       (else (ctx-emit ctx "/* binding name must be symbol */"))))
                   ((none) (ctx-emit ctx "/* missing binding name */")))))))

@@ -1885,18 +1885,51 @@ def cmd_build(args):
 
             # Type check all modules
             print("  Type checking...")
-            all_diagnostics = check_modules(graph.modules, order)
             total_errors = 0
             total_warnings = 0
-            for mod_name, diagnostics in all_diagnostics.items():
-                type_errors = [d for d in diagnostics if d.severity == 'error']
-                type_warnings = [d for d in diagnostics if d.severity == 'warning']
-                for w in type_warnings:
-                    print(f"    [{mod_name}] {w}")
-                for e in type_errors:
-                    print(f"    [{mod_name}] {e}")
-                total_errors += len(type_errors)
-                total_warnings += len(type_warnings)
+
+            if native_checker_bin:
+                # Use native type checker - pass files in dependency order
+                import subprocess
+                import json
+                source_files = [str(graph.modules[name].path) for name in order]
+                cmd = [native_checker_bin] + source_files
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                # Note: native checker returns non-zero on errors, but we still
+                # want to parse the JSON to show the diagnostics
+                try:
+                    all_diagnostics_json = json.loads(result.stdout)
+                    for mod_name, data in all_diagnostics_json.items():
+                        for diag in data.get('diagnostics', []):
+                            level = diag.get('level', 'error')
+                            msg = diag.get('message', '')
+                            line = diag.get('line', 0)
+                            col = diag.get('col', 0)
+                            if level == 'warning':
+                                print(f"    [{mod_name}] warning at {line}:{col}: {msg}")
+                                total_warnings += 1
+                            else:
+                                print(f"    [{mod_name}] error at {line}:{col}: {msg}")
+                                total_errors += 1
+                except json.JSONDecodeError as e:
+                    # If JSON parsing fails, show stderr
+                    if result.stderr:
+                        print(f"Native type checker output:\n{result.stderr}")
+                    if result.returncode != 0:
+                        print(f"  Type check failed with exit code {result.returncode}")
+                        return 1
+            else:
+                # Fall back to Python type checker
+                all_diagnostics = check_modules(graph.modules, order)
+                for mod_name, diagnostics in all_diagnostics.items():
+                    type_errors = [d for d in diagnostics if d.severity == 'error']
+                    type_warnings = [d for d in diagnostics if d.severity == 'warning']
+                    for w in type_warnings:
+                        print(f"    [{mod_name}] {w}")
+                    for e in type_errors:
+                        print(f"    [{mod_name}] {e}")
+                    total_errors += len(type_errors)
+                    total_warnings += len(type_warnings)
 
             if total_errors > 0:
                 print(f"  Type check failed: {total_errors} error(s)")

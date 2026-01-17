@@ -44,7 +44,7 @@
   ;; ============================================================
 
   ;; FFI for number parsing
-  ;; Note: Use (Ptr Char) for C string compatibility
+  ;; Note: Use (Ptr Char) for C string compatibility with strtoll/strtod
   (ffi "stdlib.h"
     (strtoll ((s (Ptr Char)) (endptr (Ptr (Ptr Char))) (base Int)) I64)
     (strtod ((s (Ptr Char)) (endptr (Ptr (Ptr Char)))) Float))

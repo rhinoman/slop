@@ -8,7 +8,7 @@
 (module collect
   (export
     ;; Main collection functions
-    collect-types collect-functions collect-module)
+    collect-types collect-functions collect-constants collect-module)
 
   (import parser (SExpr SExprList SExprSymbol is-form
                   sexpr-line sexpr-col
@@ -19,7 +19,7 @@
                  resolved-type-set-inner
                  fn-signature-new param-info-new))
   (import env (TypeEnv env-arena env-register-type env-lookup-type
-               env-register-function env-set-module env-get-module
+               env-register-function env-register-constant env-set-module env-get-module
                env-get-int-type env-get-bool-type env-get-string-type
                env-get-unit-type env-register-variant env-check-variant-collisions
                env-make-option-type))
@@ -29,14 +29,16 @@
   ;; ============================================================
 
   (fn collect-module ((env (Ptr TypeEnv)) (ast (List (Ptr SExpr))))
-    (@intent "Collect all types and functions from a module AST")
+    (@intent "Collect all types, constants, and functions from a module AST")
     (@spec (((Ptr TypeEnv) (List (Ptr SExpr))) -> Unit))
     (@pre (!= env nil))
     ;; First pass: collect all type definitions
     (collect-types env ast)
     ;; Check for ambiguous enum variants (same name in different enums)
     (env-check-variant-collisions env)
-    ;; Second pass: collect function signatures
+    ;; Second pass: collect constant definitions
+    (collect-constants env ast)
+    ;; Third pass: collect function signatures
     (collect-functions env ast))
 
   (fn collect-types ((env (Ptr TypeEnv)) (ast (List (Ptr SExpr))))
@@ -180,9 +182,16 @@
                                           ((none) (env-get-int-type env)))
                                         (env-get-int-type env))))
                       (env-make-option-type env inner-type)))
-                  ;; Ptr type: (Ptr PointeeType) - return placeholder
+                  ;; Ptr type: (Ptr PointeeType)
                   ((string-eq head-name "Ptr")
-                    (resolved-type-new arena 'rk-primitive "Ptr" (none) "void*"))
+                    (let ((inner-type (if (>= (list-len items) 2)
+                                        (match (list-get items 1)
+                                          ((some inner-expr) (get-field-type env arena inner-expr))
+                                          ((none) (env-get-int-type env)))
+                                        (env-get-int-type env)))
+                          (ptr-type (resolved-type-new arena 'rk-ptr "Ptr" (none) "void*")))
+                      (resolved-type-set-inner ptr-type inner-type)
+                      ptr-type))
                   ;; List type: (List ElemType) - return placeholder
                   ((string-eq head-name "List")
                     (resolved-type-new arena 'rk-primitive "List" (none) "slop_list_t*"))
@@ -344,6 +353,89 @@
                   (_ (do))))
               ((none) (do))))))
       (_ (do))))
+
+  ;; ============================================================
+  ;; Constant Collection
+  ;; ============================================================
+
+  (fn collect-constants ((env (Ptr TypeEnv)) (ast (List (Ptr SExpr))))
+    (@intent "Scan AST for constant definitions and register them")
+    (@spec (((Ptr TypeEnv) (List (Ptr SExpr))) -> Unit))
+    (@pre (!= env nil))
+    (let ((arena (env-arena env))
+          (len (list-len ast)))
+      (for (i 0 len)
+        (match (list-get ast i)
+          ((some expr)
+            (cond
+              ((is-form expr "const")
+                (collect-single-constant env arena expr))
+              ((is-form expr "module")
+                (collect-module-constants env expr))
+              (else (do))))
+          ((none) (do))))))
+
+  (fn collect-module-constants ((env (Ptr TypeEnv)) (module-form (Ptr SExpr)))
+    (@intent "Collect constant definitions from inside a module")
+    (@spec (((Ptr TypeEnv) (Ptr SExpr)) -> Unit))
+    (@pre (!= env nil))
+    (@pre (!= module-form nil))
+    (let ((arena (env-arena env)))
+      (when (sexpr-is-list module-form)
+        (let ((len (sexpr-list-len module-form)))
+          ;; Skip module name and export, start at index 2
+          (for (i 2 len)
+            (match (sexpr-list-get module-form i)
+              ((some item)
+                (when (is-form item "const")
+                  (collect-single-constant env arena item)))
+              ((none) (do))))))))
+
+  (fn collect-single-constant ((env (Ptr TypeEnv)) (arena Arena) (const-form (Ptr SExpr)))
+    (@intent "Collect a single constant definition: (const NAME Type value)")
+    (@spec (((Ptr TypeEnv) Arena (Ptr SExpr)) -> Unit))
+    (@pre (!= env nil))
+    (@pre (!= const-form nil))
+    (when (sexpr-is-list const-form)
+      (when (>= (sexpr-list-len const-form) 3)
+        ;; Get name at position 1
+        (match (sexpr-list-get const-form 1)
+          ((some name-expr)
+            (let ((const-name (sexpr-get-symbol-name name-expr)))
+              (when (not (string-eq const-name ""))
+                ;; Get type at position 2
+                (match (sexpr-list-get const-form 2)
+                  ((some type-expr)
+                    (let ((const-type (get-const-type env arena type-expr)))
+                      (env-register-constant env const-name const-type)))
+                  ((none) (do))))))
+          ((none) (do))))))
+
+  (fn get-const-type ((env (Ptr TypeEnv)) (arena Arena) (type-expr (Ptr SExpr)))
+    (@intent "Get resolved type for a constant type expression")
+    (@spec (((Ptr TypeEnv) Arena (Ptr SExpr)) -> (Ptr ResolvedType)))
+    (@pre (!= env nil))
+    (match (deref type-expr)
+      ((symbol sym)
+        (let ((type-name (. sym name)))
+          ;; Try to look up type, fall back to primitive
+          (match (env-lookup-type env type-name)
+            ((some t) t)
+            ((none)
+              ;; Check for built-in types
+              (cond
+                ((string-eq type-name "Int") (env-get-int-type env))
+                ((string-eq type-name "Bool") (env-get-bool-type env))
+                ((string-eq type-name "String") (env-get-string-type env))
+                ((string-eq type-name "Unit") (env-get-unit-type env))
+                ;; Unknown type - create placeholder
+                (else (resolved-type-new arena 'rk-primitive type-name (none) type-name)))))))
+      ;; Complex type or other - use Int as default
+      (_ (env-get-int-type env))))
+
+  ;; ============================================================
+  ;; Function Collection
+  ;; ============================================================
 
   (fn collect-functions ((env (Ptr TypeEnv)) (ast (List (Ptr SExpr))))
     (@intent "Scan AST for function definitions and register signatures")

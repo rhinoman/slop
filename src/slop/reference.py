@@ -60,6 +60,10 @@ TOPICS = {
 (Result T E)            ; Success or error
 (Fn (A B) -> R)         ; Function pointer
 
+### Concurrency Types (thread library)
+(Chan T)                ; Typed channel
+(Thread T)              ; Thread handle returning T
+
 ### Type Aliases
 (type UserId (Int 1 ..))
 (alias Handler (Fn (Request) -> Response))
@@ -284,6 +288,16 @@ tier-4: 70B+ models   ; Complex algorithms, multi-step logic
 (c-inline "CONSTANT")            ; Emit C constant
 (c-inline "sizeof(struct foo)")  ; Emit C expression
 
+### FFI-Only Types
+
+#### Char
+For C functions expecting `char*` (distinct from `int8_t*` and `uint8_t*`):
+```lisp
+(ffi "stdlib.h"
+  (strtol ((s (Ptr Char)) (endptr (Ptr (Ptr Char))) (base Int)) I64))
+```
+Use only at FFI boundaries. For general code, use `U8` or `String`.
+
 ### Type Casting
 (cast Type expr)                 ; Cast expression to Type
 """,
@@ -336,6 +350,18 @@ tier-4: 70B+ models   ; Complex algorithms, multi-step logic
 ### Time
 (now-ms) -> (Int 0 ..)
 (sleep-ms ms) -> Unit
+
+### Concurrency (import thread, link -lpthread)
+(import thread (chan chan-buffered chan-close send recv try-recv spawn join))
+
+(chan arena) -> (Ptr (Chan T))              ; Unbuffered channel
+(chan-buffered arena cap) -> (Ptr (Chan T)) ; Buffered channel
+(chan-close ch) -> Unit                     ; Close channel
+(send ch val) -> (Result Unit ChanError)    ; Blocking send
+(recv ch) -> (Result T ChanError)           ; Blocking receive
+(try-recv ch) -> (Result T ChanError)       ; Non-blocking receive
+(spawn arena func) -> (Ptr (Thread T))      ; Spawn thread
+(join thread) -> T                          ; Wait and get result
 """,
 
     'expressions': """## Expressions

@@ -381,6 +381,46 @@ class ResultType(Type):
 
 
 @dataclass(frozen=True)
+class ChanType(Type):
+    """Channel type: (Chan T) for typed inter-thread communication"""
+    element_type: Type
+
+    def __str__(self) -> str:
+        return f"(Chan {self.element_type})"
+
+    def equals(self, other: Type) -> bool:
+        if isinstance(other, ChanType):
+            return self.element_type.equals(other.element_type)
+        return False
+
+    def is_subtype_of(self, other: Type) -> bool:
+        """Chan is invariant: Chan<T> is only subtype of Chan<T>"""
+        return self.equals(other)
+
+
+@dataclass(frozen=True)
+class ThreadType(Type):
+    """Thread type: (Thread T) for typed thread handle with result type T"""
+    result_type: Type
+
+    def __str__(self) -> str:
+        return f"(Thread {self.result_type})"
+
+    def equals(self, other: Type) -> bool:
+        if isinstance(other, ThreadType):
+            return self.result_type.equals(other.result_type)
+        return False
+
+    def is_subtype_of(self, other: Type) -> bool:
+        """Thread is covariant: Thread<Subtype> <: Thread<Supertype>"""
+        if self.equals(other):
+            return True
+        if isinstance(other, ThreadType):
+            return self.result_type.is_subtype_of(other.result_type)
+        return False
+
+
+@dataclass(frozen=True)
 class PtrType(Type):
     """Pointer type: (Ptr T), (OwnPtr T), (OptPtr T)"""
     pointee: Type

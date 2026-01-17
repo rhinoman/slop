@@ -1,0 +1,6 @@
+[project]
+name = "thread"
+entry = "thread.slop"
+
+[build.link]
+libraries = ["pthread"]

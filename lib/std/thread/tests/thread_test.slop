@@ -1,0 +1,36 @@
+;; ============================================================
+;; Thread/Channel Type System Test
+;;
+;; This file tests that the Chan and Thread types are properly
+;; recognized by the parser and type system.
+;; ============================================================
+
+(module thread-test
+  (export main)
+
+  ;; Test that Chan type is recognized in function signatures
+  (fn make-int-chan ((arena Arena))
+    (@intent "Create a channel for integers")
+    (@spec ((Arena) -> (Ptr (Chan Int))))
+    (@alloc arena)
+    ;; Return nil for now - we just want to test type recognition
+    (cast (Ptr (Chan Int)) nil))
+
+  ;; Test that Thread type is recognized
+  (fn make-int-thread ((arena Arena))
+    (@intent "Create a thread handle")
+    (@spec ((Arena) -> (Ptr (Thread Int))))
+    (@alloc arena)
+    (cast (Ptr (Thread Int)) nil))
+
+  ;; Test that we can declare variables with Chan/Thread types
+  (fn main ()
+    (@intent "Test Chan and Thread type system support")
+    (@spec (() -> Int))
+
+    (with-arena 4096
+      ;; Create typed channel and thread handles
+      (let ((ch (make-int-chan arena)))
+        (let ((th (make-int-thread arena)))
+          ;; Just test that types compile correctly
+          0)))))

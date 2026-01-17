@@ -151,6 +151,8 @@
         ((string-eq name "nil") "NULL")
         ;; None literal - use runtime macro
         ((string-eq name "none") "none")
+        ;; Unit literal - used for Result Unit E types
+        ((string-eq name "unit") "0")
         ;; Quoted symbols for enum values: 'read -> file_FileMode_read
         ((starts-with name "'")
           (let ((name-len (string-len name))
@@ -162,6 +164,32 @@
               ((none)
                 ;; Fallback - just strip quote and convert
                 (to-c-name arena variant-name)))))
+        ;; Dot notation: either field access (var.field) or enum (Type.variant)
+        ((contains name ".")
+          (match (index-of name ".")
+            ((some dot-pos)
+              (let ((base-name (substring arena name 0 dot-pos))
+                    (rest-len (cast (Int 0 ..) (- (string-len name) (+ dot-pos 1))))
+                    (rest-name (substring arena name (+ dot-pos 1) rest-len))
+                    ;; Convert rest to C name (hyphen to underscore)
+                    (c-rest (to-c-name arena rest-name)))
+                ;; First check if base is a variable (field access)
+                (match (ctx-lookup-var ctx base-name)
+                  ((some var-entry)
+                    ;; Field access: use -> if pointer, . otherwise
+                    (let ((c-base (. var-entry c-name))
+                          (is-ptr (. var-entry is-pointer))
+                          (accessor (if is-ptr "->" ".")))
+                      (ctx-str3 ctx c-base accessor c-rest)))
+                  ((none)
+                    ;; Not a variable - check if it's enum dot notation
+                    (match (ctx-lookup-type ctx base-name)
+                      ((some type-info)
+                        (get-prefixed-enum-value ctx (. type-info c-name) rest-name))
+                      ((none)
+                        ;; Fallback: assume base_rest format
+                        (ctx-str3 ctx base-name "_" c-rest)))))))
+            ((none) (to-c-name arena name))))
         ;; Variable/constant lookup - check context first
         (else
           (match (ctx-lookup-var ctx name)
@@ -173,16 +201,22 @@
                 ((some enum-name)
                   (get-prefixed-enum-value ctx enum-name name))
                 ((none)
-                  ;; Not found - convert to C name
-                  (to-c-name arena name)))))))))
+                  ;; Check if it's a registered function (for function references)
+                  (let ((c-name (to-c-name arena name)))
+                    (match (ctx-lookup-func ctx name)
+                      ((some func-entry)
+                        ;; Use the registered c-name which includes module prefix
+                        (. func-entry c-name))
+                      ((none) c-name)))))))))))
 
   (fn get-prefixed-enum-value ((ctx (Ptr TranspileContext)) (enum-name String) (variant-name String))
     (@intent "Get fully qualified enum value - enum-name already has module prefix")
     (@spec (((Ptr TranspileContext) String String) -> String))
     (@pre {ctx != nil})
     ;; enum-name already includes module prefix (e.g., "file_FileMode")
-    ;; Just append _variant to get the full constant name
-    (ctx-str3 ctx enum-name "_" variant-name))
+    ;; Convert variant-name to C format (hyphens to underscores) and append
+    (let ((arena (. (deref ctx) arena)))
+      (ctx-str3 ctx enum-name "_" (to-c-name arena variant-name))))
 
   ;; ============================================================
   ;; Binary Operation Transpilation
@@ -333,18 +367,24 @@
           ;; Handle qualified names like "file.open" or regular names like "open"
           (let ((base-name (get-base-function-name arena fn-name))
                 (mod-name (get-module-from-qualified-name arena fn-name)))
-            ;; Look up registered function using base name
-            (let ((c-name (match (ctx-lookup-func ctx base-name)
-                            ((some func-entry)
-                              (. func-entry c-name))
-                            ;; Not found - generate C name
-                            ((none)
-                              (if (> (string-len mod-name) 0)
-                                ;; Cross-module call - convert qualified name to C name (mod_func)
-                                (to-c-name arena fn-name)
-                                ;; Same-module call - add current module prefix
-                                (ctx-prefix-type ctx (to-c-name arena fn-name)))))))
-              (ctx-str4 ctx c-name "(" args ")")))))))
+            ;; First check if this is a local variable (function pointer)
+            (match (ctx-lookup-var ctx fn-name)
+              ((some var-entry)
+                ;; Local function pointer variable - use its c-name directly
+                (ctx-str4 ctx (. var-entry c-name) "(" args ")"))
+              ((none)
+                ;; Look up registered function using base name
+                (let ((c-name (match (ctx-lookup-func ctx base-name)
+                                ((some func-entry)
+                                  (. func-entry c-name))
+                                ;; Not found - generate C name
+                                ((none)
+                                  (if (> (string-len mod-name) 0)
+                                    ;; Cross-module call - convert qualified name to C name (mod_func)
+                                    (to-c-name arena fn-name)
+                                    ;; Same-module call - add current module prefix
+                                    (ctx-prefix-type ctx (to-c-name arena fn-name)))))))
+                  (ctx-str4 ctx c-name "(" args ")")))))))))
 
   (fn get-base-function-name ((arena Arena) (fn-name String))
     (@intent "Extract base function name from qualified name (file.open -> open)")
@@ -792,25 +832,43 @@
   ;; ============================================================
 
   (fn extract-sizeof-type ((ctx (Ptr TranspileContext)) (expr (Ptr SExpr)))
-    (@intent "Extract type from (sizeof Type) expression, or return uint8_t")
+    (@intent "Extract type from (sizeof Type) expression or nested within arithmetic, or return uint8_t")
     (@spec (((Ptr TranspileContext) (Ptr SExpr)) -> String))
     (@pre {ctx != nil})
     (@pre {expr != nil})
     (let ((arena (. (deref ctx) arena)))
       (match (deref expr)
         ((list lst)
-          (let ((items (. lst items)))
-            (if (>= (list-len items) 2)
+          (let ((items (. lst items))
+                (len (list-len items)))
+            (if (>= len 2)
               (match (list-get items 0)
                 ((some head-ptr)
                   (match (deref head-ptr)
                     ((symbol head-sym)
-                      (if (string-eq (. head-sym name) "sizeof")
-                        (match (list-get items 1)
-                          ((some type-expr)
-                            (to-c-type-prefixed ctx type-expr))
-                          ((none) "uint8_t"))
-                        "uint8_t"))
+                      (let ((op (. head-sym name)))
+                        (cond
+                          ;; Direct sizeof - extract type
+                          ((string-eq op "sizeof")
+                            (match (list-get items 1)
+                              ((some type-expr)
+                                (to-c-type-prefixed ctx type-expr))
+                              ((none) "uint8_t")))
+                          ;; Arithmetic ops - search recursively for sizeof
+                          ((or (string-eq op "*") (or (string-eq op "+") (or (string-eq op "-") (string-eq op "/"))))
+                            ;; Search each operand for sizeof
+                            (let ((mut i 1)
+                                  (mut found "uint8_t"))
+                              (while (< i len)
+                                (match (list-get items i)
+                                  ((some arg-expr)
+                                    (let ((result (extract-sizeof-type ctx arg-expr)))
+                                      (when (not (string-eq result "uint8_t"))
+                                        (set! found result))))
+                                  ((none) (do)))
+                                (set! i (+ i 1)))
+                              found))
+                          (else "uint8_t"))))
                     (_ "uint8_t")))
                 ((none) "uint8_t"))
               "uint8_t")))
@@ -1235,8 +1293,22 @@
                     ;; Default: function call
                     (else
                       (transpile-fn-call ctx op items)))))
-              ;; Non-symbol head
-              (_ "/* non-symbol head */")))
+              ;; Non-symbol head - could be a function pointer variable call
+              (_
+                ;; Transpile head expression and call it with arguments
+                (let ((head-c (transpile-expr ctx head-expr))
+                      (mut args "")
+                      (mut i 1))
+                  (while (< i len)
+                    (match (list-get items i)
+                      ((some arg)
+                        (let ((arg-c (transpile-expr ctx arg)))
+                          (if (string-eq args "")
+                            (set! args arg-c)
+                            (set! args (ctx-str3 ctx args ", " arg-c)))))
+                      ((none) (do)))
+                    (set! i (+ i 1)))
+                  (ctx-str5 ctx head-c "(" args ")" "")))))
           ((none) "/* empty list */")))))
 
   (fn transpile-fn-call ((ctx (Ptr TranspileContext)) (fn-name String) (items (List (Ptr SExpr))))
@@ -2045,6 +2117,14 @@
                         ;; set! returns void
                         ((string-eq op "set!")
                           "void")
+                        ;; cast - return the target type
+                        ((string-eq op "cast")
+                          (if (< (list-len items) 2)
+                            "void*"
+                            (match (list-get items 1)
+                              ((some type-expr)
+                                (to-c-type-prefixed ctx type-expr))
+                              ((none) "void*"))))
                         ;; when returns void
                         ((string-eq op "when")
                           "void")

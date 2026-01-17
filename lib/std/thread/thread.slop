@@ -1,0 +1,319 @@
+;; ============================================================
+;; Thread and Channel Concurrency Primitives
+;;
+;; Type-safe SLOP concurrency built on pthreads.
+;;
+;; Provides:
+;; - Typed channels: (Chan T) for thread-safe communication
+;; - Typed threads: (Thread T) for spawning and joining
+;; - Arena-based allocation for all concurrency primitives
+;;
+;; Usage pattern:
+;;   (with-arena 4096
+;;     (let ((ch (chan arena)))    ;; Creates (Ptr (Chan Int))
+;;       (spawn arena (fn () (send ch 42)))
+;;       (recv ch)))               ;; Blocks until value available
+;;
+;; Implementation: Pure SLOP using pthread FFI. The transpiler
+;; generates the channel and thread state structs; this module
+;; provides the operations.
+;; ============================================================
+
+(module thread
+  (export
+    ;; Error type
+    ChanError
+    ;; Channel creation
+    chan chan-buffered chan-close
+    ;; Channel operations
+    send recv try-recv
+    ;; Thread operations
+    spawn spawn-with-chan join
+    ;; Thread with channel type
+    ThreadWithChan)
+
+  ;; ============================================================
+  ;; FFI: pthreads
+  ;; ============================================================
+
+  (ffi "pthread.h"
+    (pthread-create ((thread (Ptr U64)) (attr (Ptr Void))
+                     (start (Ptr Void)) (arg (Ptr Void))) Int)
+    (pthread-join ((thread U64) (retval (Ptr (Ptr Void)))) Int)
+    (pthread-mutex-init ((mutex (Ptr Void)) (attr (Ptr Void))) Int)
+    (pthread-mutex-destroy ((mutex (Ptr Void))) Int)
+    (pthread-mutex-lock ((mutex (Ptr Void))) Int)
+    (pthread-mutex-unlock ((mutex (Ptr Void))) Int)
+    (pthread-cond-init ((cond (Ptr Void)) (attr (Ptr Void))) Int)
+    (pthread-cond-destroy ((cond (Ptr Void))) Int)
+    (pthread-cond-wait ((cond (Ptr Void)) (mutex (Ptr Void))) Int)
+    (pthread-cond-signal ((cond (Ptr Void))) Int)
+    (pthread-cond-broadcast ((cond (Ptr Void))) Int))
+
+  ;; ============================================================
+  ;; Types
+  ;; ============================================================
+
+  (type ChanError (enum
+    closed           ;; Channel has been closed
+    would-block      ;; try-recv on empty channel
+    send-on-closed)) ;; Attempted send on closed channel
+
+  ;; Thread state for spawn-with-chan
+  ;; Holds function pointer, channel argument, and thread state
+  (type ThreadWithChan (record
+    (func (Ptr Void))       ;; Function: (Ptr (Chan Int)) -> Int
+    (chan (Ptr (Chan Int))) ;; Channel argument passed to function
+    (id U64)                ;; pthread_t handle
+    (result Int)            ;; Thread return value
+    (done Bool)))           ;; Completion flag
+
+  ;; Note: (Chan T) and (Thread T) are built-in parameterized types
+  ;; like (List T). The transpiler generates type-specific structs:
+  ;;
+  ;; (Chan Int) -> slop_chan_int with fields:
+  ;;   mutex[64], not_empty[64], not_full[64] - pthread storage
+  ;;   buffer, capacity, count, head, tail, closed
+  ;;
+  ;; (Thread Int) -> slop_thread_int with fields:
+  ;;   id (pthread_t), result, func, done
+  ;; Plus a trampoline function: slop_thread_int_entry
+
+  ;; ============================================================
+  ;; Channel Creation
+  ;; ============================================================
+
+  (fn chan ((arena Arena))
+    (@intent "Create an unbuffered channel - sends block until received")
+    (@spec ((Arena) -> (Ptr (Chan Int))))
+    (@alloc arena)
+    (@post {$result != nil})
+    (let ((ch (arena-alloc arena (sizeof (Chan Int)))))
+      ;; Initialize pthread primitives
+      (pthread-mutex-init (cast (Ptr Void) (addr ch.mutex)) nil)
+      (pthread-cond-init (cast (Ptr Void) (addr ch.not-empty)) nil)
+      (pthread-cond-init (cast (Ptr Void) (addr ch.not-full)) nil)
+      ;; Initialize channel state
+      (set! ch.buffer nil)
+      (set! ch.capacity 0)
+      (set! ch.count 0)
+      (set! ch.head 0)
+      (set! ch.tail 0)
+      (set! ch.closed false)
+      ch))
+
+  (fn chan-buffered ((arena Arena) (capacity (Int 1 ..)))
+    (@intent "Create a buffered channel with given capacity")
+    (@spec ((Arena (Int 1 ..)) -> (Ptr (Chan Int))))
+    (@alloc arena)
+    (@pre {capacity >= 1})
+    (@post {$result != nil})
+    (let ((ch (arena-alloc arena (sizeof (Chan Int)))))
+      ;; Initialize pthread primitives
+      (pthread-mutex-init (cast (Ptr Void) (addr ch.mutex)) nil)
+      (pthread-cond-init (cast (Ptr Void) (addr ch.not-empty)) nil)
+      (pthread-cond-init (cast (Ptr Void) (addr ch.not-full)) nil)
+      ;; Initialize channel state with buffer
+      (set! ch.buffer (arena-alloc arena (* capacity (sizeof Int))))
+      (set! ch.capacity (cast U64 capacity))
+      (set! ch.count 0)
+      (set! ch.head 0)
+      (set! ch.tail 0)
+      (set! ch.closed false)
+      ch))
+
+  (fn chan-close ((ch (Ptr (Chan Int))))
+    (@intent "Close channel - subsequent sends fail, recvs drain then return error")
+    (@spec (((Ptr (Chan Int))) -> Unit))
+    (@pre {ch != nil})
+    ;; Lock, set closed flag, wake all waiters
+    (pthread-mutex-lock (cast (Ptr Void) (addr ch.mutex)))
+    (set! ch.closed true)
+    (pthread-cond-broadcast (cast (Ptr Void) (addr ch.not-empty)))
+    (pthread-cond-broadcast (cast (Ptr Void) (addr ch.not-full)))
+    (pthread-mutex-unlock (cast (Ptr Void) (addr ch.mutex)))
+    unit)
+
+  ;; ============================================================
+  ;; Channel Operations
+  ;; ============================================================
+
+  (fn send ((ch (Ptr (Chan Int))) (value Int))
+    (@intent "Send value to channel, blocking if full/unbuffered")
+    (@spec (((Ptr (Chan Int)) Int) -> (Result Unit ChanError)))
+    (@pre {ch != nil})
+    (pthread-mutex-lock (cast (Ptr Void) (addr ch.mutex)))
+
+    ;; Check if channel is closed
+    (if ch.closed
+        (do
+          (pthread-mutex-unlock (cast (Ptr Void) (addr ch.mutex)))
+          (error ChanError.send-on-closed))
+
+        ;; Handle unbuffered vs buffered
+        (if (= ch.capacity 0)
+            ;; Unbuffered: wait for receiver, do synchronous handoff
+            (do
+              ;; Wait until count is 0 (receiver took previous value) or closed
+              (while (and (> ch.count 0) (not ch.closed))
+                (pthread-cond-wait (cast (Ptr Void) (addr ch.not-full))
+                                   (cast (Ptr Void) (addr ch.mutex))))
+              (if ch.closed
+                  (do
+                    (pthread-mutex-unlock (cast (Ptr Void) (addr ch.mutex)))
+                    (error ChanError.send-on-closed))
+                  (do
+                    ;; For unbuffered, use a single-element inline buffer
+                    ;; We store the value in the buffer pointer itself (type punning)
+                    (set! ch.buffer (cast (Ptr Int) (cast U64 value)))
+                    (set! ch.count 1)
+                    (pthread-cond-signal (cast (Ptr Void) (addr ch.not-empty)))
+                    ;; Wait for receiver to take it (synchronous handoff)
+                    (while (and (> ch.count 0) (not ch.closed))
+                      (pthread-cond-wait (cast (Ptr Void) (addr ch.not-full))
+                                         (cast (Ptr Void) (addr ch.mutex))))
+                    (pthread-mutex-unlock (cast (Ptr Void) (addr ch.mutex)))
+                    (ok unit))))
+
+            ;; Buffered: wait for space, enqueue
+            (do
+              ;; Wait for space in buffer
+              (while (and (>= ch.count ch.capacity) (not ch.closed))
+                (pthread-cond-wait (cast (Ptr Void) (addr ch.not-full))
+                                   (cast (Ptr Void) (addr ch.mutex))))
+              (if ch.closed
+                  (do
+                    (pthread-mutex-unlock (cast (Ptr Void) (addr ch.mutex)))
+                    (error ChanError.send-on-closed))
+                  (do
+                    ;; Enqueue value
+                    (set! (deref (+ ch.buffer ch.tail)) value)
+                    (set! ch.tail (% (+ ch.tail 1) ch.capacity))
+                    (set! ch.count (+ ch.count 1))
+                    (pthread-cond-signal (cast (Ptr Void) (addr ch.not-empty)))
+                    (pthread-mutex-unlock (cast (Ptr Void) (addr ch.mutex)))
+                    (ok unit)))))))
+
+  (fn recv ((ch (Ptr (Chan Int))))
+    (@intent "Receive from channel, blocking if empty")
+    (@spec (((Ptr (Chan Int))) -> (Result Int ChanError)))
+    (@pre {ch != nil})
+    (pthread-mutex-lock (cast (Ptr Void) (addr ch.mutex)))
+
+    ;; Wait for data or close
+    (while (and (= ch.count 0) (not ch.closed))
+      (pthread-cond-wait (cast (Ptr Void) (addr ch.not-empty))
+                         (cast (Ptr Void) (addr ch.mutex))))
+
+    ;; Check if empty and closed
+    (if (and (= ch.count 0) ch.closed)
+        (do
+          (pthread-mutex-unlock (cast (Ptr Void) (addr ch.mutex)))
+          (error ChanError.closed))
+
+        ;; Dequeue value
+        (if (= ch.capacity 0)
+            ;; Unbuffered: value stored in buffer pointer
+            (let ((value (cast Int (cast U64 ch.buffer))))
+              (set! ch.count 0)
+              (pthread-cond-signal (cast (Ptr Void) (addr ch.not-full)))
+              (pthread-mutex-unlock (cast (Ptr Void) (addr ch.mutex)))
+              (ok value))
+
+            ;; Buffered: dequeue from ring buffer
+            (let ((value (deref (+ ch.buffer ch.head))))
+              (set! ch.head (% (+ ch.head 1) ch.capacity))
+              (set! ch.count (- ch.count 1))
+              (pthread-cond-signal (cast (Ptr Void) (addr ch.not-full)))
+              (pthread-mutex-unlock (cast (Ptr Void) (addr ch.mutex)))
+              (ok value)))))
+
+  (fn try-recv ((ch (Ptr (Chan Int))))
+    (@intent "Non-blocking receive - returns immediately")
+    (@spec (((Ptr (Chan Int))) -> (Result Int ChanError)))
+    (@pre {ch != nil})
+    (pthread-mutex-lock (cast (Ptr Void) (addr ch.mutex)))
+
+    ;; Check for data
+    (if (= ch.count 0)
+        (do
+          (pthread-mutex-unlock (cast (Ptr Void) (addr ch.mutex)))
+          (if ch.closed
+              (error ChanError.closed)
+              (error ChanError.would-block)))
+
+        ;; Dequeue value
+        (if (= ch.capacity 0)
+            ;; Unbuffered
+            (let ((value (cast Int (cast U64 ch.buffer))))
+              (set! ch.count 0)
+              (pthread-cond-signal (cast (Ptr Void) (addr ch.not-full)))
+              (pthread-mutex-unlock (cast (Ptr Void) (addr ch.mutex)))
+              (ok value))
+
+            ;; Buffered
+            (let ((value (deref (+ ch.buffer ch.head))))
+              (set! ch.head (% (+ ch.head 1) ch.capacity))
+              (set! ch.count (- ch.count 1))
+              (pthread-cond-signal (cast (Ptr Void) (addr ch.not-full)))
+              (pthread-mutex-unlock (cast (Ptr Void) (addr ch.mutex)))
+              (ok value)))))
+
+  ;; ============================================================
+  ;; Thread Operations
+  ;; ============================================================
+
+  (fn spawn ((arena Arena) (func (Fn () Int)))
+    (@intent "Spawn a new thread running func()")
+    (@spec ((Arena (Fn () Int)) -> (Ptr (Thread Int))))
+    (@alloc arena)
+    (@post {$result != nil})
+    (let ((th (arena-alloc arena (sizeof (Thread Int)))))
+      ;; Store function pointer
+      (set! th.func (cast (Ptr Void) func))
+      (set! th.done false)
+      ;; Create thread using generated trampoline
+      ;; The trampoline function slop_thread_int_entry is generated by the transpiler
+      (pthread-create (addr th.id)
+                      nil
+                      (cast (Ptr Void) (c-inline "(void*)slop_thread_int_entry"))
+                      (cast (Ptr Void) th))
+      th))
+
+  (fn spawn-with-chan ((arena Arena) (func (Fn ((Ptr (Chan Int))) Int)) (ch (Ptr (Chan Int))))
+    (@intent "Spawn a thread that receives a channel as its argument")
+    (@spec ((Arena (Fn ((Ptr (Chan Int))) Int) (Ptr (Chan Int))) -> (Ptr ThreadWithChan)))
+    (@alloc arena)
+    (@pre {ch != nil})
+    (@post {$result != nil})
+    (let ((th (arena-alloc arena (sizeof ThreadWithChan))))
+      ;; Store function and channel
+      (set! th.func (cast (Ptr Void) func))
+      (set! th.chan ch)
+      (set! th.done false)
+      ;; Create thread using our trampoline
+      (pthread-create (addr th.id)
+                      nil
+                      (cast (Ptr Void) thread-with-chan-entry)
+                      (cast (Ptr Void) th))
+      th))
+
+  ;; Trampoline for spawn-with-chan - called by pthread, calls func(chan)
+  (fn thread-with-chan-entry ((arg (Ptr Void)))
+    (@intent "Entry point for threads spawned with spawn-with-chan")
+    (@spec (((Ptr Void)) -> (Ptr Void)))
+    (let ((th (cast (Ptr ThreadWithChan) arg)))
+      ;; Call the user function with the channel argument
+      (let ((user-func (cast (Fn ((Ptr (Chan Int))) Int) th.func))
+            (ch th.chan))
+        (set! th.result (user-func ch))
+        (set! th.done true))
+      nil))
+
+  (fn join ((thread (Ptr (Thread Int))))
+    (@intent "Wait for thread to complete and return its result")
+    (@spec (((Ptr (Thread Int))) -> Int))
+    (@pre {thread != nil})
+    (pthread-join (. thread id) nil)
+    (. thread result))
+)

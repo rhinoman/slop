@@ -17,6 +17,7 @@ from slop.types import (
     RangeBounds, Constraint,
     Type, PrimitiveType, RangeType, ListType, ArrayType, MapType,
     RecordType, EnumType, UnionType, OptionType, ResultType, PtrType,
+    ChanType, ThreadType,
     FnType, TypeVar, UnknownType, UNKNOWN,
     STRING, INT, BOOL, UNIT, ARENA, BUILTIN_FUNCTIONS,
 )
@@ -469,6 +470,14 @@ class TypeChecker:
                     value_type = self.parse_type_expr(expr[2]) if len(expr) > 2 else UNKNOWN
                     return MapType(key_type, value_type)
 
+                if name == 'Chan':
+                    element_type = self.parse_type_expr(expr[1]) if len(expr) > 1 else UNKNOWN
+                    return ChanType(element_type)
+
+                if name == 'Thread':
+                    result_type = self.parse_type_expr(expr[1]) if len(expr) > 1 else UNKNOWN
+                    return ThreadType(result_type)
+
                 if name == 'Ptr':
                     pointee = self.parse_type_expr(expr[1]) if len(expr) > 1 else UNKNOWN
                     return PtrType(pointee)
@@ -647,8 +656,19 @@ class TypeChecker:
         name = sym.name
 
         # Handle dotted field access: foo.bar.baz
+        # or enum value access: EnumName.variant
         if '.' in name:
             parts = name.split('.')
+            # Check if base is an enum type - if so, this is enum value access
+            base_enum_type = self.env.lookup_type(parts[0])
+            if isinstance(base_enum_type, EnumType):
+                # Enum value access: EnumName.variant
+                variant = parts[1]
+                if base_enum_type.has_variant(variant):
+                    return base_enum_type
+                else:
+                    self.error(f"Enum '{parts[0]}' has no variant '{variant}'", sym)
+                    return UNKNOWN
             # Check refinements first, then variable lookup
             base_type = self._get_refined_type(parts[0])
             if base_type is None:
@@ -683,6 +703,9 @@ class TypeChecker:
         if name == 'none':
             # Bare 'none' is Option type with unknown inner type
             return OptionType(self.fresh_type_var('T'))
+        if name == 'unit':
+            # Unit value for void results
+            return PrimitiveType('Unit')
         if name.startswith("'"):
             # Quoted symbol - enum variant, look up which enum it belongs to
             variant_name = name[1:]  # Strip the quote
@@ -1750,7 +1773,7 @@ class TypeChecker:
         if isinstance(collection_type, ListType):
             element_type = collection_type.element_type
         elif isinstance(collection_type, PrimitiveType) and collection_type.name == 'String':
-            element_type = PrimitiveType('Char')
+            element_type = PrimitiveType('U8')
         else:
             self.error(f"for-each requires a List or String, got {collection_type}", binding[1])
 
@@ -2138,7 +2161,7 @@ class TypeChecker:
             elif isinstance(arg_type, PrimitiveType):
                 is_valid = arg_type.name in ('Int', 'Bool', 'String', 'Float',
                                               'I8', 'I16', 'I32', 'I64',
-                                              'U8', 'U16', 'U32', 'U64', 'Char')
+                                              'U8', 'U16', 'U32', 'U64')
             elif isinstance(arg_type, RecordType) and arg_type.name == 'String':
                 is_valid = True
             if not is_valid and not isinstance(arg_type, UnknownType):
