@@ -38,9 +38,7 @@
   (import emit (emit-standard-includes emit-include))
   (import defn (transpile-type transpile-function transpile-const is-const-form emit-forward-declaration
                 is-ffi-form is-ffi-struct-form transpile-ffi transpile-ffi-struct
-                get-return-type get-result-type-name build-param-str
-                is-range-type parse-range-bounds-ctx choose-range-c-type emit-range-bounds-check
-                ParsedRangeBounds))
+                get-return-type get-result-type-name build-param-str))
   (import stmt (transpile-stmt))
   (import expr (transpile-expr))
   (import match (transpile-match))
@@ -1511,18 +1509,13 @@
                             (c-name (ctx-prefix-type ctx base-c-name)))
                         (match (list-get items 2)
                           ((some body-expr)
-                            (cond
-                              ;; Check if range type - needs bounds checking constructor
-                              ((is-range-type body-expr)
-                                (emit-range-typedef-to-header ctx c-name body-expr))
-                              ;; Check if Array type - needs special handling
-                              ((is-array-type-body body-expr)
-                                (emit-array-typedef-to-header ctx c-name body-expr))
-                              ;; Standard typedef
-                              (else
-                                (let ((c-type (to-c-type-prefixed ctx body-expr)))
-                                  (ctx-emit-header ctx (ctx-str5 ctx "typedef " c-type " " c-name ";"))
-                                  (ctx-emit-header ctx "")))))
+                            ;; Check if Array type - needs special handling
+                            (if (is-array-type-body body-expr)
+                              (emit-array-typedef-to-header ctx c-name body-expr)
+                              ;; Get the C type for the body (with prefixing)
+                              (let ((c-type (to-c-type-prefixed ctx body-expr)))
+                                (ctx-emit-header ctx (ctx-str5 ctx "typedef " c-type " " c-name ";"))
+                                (ctx-emit-header ctx ""))))
                           ((none) (do)))))
                     (else (do))))
                 ((none) (do))))))
@@ -1575,63 +1568,6 @@
                   (ctx-emit-header ctx (ctx-str3 ctx "typedef void* " c-name ";")))))))
         (else
           (ctx-emit-header ctx (ctx-str3 ctx "typedef void* " c-name ";"))))))
-
-  (fn emit-range-typedef-to-header ((ctx (Ptr TranspileContext)) (c-name String) (body-expr (Ptr SExpr)))
-    (@intent "Emit range type typedef and bounds-checking constructor to header")
-    (@spec (((Ptr TranspileContext) String (Ptr SExpr)) -> Unit))
-    (@pre {ctx != nil})
-    (@pre {body-expr != nil})
-    (let ((arena (. (deref ctx) arena))
-          (bounds (parse-range-bounds-ctx ctx body-expr)))
-      (match bounds
-        ((some min-max)
-          ;; Access fields directly via pointer - let C use __auto_type for proper inference
-          (let ((min-val (. (deref min-max) first))
-                (max-val (. (deref min-max) second))
-                ;; Choose smallest fitting C type
-                (c-type (choose-range-c-type min-val max-val)))
-            ;; Emit typedef
-            (ctx-emit-header ctx (ctx-str5 ctx "typedef " c-type " " c-name ";"))
-            (ctx-emit-header ctx "")
-            ;; Emit static inline constructor with bounds check
-            (ctx-emit-header ctx (ctx-str5 ctx "static inline " c-name " " c-name "_new(int64_t v) {"))
-            ;; Emit SLOP_PRE bounds check
-            (emit-range-bounds-check-header ctx c-name min-val max-val)
-            (ctx-emit-header ctx (ctx-str3 ctx "    return (" c-name ")v;"))
-            (ctx-emit-header ctx "}")
-            (ctx-emit-header ctx "")))
-        ((none)
-          ;; Fallback: no valid bounds parsed, just emit typedef
-          (ctx-emit-header ctx (ctx-str3 ctx "typedef int64_t " c-name ";"))
-          (ctx-emit-header ctx "")))))
-
-  (fn emit-range-bounds-check-header ((ctx (Ptr TranspileContext)) (type-name String) (min-val (Option Int)) (max-val (Option Int)))
-    (@intent "Emit SLOP_PRE bounds check for range type constructor to header")
-    (@spec (((Ptr TranspileContext) String (Option Int) (Option Int)) -> Unit))
-    (@pre {ctx != nil})
-    (let ((arena (. (deref ctx) arena)))
-      (match min-val
-        ((some min-v)
-          (match max-val
-            ((some max-v)
-              ;; Both bounds: v >= min && v <= max
-              (let ((min-str (int-to-string arena min-v))
-                    (max-str (int-to-string arena max-v)))
-                (ctx-emit-header ctx (ctx-str5 ctx "    SLOP_PRE(v >= " min-str " && v <= " max-str
-                                (ctx-str5 ctx ", \"" type-name " in range " min-str (ctx-str3 ctx ".." max-str "\");"))))))
-            ((none)
-              ;; Only min bound: v >= min
-              (let ((min-str (int-to-string arena min-v)))
-                (ctx-emit-header ctx (ctx-str5 ctx "    SLOP_PRE(v >= " min-str ", \"" type-name (ctx-str ctx " >= " (ctx-str ctx min-str "\");"))))))))
-        ((none)
-          (match max-val
-            ((some max-v)
-              ;; Only max bound: v <= max
-              (let ((max-str (int-to-string arena max-v)))
-                (ctx-emit-header ctx (ctx-str5 ctx "    SLOP_PRE(v <= " max-str ", \"" type-name (ctx-str ctx " <= " (ctx-str ctx max-str "\");"))))))
-            ((none)
-              ;; No bounds - no check needed
-              (do)))))))
 
   (fn get-array-size-string ((expr (Ptr SExpr)))
     (@intent "Get number value as string for array size")

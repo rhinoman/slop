@@ -224,15 +224,11 @@
                                                       (let ((val-c (transpile-expr ctx val-expr)))
                                                         (ctx-str5 ctx "(" c-type "){.has_value = 1, .value = " val-c "}")))
                                                     ((none)
-                                                      ;; Not a some expression - check for none (both bare and list form)
-                                                      (if (is-none-call init-expr)
-                                                        ;; (none) list form - generate typed none with binding's type
-                                                        (ctx-str3 ctx "(" c-type "){.has_value = false}")
-                                                        ;; Otherwise check for bare none symbol
-                                                        (let ((init-c (transpile-expr ctx init-expr)))
-                                                          (if (string-eq init-c "none")
-                                                            (ctx-str3 ctx "(" c-type "){.has_value = false}")
-                                                            init-c))))))
+                                                      ;; Not a some expression - check for none
+                                                      (let ((init-c (transpile-expr ctx init-expr)))
+                                                        (if (string-eq init-c "none")
+                                                          (ctx-str3 ctx "(" c-type "){.has_value = false}")
+                                                          init-c)))))
                                                 ;; Not an Option type - regular transpilation
                                                 (transpile-expr ctx init-expr))))
                                         ;; Emit declaration with type
@@ -296,23 +292,6 @@
                 ((none) (do))))))
         (else (do)))
       result))
-
-  (fn is-none-call ((expr (Ptr SExpr)))
-    (@intent "Check if expr is (none) - the list form of none constructor")
-    (@spec (((Ptr SExpr)) -> Bool))
-    (@pre {expr != nil})
-    (match (deref expr)
-      ((list lst)
-        (let ((items (. lst items)))
-          (if (== (list-len items) 1)
-            (match (list-get items 0)
-              ((some head-expr)
-                (match (deref head-expr)
-                  ((symbol sym) (string-eq (. sym name) "none"))
-                  (else false)))
-              ((none) false))
-            false)))
-      (else false)))
 
   ;; ============================================================
   ;; If Statement
