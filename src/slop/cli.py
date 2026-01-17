@@ -268,15 +268,15 @@ def parse_with_fallback(input_file: str, prefer_native: bool = False, verbose: b
 
 def cmd_parse(args):
     """Parse and display SLOP file"""
-    use_native = getattr(args, 'native', False)
+    use_native = not getattr(args, 'python', False)
 
     try:
-        # When --native, try to use native parser for display output
+        # Try native parser by default
         if use_native:
             import subprocess
             parser_bin = find_native_component('parser')
             if parser_bin:
-                print(f"[native] Using {parser_bin} for parsing", file=sys.stderr)
+                print(f"Using native parser: {parser_bin}", file=sys.stderr)
                 result = subprocess.run(
                     [str(parser_bin), args.input],
                     capture_output=True,
@@ -288,9 +288,9 @@ def cmd_parse(args):
                     return 0
                 else:
                     # Native parser failed, fall back to Python
-                    print("[native] Native parser failed, falling back to Python", file=sys.stderr)
+                    print("Native parser failed, falling back to Python", file=sys.stderr)
             else:
-                print("[native] Parser: not found, using Python", file=sys.stderr)
+                print("Native parser not found, falling back to Python", file=sys.stderr)
 
         # Python parser
         ast = parse_file(args.input)
@@ -330,7 +330,27 @@ def cmd_transpile(args):
 
     try:
         input_path = Path(args.input)
+        use_native = not getattr(args, 'python', False)
 
+        # Try native transpiler by default
+        if use_native:
+            c_code, success = transpile_native(str(input_path))
+            if success:
+                if args.output:
+                    with open(args.output, 'w') as f:
+                        f.write(c_code)
+                    print(f"Wrote {args.output}")
+                else:
+                    print(c_code)
+                return 0
+            else:
+                # Native transpiler failed or not available, fall back to Python
+                if c_code:  # c_code contains error message on failure
+                    print(f"Native transpiler not available, falling back to Python", file=sys.stderr)
+                else:
+                    print("Native transpiler not found, falling back to Python", file=sys.stderr)
+
+        # Python transpiler path
         # Parse entry file to check for imports
         with open(input_path) as f:
             source = f.read()
@@ -1621,9 +1641,9 @@ def _extract_context(form: SList) -> dict:
 def cmd_check(args):
     """Validate SLOP file with type checking"""
     try:
-        use_native = getattr(args, 'native', False)
+        use_native = not getattr(args, 'python', False)
 
-        # Check for native checker
+        # Try native checker by default
         if use_native:
             checker_bin = find_native_component('checker')
             if checker_bin:
@@ -1820,27 +1840,27 @@ def cmd_build(args):
 
         print(f"Building {input_path} -> {output}")
 
-        # Check for --native flag
-        use_native = getattr(args, 'native', False)
+        # Use native by default unless --python flag is set
+        use_native = not getattr(args, 'python', False)
         native_transpiler_bin = None
         native_checker_bin = None
         if use_native:
             # Report which native components are available
             parser_bin = find_native_component('parser')
             if parser_bin:
-                print(f"  [native] Parser: {parser_bin}")
+                print(f"  Using native parser: {parser_bin}")
             else:
-                print("  [native] Parser: not found, using Python")
+                print("  Native parser not found, falling back to Python")
             native_checker_bin = find_native_component('checker')
             if native_checker_bin:
-                print(f"  [native] Type checker: {native_checker_bin}")
+                print(f"  Using native type checker: {native_checker_bin}")
             else:
-                print("  [native] Type checker: not found, using Python")
+                print("  Native type checker not found, falling back to Python")
             native_transpiler_bin = find_native_component('transpiler')
             if native_transpiler_bin:
-                print(f"  [native] Transpiler: {native_transpiler_bin}")
+                print(f"  Using native transpiler: {native_transpiler_bin}")
             else:
-                print("  [native] Transpiler: not found, using Python")
+                print("  Native transpiler not found, falling back to Python")
 
         # Create output directory if needed
         output_dir = Path(output).parent
@@ -2485,24 +2505,25 @@ def cmd_test(args):
 
         # Transpile the source
         print("  Transpiling...")
-        use_native = getattr(args, 'native', False)
+        use_native = not getattr(args, 'python', False)
         c_code = None
         used_native_transpiler = False  # Track if native transpiler was used (always prefixes)
 
+        # Try native transpiler by default
         if use_native:
             native_transpiler_bin = find_native_component('transpiler')
             if native_transpiler_bin:
-                print(f"  [native] Transpiler: {native_transpiler_bin}")
+                print(f"  Using native transpiler: {native_transpiler_bin}")
                 c_code, success = transpile_native(str(input_path))
                 if not success:
-                    print(f"  [native] Transpiler failed, falling back to Python")
+                    print("  Native transpiler failed, falling back to Python")
                     if c_code:  # c_code contains error message on failure
-                        print(f"  [native] Error: {c_code}")
+                        print(f"    Error: {c_code}")
                     c_code = None
                 else:
                     used_native_transpiler = True  # Native transpiler always uses module prefixes
             else:
-                print("  [native] Transpiler: not found, using Python")
+                print("  Native transpiler not found, falling back to Python")
 
         if c_code is None:
             if is_multi_module:
@@ -3023,8 +3044,8 @@ def cmd_verify(args):
     # Determine failure mode
     mode = args.mode if args.mode else "error"
 
-    # Check if using native parser
-    use_native = getattr(args, 'native', False)
+    # Use native parser by default unless --python flag is set
+    use_native = not getattr(args, 'python', False)
     if use_native:
         ast, success = parse_native_json(args.input)
         if not success:
@@ -3038,7 +3059,7 @@ def cmd_verify(args):
                 use_native = False
         if use_native and success:
             if args.verbose:
-                print("[native] Using native parser", file=sys.stderr)
+                print("Using native parser", file=sys.stderr)
             results = verify_ast(ast, filename=args.input, mode=mode, timeout_ms=args.timeout)
     else:
         # Run verification with Python parser
@@ -3118,8 +3139,8 @@ def main():
     p = subparsers.add_parser('parse', help='Parse SLOP file')
     p.add_argument('input')
     p.add_argument('--holes', action='store_true', help='Show only holes')
-    p.add_argument('--native', action='store_true',
-                   help='Use native components where available, fall back to Python')
+    p.add_argument('--python', action='store_true',
+                   help='Use Python toolchain instead of native')
 
     # transpile
     p = subparsers.add_parser('transpile', help='Convert to C')
@@ -3127,6 +3148,8 @@ def main():
     p.add_argument('-o', '--output')
     p.add_argument('-I', '--include', action='append', default=[],
                    help='Add search path for module imports')
+    p.add_argument('--python', action='store_true',
+                   help='Use Python toolchain instead of native')
 
     # fill
     p = subparsers.add_parser('fill', help='Fill holes with LLM')
@@ -3150,8 +3173,8 @@ def main():
     # check
     p = subparsers.add_parser('check', help='Validate')
     p.add_argument('input')
-    p.add_argument('--native', action='store_true',
-                   help='Use native type checker')
+    p.add_argument('--python', action='store_true',
+                   help='Use Python toolchain instead of native')
 
     # check-hole
     p = subparsers.add_parser('check-hole', help='Validate expression against expected type')
@@ -3179,8 +3202,8 @@ def main():
     p.add_argument('--debug', action='store_true')
     p.add_argument('--library', choices=['static', 'shared'],
                    help='Build as library instead of executable')
-    p.add_argument('--native', action='store_true',
-                   help='Use native components where available, fall back to Python')
+    p.add_argument('--python', action='store_true',
+                   help='Use Python toolchain instead of native')
 
     # derive
     p = subparsers.add_parser('derive', help='Generate SLOP from schemas')
@@ -3211,8 +3234,8 @@ def main():
         help='Z3 solver timeout in milliseconds (default: 5000)')
     p.add_argument('-v', '--verbose', action='store_true',
         help='Show counterexamples and skipped contracts')
-    p.add_argument('--native', action='store_true',
-        help='Use native parser where available, fall back to Python')
+    p.add_argument('--python', action='store_true',
+        help='Use Python toolchain instead of native')
 
     # ref
     p = subparsers.add_parser('ref', help='Language reference for AI assistants')
@@ -3235,8 +3258,8 @@ def main():
         help='Add search path for module imports')
     p.add_argument('-v', '--verbose', action='store_true',
         help='Show generated C code on failure')
-    p.add_argument('--native', action='store_true',
-        help='Use native components where available, fall back to Python')
+    p.add_argument('--python', action='store_true',
+        help='Use Python toolchain instead of native')
 
     args = parser.parse_args()
 
