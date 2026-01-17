@@ -76,9 +76,9 @@
   (type AsciiChar (Int 0 .. 127))
 
   ;; Internal helper
-  (fn min ((a Int) (b Int))
+  (fn min ((a I64) (b I64))
     (@intent "Return the smaller of two integers")
-    (@spec ((Int Int) -> Int))
+    (@spec ((I64 I64) -> I64))
     (@pure)
     (if (< a b) a b))
 
@@ -476,8 +476,8 @@
     (@pre (<= start (. s len)))
     (@example (arena "hello world" 0 5) -> "hello")
     (@example (arena "hello world" 6 5) -> "world")
-    (let ((slen (cast Int (. s len)))
-          (actual-len (min len (- slen start))))
+    (let ((slen (cast I64 (. s len)))
+          (actual-len (min (cast I64 len) (cast I64 (- slen (cast I64 start))))))
       (if (== actual-len 0)
         (String (cast (Ptr U8) (arena-alloc arena 1)) (cast U64 0))
         (let ((buf (arena-alloc arena (+ actual-len 1))))
@@ -806,8 +806,8 @@
     (@pure)
     (@example ("ABC" "abc") -> 0)
     (@example ("abc" "ABD") -> -1)
-    (let ((alen (cast Int (. a len)))
-          (blen (cast Int (. b len)))
+    (let ((alen (cast I64 (. a len)))
+          (blen (cast I64 (. b len)))
           (min-len (min alen blen))
           (mut i 0)
           (mut result 0))
