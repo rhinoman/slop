@@ -195,17 +195,17 @@ def parse_native_json(input_file: str):
 
 
 def transpile_native(input_file: str):
-    """Transpile using native transpiler, returns (c_code, success).
+    """Transpile using native transpiler, returns (c_code, public_headers, success).
 
-    Returns tuple of (output, success). If native transpiler isn't available,
-    returns (None, False).
+    Returns tuple of (output, public_headers, success). If native transpiler isn't available,
+    returns (None, {}, False). public_headers is a dict of module_name -> public_header_content.
     """
     import subprocess
     import json
 
     transpiler_bin = find_native_component('transpiler')
     if not transpiler_bin:
-        return None, False
+        return None, {}, False
 
     try:
         result = subprocess.run(
@@ -217,6 +217,7 @@ def transpile_native(input_file: str):
             # Parse JSON output and combine into single C file
             data = json.loads(result.stdout)
             c_parts = ['#include "slop_runtime.h"', '']
+            public_headers = {}
             main_mod = None
             for mod_name, mod_data in data.items():
                 c_parts.append(mod_data['header'])
@@ -228,15 +229,55 @@ def transpile_native(input_file: str):
                 # Check if this module exports main
                 if f'{mod_name}_main' in mod_data['header']:
                     main_mod = mod_name
+                # Collect public headers
+                pub_header = mod_data.get('public_header', '')
+                if pub_header:
+                    public_headers[mod_name] = pub_header
             # Add main wrapper if module exports main
             if main_mod:
                 c_parts.append(f'\nint main(void) {{ return (int){main_mod}_main(); }}\n')
-            return '\n'.join(c_parts), True
-        return result.stderr, False
+            return '\n'.join(c_parts), public_headers, True
+        return result.stderr, {}, False
     except json.JSONDecodeError as e:
-        return f"Failed to parse transpiler output: {e}", False
+        return f"Failed to parse transpiler output: {e}", {}, False
     except Exception as e:
-        return str(e), False
+        return str(e), {}, False
+
+
+def transpile_native_split(input_file: str):
+    """Transpile using native transpiler, returns split headers/impls for library builds.
+
+    Returns tuple of (results, success) where results is a dict of:
+      module_name -> (header, impl, public_header)
+    If native transpiler isn't available, returns ({}, False).
+    """
+    import subprocess
+    import json
+
+    transpiler_bin = find_native_component('transpiler')
+    if not transpiler_bin:
+        return {}, False
+
+    try:
+        result = subprocess.run(
+            [str(transpiler_bin), input_file],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            results = {}
+            for mod_name, mod_data in data.items():
+                header = mod_data['header']
+                impl = mod_data['impl']
+                pub_header = mod_data.get('public_header', '')
+                results[mod_name] = (header, impl, pub_header)
+            return results, True
+        return {}, False
+    except json.JSONDecodeError:
+        return {}, False
+    except Exception:
+        return {}, False
 
 
 def parse_with_fallback(input_file: str, prefer_native: bool = False, verbose: bool = False):
@@ -334,7 +375,7 @@ def cmd_transpile(args):
 
         # Try native transpiler by default
         if use_native:
-            c_code, success = transpile_native(str(input_path))
+            c_code, _public_headers, success = transpile_native(str(input_path))
             if success:
                 if args.output:
                     with open(args.output, 'w') as f:
@@ -1978,8 +2019,8 @@ def cmd_build(args):
                     return 1
                 try:
                     results = json.loads(result.stdout)
-                    # Convert from {"mod": {"header": ..., "impl": ...}} to {"mod": (header, impl)}
-                    results = {name: (data['header'], data['impl']) for name, data in results.items()}
+                    # Convert from {"mod": {"header": ..., "impl": ..., "public_header": ...}} to {"mod": (header, impl, public_header)}
+                    results = {name: (data['header'], data['impl'], data.get('public_header', '')) for name, data in results.items()}
                 except json.JSONDecodeError as e:
                     print(f"Failed to parse native transpiler output: {e}")
                     return 1
@@ -1991,9 +2032,20 @@ def cmd_build(args):
             # Write to temp directory and compile
             runtime_path = _get_runtime_path()
 
+            # Collect public headers for library builds
+            public_headers = {}
+
             with tempfile.TemporaryDirectory() as tmpdir:
                 c_files = []
-                for mod_name, (header, impl) in results.items():
+                for mod_name, result_tuple in results.items():
+                    # Handle both (header, impl) and (header, impl, public_header) formats
+                    if len(result_tuple) == 3:
+                        header, impl, public_header = result_tuple
+                        if public_header:
+                            public_headers[mod_name] = public_header
+                    else:
+                        header, impl = result_tuple
+
                     # Prefix with slop_ to avoid C stdlib conflicts (e.g., ctype.h)
                     c_mod_name = mod_name.replace('-', '_')
                     header_path = os.path.join(tmpdir, f"slop_{c_mod_name}.h")
@@ -2040,6 +2092,14 @@ def cmd_build(args):
                         return 1
                     print(f"✓ Built {lib_file}")
 
+                    # Write public headers for library builds
+                    for mod_name, pub_header in public_headers.items():
+                        c_mod_name = mod_name.replace('-', '_')
+                        pub_header_path = f"{c_mod_name}_public.h"
+                        with open(pub_header_path, 'w') as f:
+                            f.write(pub_header)
+                        print(f"  Public header: {pub_header_path}")
+
                 elif library_mode == 'shared':
                     ext = ".dylib" if sys.platform == "darwin" else ".so"
                     lib_file = f"{output}{ext}"
@@ -2053,6 +2113,14 @@ def cmd_build(args):
                         print(f"Compilation failed:\n{result.stderr}")
                         return 1
                     print(f"✓ Built {lib_file}")
+
+                    # Write public headers for library builds
+                    for mod_name, pub_header in public_headers.items():
+                        c_mod_name = mod_name.replace('-', '_')
+                        pub_header_path = f"{c_mod_name}_public.h"
+                        with open(pub_header_path, 'w') as f:
+                            f.write(pub_header)
+                        print(f"  Public header: {pub_header_path}")
 
                 else:
                     # Default: build executable
@@ -2116,20 +2184,54 @@ def cmd_build(args):
 
             # Transpile using native transpiler if available, else Python
             print("  Transpiling to C...")
-            if native_transpiler_bin:
-                c_code, success = transpile_native(str(input_path))
+            transpiler = None  # Keep reference for public header generation (Python path)
+            native_public_headers = {}  # Public headers from native transpiler
+            native_module_headers = {}  # Module headers from native transpiler (for library builds)
+            module_name = input_path.stem
+            c_mod_name = module_name.replace('-', '_')
+
+            if library_mode and native_transpiler_bin:
+                # For library builds with native transpiler, use split output to get separate header
+                split_results, success = transpile_native_split(str(input_path))
+                if success and module_name in split_results:
+                    header, impl, pub_header = split_results[module_name]
+                    native_module_headers[module_name] = header
+                    if pub_header:
+                        native_public_headers[module_name] = pub_header
+                    # Build C file with proper includes
+                    c_code = f'#include "slop_runtime.h"\n#include "slop_{c_mod_name}.h"\n\n{impl}'
+                else:
+                    # Fall back to Python transpiler
+                    print("  Native transpiler failed, falling back to Python...")
+                    from slop.transpiler import Transpiler
+                    transpiler = Transpiler()
+                    c_code = transpiler.transpile(ast)
+            elif native_transpiler_bin:
+                c_code, native_public_headers, success = transpile_native(str(input_path))
                 if not success:
                     print(f"  Native transpiler failed: {c_code}")
                     print("  Falling back to Python transpiler...")
                     from slop.transpiler import Transpiler
-                    c_code = Transpiler().transpile(ast)
+                    transpiler = Transpiler()
+                    c_code = transpiler.transpile(ast)
+                    native_public_headers = {}  # Clear since we fell back to Python
             else:
                 from slop.transpiler import Transpiler
-                c_code = Transpiler().transpile(ast)
+                transpiler = Transpiler()
+                c_code = transpiler.transpile(ast)
 
         c_file = f"{output}.c"
         with open(c_file, 'w') as f:
             f.write(c_code)
+
+        # Write module header for library builds (needed for C interop)
+        if library_mode and native_module_headers:
+            for mod_name, header in native_module_headers.items():
+                c_mod_name = mod_name.replace('-', '_')
+                header_path = f"slop_{c_mod_name}.h"
+                with open(header_path, 'w') as f:
+                    f.write(header)
+                print(f"  Module header: {header_path}")
 
         # Compile
         print("  Compiling...")
@@ -2169,6 +2271,21 @@ def cmd_build(args):
             Path(obj_file).unlink(missing_ok=True)
             print(f"✓ Built {lib_file}")
 
+            # Generate public header for library builds (single-file path)
+            module_name = input_path.stem
+            pub_header = None
+            if native_public_headers:
+                # Use public header from native transpiler
+                pub_header = native_public_headers.get(module_name, '')
+            elif transpiler and transpiler.public_functions:
+                # Use public header from Python transpiler
+                pub_header = transpiler.generate_public_header(module_name)
+            if pub_header:
+                pub_header_path = f"{module_name}_public.h"
+                with open(pub_header_path, 'w') as f:
+                    f.write(pub_header)
+                print(f"  Public header: {pub_header_path}")
+
         elif library_mode == 'shared':
             # Compile to shared library
             ext = ".dylib" if sys.platform == "darwin" else ".so"
@@ -2186,6 +2303,21 @@ def cmd_build(args):
                 return 1
 
             print(f"✓ Built {lib_file}")
+
+            # Generate public header for library builds (single-file path)
+            module_name = input_path.stem
+            pub_header = None
+            if native_public_headers:
+                # Use public header from native transpiler
+                pub_header = native_public_headers.get(module_name, '')
+            elif transpiler and transpiler.public_functions:
+                # Use public header from Python transpiler
+                pub_header = transpiler.generate_public_header(module_name)
+            if pub_header:
+                pub_header_path = f"{module_name}_public.h"
+                with open(pub_header_path, 'w') as f:
+                    f.write(pub_header)
+                print(f"  Public header: {pub_header_path}")
 
         else:
             # Default: build executable
@@ -2514,7 +2646,7 @@ def cmd_test(args):
             native_transpiler_bin = find_native_component('transpiler')
             if native_transpiler_bin:
                 print(f"  Using native transpiler: {native_transpiler_bin}")
-                c_code, success = transpile_native(str(input_path))
+                c_code, _public_headers, success = transpile_native(str(input_path))
                 if not success:
                     print("  Native transpiler failed, falling back to Python")
                     if c_code:  # c_code contains error message on failure

@@ -98,6 +98,13 @@ class Transpiler:
         # Match counter for unique scrutinee variable names in nested matches
         self.match_counter: int = 0
 
+        # Function C name overrides for :c-name support
+        self.c_name_overrides: Dict[str, str] = {}  # raw_func_name -> clean_c_name
+
+        # Public API tracking (for library header generation)
+        self.public_functions: List[dict] = []  # {clean_name, param_str, return_type}
+        self.public_types: Set[str] = set()  # Type names referenced by public functions
+
         # ScopedPtr tracking - stack of scopes, each maps var_name -> pointee_c_type
         self.scoped_vars: List[Dict[str, str]] = [{}]
         self.records_needing_destructor: Dict[str, List[str]] = {}  # record_name -> [scoped_field_names]
@@ -2091,6 +2098,9 @@ class Transpiler:
                 self.emit_forward_declaration(fn)
             self.emit("")
 
+        # Emit function C name aliases for :c-name support
+        self.emit_c_name_aliases()
+
         # Third pass: emit function bodies
         for fn in functions:
             self.transpile_function(fn)
@@ -2098,7 +2108,15 @@ class Transpiler:
     def emit_forward_declaration(self, form: SList):
         """Emit function forward declaration"""
         raw_name = form[1].name
-        name = self.to_qualified_c_name(raw_name)
+        mangled_name = self.to_qualified_c_name(raw_name)
+        # Check for :c-name override
+        c_name_override = self._extract_fn_c_name(form)
+        if c_name_override:
+            name = c_name_override
+            # Register alias for later emission
+            self.c_name_overrides[raw_name] = c_name_override
+        else:
+            name = mangled_name
         params = form[2] if len(form) > 2 else SList([])
         return_type = self._get_return_type(form)
 
@@ -2118,6 +2136,16 @@ class Transpiler:
 
         self.emit(f"{return_type} {name}({', '.join(param_strs) or 'void'});")
 
+    def emit_c_name_aliases(self):
+        """Emit #define aliases for functions with :c-name"""
+        if self.c_name_overrides:
+            self.emit("/* Function name aliases for C interop */")
+            for raw_name, clean_name in self.c_name_overrides.items():
+                mangled_name = self.to_qualified_c_name(raw_name)
+                if mangled_name != clean_name:
+                    self.emit(f"#define {mangled_name} {clean_name}")
+            self.emit("")
+
     def _get_return_type(self, form: SList) -> str:
         """Extract return type from function form"""
         for item in form.items[3:]:
@@ -2135,6 +2163,99 @@ class Transpiler:
                 if spec and isinstance(spec, SList) and len(spec) >= 3:
                     return spec[-1]
         return None
+
+    def _extract_fn_c_name(self, form: SList) -> Optional[str]:
+        """Extract :c-name from function form if present"""
+        # Look for :c-name keyword followed by string literal in function items
+        items = form.items[3:]  # Skip fn, name, params
+        for i, item in enumerate(items):
+            if isinstance(item, Symbol) and item.name == ':c-name':
+                # Next item should be the C name string
+                if i + 1 < len(items):
+                    c_name_item = items[i + 1]
+                    if isinstance(c_name_item, String):
+                        return c_name_item.value
+        return None
+
+    def _collect_public_types(self, params: SList, return_type_expr: Optional[SExpr]):
+        """Collect user-defined types referenced by a public API function"""
+        # Collect types from parameters
+        for p in params:
+            if isinstance(p, SList) and len(p) >= 2:
+                mode, pname, ptype_expr = self._parse_parameter_mode(p)
+                if ptype_expr:
+                    self._collect_type_from_expr(ptype_expr)
+
+        # Collect type from return type
+        if return_type_expr:
+            self._collect_type_from_expr(return_type_expr)
+
+    def _collect_type_from_expr(self, type_expr: SExpr):
+        """Recursively collect user-defined types from a type expression"""
+        if isinstance(type_expr, Symbol):
+            type_name = type_expr.name
+            # Check if it's a user-defined type (not builtin)
+            if type_name not in self.builtin_types and type_name in self.types:
+                self.public_types.add(type_name)
+        elif isinstance(type_expr, SList) and len(type_expr) >= 1:
+            head = type_expr[0]
+            if isinstance(head, Symbol):
+                op = head.name
+                if op == 'Ptr' and len(type_expr) >= 2:
+                    self._collect_type_from_expr(type_expr[1])
+                elif op == 'Array' and len(type_expr) >= 2:
+                    self._collect_type_from_expr(type_expr[1])
+                elif op == 'Option' and len(type_expr) >= 2:
+                    self._collect_type_from_expr(type_expr[1])
+                elif op == 'Result' and len(type_expr) >= 2:
+                    self._collect_type_from_expr(type_expr[1])
+                    if len(type_expr) >= 3:
+                        self._collect_type_from_expr(type_expr[2])
+
+    def generate_public_header(self, module_name: str) -> str:
+        """Generate public API header content for library builds"""
+        if not self.public_functions:
+            return ""
+
+        c_module_name = self.to_c_name(module_name)
+        guard = f"{c_module_name.upper()}_PUBLIC_H"
+
+        lines = [
+            f"#ifndef {guard}",
+            f"#define {guard}",
+            "",
+            "#include <stdint.h>",
+            "#include <stdbool.h>",
+            "#include <string.h>",
+            "",
+            "/* String type for SLOP interop */",
+            "typedef struct { uint8_t* data; size_t len; } slop_string;",
+            "",
+            "static inline slop_string slop_str(const char* s) {",
+            "    return (slop_string){ .data = (uint8_t*)s, .len = strlen(s) };",
+            "}",
+            ""
+        ]
+
+        # Emit public type definitions if any
+        if self.public_types:
+            lines.append("/* Types used by public API */")
+            for type_name in sorted(self.public_types):
+                type_info = self.types.get(type_name)
+                if type_info:
+                    # Get the C type definition from our type registry
+                    c_name = self.to_c_name(type_name)
+                    lines.append(f"/* See module header for {c_name} definition */")
+            lines.append("")
+
+        # Emit public function declarations
+        lines.append("/* Public API functions */")
+        for func in self.public_functions:
+            decl = f"{func['return_type']} {func['clean_name']}({func['param_str']});"
+            lines.append(decl)
+
+        lines.extend(["", "#endif"])
+        return "\n".join(lines)
 
     def transpile_const(self, form: SList):
         """Transpile constant definition: (const NAME Type value)
@@ -2513,7 +2634,15 @@ class Transpiler:
     def transpile_function(self, form: SList):
         """Transpile function definition"""
         raw_name = form[1].name
-        name = self.to_qualified_c_name(raw_name)
+        mangled_name = self.to_qualified_c_name(raw_name)
+        # Check for :c-name override
+        c_name_override = self._extract_fn_c_name(form)
+        if c_name_override:
+            name = c_name_override
+            # Register alias for later emission
+            self.c_name_overrides[raw_name] = c_name_override
+        else:
+            name = mangled_name
         self.local_functions.add(raw_name)  # Track for local call resolution
         params = form[2] if len(form) > 2 else SList([])
 
@@ -2570,7 +2699,10 @@ class Transpiler:
         annotations = {}
         body_exprs = []
 
-        for item in form.items[3:]:
+        items = form.items[3:]
+        i = 0
+        while i < len(items):
+            item = items[i]
             if is_form(item, '@intent'):
                 annotations['intent'] = item[1].value if len(item) > 1 else ""
             elif is_form(item, '@spec'):
@@ -2588,8 +2720,12 @@ class Transpiler:
                 pass  # Examples are for documentation/testing, not compiled
             elif is_form(item, '@pure'):
                 pass  # Purity annotation, not compiled
+            elif isinstance(item, Symbol) and item.name == ':c-name':
+                # Skip :c-name and its following value
+                i += 1  # Skip the string value that follows
             else:
                 body_exprs.append(item)
+            i += 1
 
         # Determine return type from @spec
         return_type = 'void'
@@ -2621,6 +2757,16 @@ class Transpiler:
                     # Track pointer parameters (including out/mut)
                     if self._is_pointer_type(ptype_expr) or mode in ('out', 'mut'):
                         self.pointer_vars.add(raw_pname)
+
+        # Register as public API function if :c-name override was used
+        if c_name_override:
+            self.public_functions.append({
+                'clean_name': c_name_override,
+                'param_str': ', '.join(param_strs) if param_strs else 'void',
+                'return_type': return_type
+            })
+            # Collect types referenced by this public function
+            self._collect_public_types(params, ret_type_expr)
 
         self.emit(f"{return_type} {name}({', '.join(param_strs) or 'void'}) {{")
         self.indent += 1
@@ -6290,7 +6436,8 @@ def transpile_multi_split(modules: dict, order: list) -> dict:
         order: List of module names in topological order (dependencies first)
 
     Returns:
-        Dict mapping module_name -> (header_code, impl_code)
+        Dict mapping module_name -> (header_code, impl_code, public_header_code)
+        public_header_code is empty string if module has no public API (:c-name functions)
     """
     from slop.parser import is_form, String
 
@@ -6564,7 +6711,10 @@ def transpile_multi_split(modules: dict, order: list) -> dict:
         if transpiler.output:
             impl_lines.extend(transpiler.output)
 
-        results[mod_name] = ('\n'.join(header_lines), '\n'.join(impl_lines))
+        # Generate public header if there are public functions
+        public_header = transpiler.generate_public_header(mod_name)
+
+        results[mod_name] = ('\n'.join(header_lines), '\n'.join(impl_lines), public_header)
 
         # Accumulate enum definitions for subsequent modules
         all_enums.update(transpiler.enums)

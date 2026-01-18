@@ -1,0 +1,94 @@
+;; ============================================================
+;; C Interop Example Library
+;;
+;; This module demonstrates how to create a SLOP library with
+;; a public C API using the :c-name attribute.
+;; ============================================================
+
+(module mylib
+  (export Config Status parse-config get-status-code add-numbers)
+
+  ;; ============================================================
+  ;; Types
+  ;; ============================================================
+
+  ;; Configuration record - will be exposed in public header
+  (type Config (record
+    (timeout Int)
+    (retries Int)
+    (enabled Bool)))
+
+  ;; Status enum - will be exposed in public header
+  (type Status (enum ok error timeout))
+
+  ;; ============================================================
+  ;; Public API Functions (exposed to C via :c-name)
+  ;; ============================================================
+
+  (fn create-config ((timeout Int) (retries Int) (enabled Bool))
+    (@intent "Create a new Config with given values")
+    (@spec ((Int Int Bool) -> Config))
+    (Config timeout retries enabled)
+    :c-name "mylib_create_config")
+
+  (fn config-get-timeout ((cfg Config))
+    (@intent "Get timeout from config")
+    (@spec ((Config) -> Int))
+    (. cfg timeout)
+    :c-name "mylib_config_get_timeout")
+
+  (fn config-get-retries ((cfg Config))
+    (@intent "Get retries from config")
+    (@spec ((Config) -> Int))
+    (. cfg retries)
+    :c-name "mylib_config_get_retries")
+
+  (fn config-is-enabled ((cfg Config))
+    (@intent "Check if config is enabled")
+    (@spec ((Config) -> Bool))
+    (. cfg enabled)
+    :c-name "mylib_config_is_enabled")
+
+  (fn add-numbers ((a Int) (b Int))
+    (@intent "Add two numbers")
+    (@spec ((Int Int) -> Int))
+    (+ a b)
+    :c-name "mylib_add")
+
+  (fn multiply-numbers ((a Int) (b Int))
+    (@intent "Multiply two numbers")
+    (@spec ((Int Int) -> Int))
+    (* a b)
+    :c-name "mylib_multiply")
+
+  (fn get-status-code ((s Status))
+    (@intent "Get numeric code of status")
+    (@spec ((Status) -> Int))
+    (cond
+      ((== s ok) 0)
+      ((== s error) 1)
+      ((== s timeout) 2)
+      (else -1))
+    :c-name "mylib_status_code")
+
+  (fn parse-config ((timeout-str (Ptr Char)) (retries-str (Ptr Char)))
+    (@intent "Parse config from string arguments")
+    (@spec (((Ptr Char) (Ptr Char)) -> Config))
+    ;; In a real implementation, we'd parse the strings
+    ;; For this example, just create a default config
+    (Config 30 3 true)
+    :c-name "mylib_parse_config")
+
+  ;; ============================================================
+  ;; Internal Functions (not exposed to C)
+  ;; ============================================================
+
+  (fn validate-timeout ((timeout Int))
+    (@intent "Internal validation helper")
+    (@spec ((Int) -> Bool))
+    (and (>= timeout 0) (<= timeout 3600)))
+
+  (fn validate-retries ((retries Int))
+    (@intent "Internal validation helper")
+    (@spec ((Int) -> Bool))
+    (and (>= retries 0) (<= retries 10))))

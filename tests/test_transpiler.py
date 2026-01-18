@@ -1171,3 +1171,241 @@ class TestNativeTranspilerContracts:
         c_code = self.run_native_transpile(native_transpiler, source)
         # Should have two SLOP_PRE calls
         assert c_code.count("SLOP_PRE") >= 2
+
+
+class TestFunctionCNameOverride:
+    """Test :c-name attribute for functions"""
+
+    def test_c_name_override_in_forward_declaration(self):
+        """Function with :c-name uses clean name in forward declaration"""
+        source = '''
+        (module mymod
+          (fn my-parse-int ((s (Ptr Char)))
+            (@intent "Parse integer from string")
+            (@spec (((Ptr Char)) -> Int))
+            0
+            :c-name "parse_int"))
+        '''
+        result = transpile(source)
+        # Forward declaration should use clean name
+        assert "int64_t parse_int(char* s);" in result
+
+    def test_c_name_override_in_function_definition(self):
+        """Function with :c-name uses clean name in definition"""
+        source = '''
+        (module mymod
+          (fn my-parse-int ((s (Ptr Char)))
+            (@intent "Parse integer from string")
+            (@spec (((Ptr Char)) -> Int))
+            42
+            :c-name "parse_int"))
+        '''
+        result = transpile(source)
+        # Function definition should use clean name
+        assert "int64_t parse_int(char* s) {" in result
+
+    def test_c_name_override_emits_alias(self):
+        """Function with :c-name emits alias macro for SLOP-named function"""
+        source = '''
+        (module mymod
+          (fn my-parse-int ((s (Ptr Char)))
+            (@intent "Parse integer from string")
+            (@spec (((Ptr Char)) -> Int))
+            42
+            :c-name "parse_int"))
+        '''
+        result = transpile(source)
+        # Should emit alias: #define my_parse_int parse_int
+        # (without module prefix since prefixing is not enabled in default transpile)
+        assert "#define my_parse_int parse_int" in result
+        assert "/* Function name aliases for C interop */" in result
+
+    def test_c_name_no_override_uses_default_name(self):
+        """Function without :c-name uses default converted name"""
+        source = '''
+        (module mymod
+          (fn my-helper ((x Int))
+            (@intent "Helper function")
+            (@spec ((Int) -> Int))
+            x))
+        '''
+        result = transpile(source)
+        # Should use default name (hyphens converted to underscores)
+        assert "int64_t my_helper(int64_t x);" in result
+        assert "int64_t my_helper(int64_t x) {" in result
+
+    def test_c_name_with_multiple_functions(self):
+        """Multiple functions with :c-name override work correctly"""
+        source = '''
+        (module mymod
+          (fn parse-int ((s (Ptr Char)))
+            (@intent "Parse integer")
+            (@spec (((Ptr Char)) -> Int))
+            0
+            :c-name "parse_int")
+          (fn format-int ((n Int))
+            (@intent "Format integer")
+            (@spec ((Int) -> String))
+            "0"
+            :c-name "format_int"))
+        '''
+        result = transpile(source)
+        # Both should have clean names in forward declarations
+        assert "int64_t parse_int(char* s);" in result
+        assert "slop_string format_int(int64_t n);" in result
+
+    def test_c_name_body_not_compiled(self):
+        """The :c-name attribute should not appear in the function body"""
+        source = '''
+        (module mymod
+          (fn my-func ()
+            (@intent "Test function")
+            (@spec (() -> Int))
+            42
+            :c-name "my_func"))
+        '''
+        result = transpile(source)
+        # Should not have :c-name or "my_func" string as body code
+        assert ':c_name' not in result
+        assert 'SLOP_STR("my_func")' not in result
+        # But should use the clean name
+        assert "int64_t my_func(void)" in result
+
+
+class TestPublicHeaderGeneration:
+    """Test public API header generation for library builds"""
+
+    def test_generate_public_header_with_c_name_function(self):
+        """Functions with :c-name should appear in public header"""
+        from slop.transpiler import Transpiler
+        from slop.parser import parse
+
+        source = '''
+        (module mylib
+          (type Config (record (timeout Int) (retries Int)))
+          (fn parse-config ((s (Ptr Char)))
+            (@intent "Parse config")
+            (@spec (((Ptr Char)) -> (Ptr Config)))
+            nil
+            :c-name "mylib_parse_config")
+          (fn internal-helper ((x Int))
+            (@intent "Internal use only")
+            (@spec ((Int) -> Int))
+            (+ x 1)))
+        '''
+        ast = parse(source)
+        transpiler = Transpiler()
+        transpiler.transpile(ast)
+
+        # Generate public header
+        public_header = transpiler.generate_public_header("mylib")
+
+        # Should have header guards
+        assert "#ifndef MYLIB_PUBLIC_H" in public_header
+        assert "#define MYLIB_PUBLIC_H" in public_header
+        assert "#endif" in public_header
+
+        # Should have standard includes
+        assert "#include <stdint.h>" in public_header
+        assert "#include <stdbool.h>" in public_header
+
+        # Should have slop_string helper
+        assert "slop_string" in public_header
+        assert "slop_str" in public_header
+
+        # Should have public function declaration
+        assert "mylib_parse_config" in public_header
+
+        # Should NOT have internal function
+        assert "internal_helper" not in public_header
+        assert "internal-helper" not in public_header
+
+    def test_no_public_header_without_c_name_functions(self):
+        """Modules without :c-name functions should return empty public header"""
+        from slop.transpiler import Transpiler
+        from slop.parser import parse
+
+        source = '''
+        (module mylib
+          (fn my-func ((x Int))
+            (@intent "A function")
+            (@spec ((Int) -> Int))
+            x))
+        '''
+        ast = parse(source)
+        transpiler = Transpiler()
+        transpiler.transpile(ast)
+
+        # Generate public header - should be empty
+        public_header = transpiler.generate_public_header("mylib")
+        assert public_header == ""
+
+    def test_public_header_multiple_c_name_functions(self):
+        """Multiple :c-name functions should all appear in public header"""
+        from slop.transpiler import Transpiler
+        from slop.parser import parse
+
+        source = '''
+        (module mylib
+          (fn parse-int ((s (Ptr Char)))
+            (@intent "Parse integer")
+            (@spec (((Ptr Char)) -> Int))
+            0
+            :c-name "mylib_parse_int")
+          (fn format-int ((n Int))
+            (@intent "Format integer")
+            (@spec ((Int) -> String))
+            "0"
+            :c-name "mylib_format_int"))
+        '''
+        ast = parse(source)
+        transpiler = Transpiler()
+        transpiler.transpile(ast)
+
+        public_header = transpiler.generate_public_header("mylib")
+
+        # Both functions should appear
+        assert "mylib_parse_int" in public_header
+        assert "mylib_format_int" in public_header
+
+    def test_transpile_multi_split_returns_public_header(self):
+        """transpile_multi_split should return public header in tuple"""
+        from slop.transpiler import transpile_multi_split
+        from slop.resolver import ModuleInfo
+        from slop.parser import parse
+
+        source = '''
+        (module mylib (export parse-config)
+          (fn parse-config ((s (Ptr Char)))
+            (@intent "Parse config")
+            (@spec (((Ptr Char)) -> Int))
+            0
+            :c-name "mylib_parse_config"))
+        '''
+        ast = parse(source)
+
+        # Create mock ModuleInfo
+        from pathlib import Path
+        mod_info = ModuleInfo(
+            name="mylib",
+            path=Path("test.slop"),
+            ast=ast,
+            imports=[],
+            exports={"parse-config"}  # Set, not list
+        )
+
+        modules = {"mylib": mod_info}
+        order = ["mylib"]
+
+        results = transpile_multi_split(modules, order)
+
+        # Result should be (header, impl, public_header)
+        assert "mylib" in results
+        result = results["mylib"]
+        assert len(result) == 3
+
+        header, impl, public_header = result
+        assert header  # Should have content
+        assert impl  # Should have content
+        assert public_header  # Should have public header content
+        assert "mylib_parse_config" in public_header

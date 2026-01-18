@@ -29,7 +29,8 @@
                    ctx-push-scope ctx-pop-scope ctx-bind-var
                    ctx-prefixing-enabled ctx-get-module ctx-prefix-type
                    TypeEntry FuncEntry FuncParamType VarEntry
-                   to-c-type-prefixed))
+                   to-c-type-prefixed extract-fn-c-name
+                   PublicFuncInfo ctx-add-public-func ctx-add-public-type))
   (import ctype (to-c-type to-c-name type-to-identifier is-builtin-c-type))
   (import stmt (transpile-stmt))
   (import expr (transpile-expr))
@@ -755,7 +756,7 @@
               (set! i (+ i 1)))))
         (else (do)))
       ;; Return record - field order: has-min, has-max, min-val, max-val
-      (RangeBounds has-min has-max min-val max-val)))
+      (RangeBounds has-min has-max (cast I64 min-val) (cast I64 max-val))))
 
   (fn string-to-int ((s String))
     (@intent "Convert string to integer")
@@ -865,21 +866,25 @@
                       (let ((raw-name (. name-sym name))
                             (base-name (to-c-name arena raw-name))
                             ;; Add module prefix EXCEPT for main function
-                            (fn-name (if (string-eq base-name "main")
-                                       base-name
-                                       (ctx-prefix-type ctx base-name))))
+                            (mangled-name (if (string-eq base-name "main")
+                                            base-name
+                                            (ctx-prefix-type ctx base-name)))
+                            ;; Check for :c-name override
+                            (fn-name (extract-fn-c-name arena items mangled-name))
+                            ;; Determine if this is a public API function (has :c-name override)
+                            (is-public-api (not (string-eq fn-name mangled-name))))
                         ;; Get params
                         (match (list-get items 2)
                           ((some params-expr)
-                            (emit-function-def ctx raw-name fn-name params-expr items))
+                            (emit-function-def ctx raw-name fn-name params-expr items is-public-api))
                           ((none) (ctx-emit ctx "/* missing params */")))))
                     (else (ctx-emit ctx "/* function name must be symbol */"))))
                 ((none) (ctx-emit ctx "/* missing function name */"))))))
         (else (ctx-emit ctx "/* invalid fn form */")))))
 
-  (fn emit-function-def ((ctx (Ptr TranspileContext)) (raw-name String) (fn-name String) (params-expr (Ptr SExpr)) (items (List (Ptr SExpr))))
+  (fn emit-function-def ((ctx (Ptr TranspileContext)) (raw-name String) (fn-name String) (params-expr (Ptr SExpr)) (items (List (Ptr SExpr))) (is-public-api Bool))
     (@intent "Emit function definition")
-    (@spec (((Ptr TranspileContext) String String (Ptr SExpr) (List (Ptr SExpr))) -> Unit))
+    (@spec (((Ptr TranspileContext) String String (Ptr SExpr) (List (Ptr SExpr)) Bool) -> Unit))
     (@pre {ctx != nil})
     (@pre {params-expr != nil})
     (let ((arena (. (deref ctx) arena))
@@ -903,6 +908,11 @@
             ;; Check if we need _retval (has postconditions/assumptions and non-void return)
             (has-post (or (> (list-len postconditions) 0) (> (list-len assumptions) 0)))
             (needs-retval (and has-post (not (string-eq actual-return "void")))))
+        ;; Register as public API function if this is a :c-name function
+        (when is-public-api
+          (ctx-add-public-func ctx (PublicFuncInfo fn-name param-str actual-return))
+          ;; Collect types referenced by this public function
+          (collect-public-types ctx params-expr actual-return))
         ;; Set current return type for typed none in return statements
         (ctx-set-current-return-type ctx actual-return)
         ;; Set current result type if present, otherwise clear any previous
@@ -947,6 +957,145 @@
         ;; Clear current result type and return type
         (ctx-clear-current-result-type ctx)
         (ctx-clear-current-return-type ctx))))
+
+  ;; ============================================================
+  ;; Public Type Collection (for library header generation)
+  ;; ============================================================
+
+  (fn collect-public-types ((ctx (Ptr TranspileContext)) (params-expr (Ptr SExpr)) (return-c-type String))
+    (@intent "Collect user-defined types referenced by a public API function")
+    (@spec (((Ptr TranspileContext) (Ptr SExpr) String) -> Unit))
+    (@pre {ctx != nil})
+    (@pre {params-expr != nil})
+    (let ((arena (. (deref ctx) arena)))
+      ;; Collect types from parameters
+      (match (deref params-expr)
+        ((list lst)
+          (let ((items (. lst items))
+                (len (list-len items))
+                (mut i 0))
+            (while (< i len)
+              (match (list-get items i)
+                ((some param)
+                  (collect-param-public-type ctx param))
+                ((none) (do)))
+              (set! i (+ i 1)))))
+        (else (do)))
+      ;; Collect type from return type (if it's a user-defined type)
+      (collect-c-type-if-user-defined ctx return-c-type)))
+
+  (fn collect-param-public-type ((ctx (Ptr TranspileContext)) (param (Ptr SExpr)))
+    (@intent "Collect user-defined type from a single parameter")
+    (@spec (((Ptr TranspileContext) (Ptr SExpr)) -> Unit))
+    (@pre {ctx != nil})
+    (@pre {param != nil})
+    (match (deref param)
+      ((list lst)
+        (let ((items (. lst items))
+              (len (list-len items)))
+          (when (>= len 2)
+            ;; Check for mode: (mode name Type) or (name Type)
+            (let ((has-mode (and (>= len 3) (is-param-mode items)))
+                  (type-idx (if has-mode 2 1)))
+              (match (list-get items type-idx)
+                ((some type-expr)
+                  (collect-type-expr-public-type ctx type-expr))
+                ((none) (do)))))))
+      (else (do))))
+
+  (fn collect-type-expr-public-type ((ctx (Ptr TranspileContext)) (type-expr (Ptr SExpr)))
+    (@intent "Collect user-defined type from a type expression")
+    (@spec (((Ptr TranspileContext) (Ptr SExpr)) -> Unit))
+    (@pre {ctx != nil})
+    (@pre {type-expr != nil})
+    (let ((arena (. (deref ctx) arena)))
+      (match (deref type-expr)
+        ((symbol sym)
+          ;; Simple type name - check if user-defined
+          (let ((type-name (. sym name)))
+            (when (not (is-builtin-c-type type-name))
+              (ctx-add-public-type ctx type-name))))
+        ((list lst)
+          ;; Complex type: (Ptr T), (Array T n), (Option T), (Result T E), etc.
+          (let ((items (. lst items)))
+            (when (> (list-len items) 0)
+              (match (list-get items 0)
+                ((some head)
+                  (match (deref head)
+                    ((symbol head-sym)
+                      (let ((kind (. head-sym name)))
+                        (cond
+                          ;; (Ptr T) - collect T
+                          ((string-eq kind "Ptr")
+                            (match (list-get items 1)
+                              ((some inner)
+                                (collect-type-expr-public-type ctx inner))
+                              ((none) (do))))
+                          ;; (Array T n) - collect T
+                          ((string-eq kind "Array")
+                            (match (list-get items 1)
+                              ((some inner)
+                                (collect-type-expr-public-type ctx inner))
+                              ((none) (do))))
+                          ;; (Option T) - collect T
+                          ((string-eq kind "Option")
+                            (match (list-get items 1)
+                              ((some inner)
+                                (collect-type-expr-public-type ctx inner))
+                              ((none) (do))))
+                          ;; (Result T E) - collect T and E
+                          ((string-eq kind "Result")
+                            (do
+                              (match (list-get items 1)
+                                ((some ok-type)
+                                  (collect-type-expr-public-type ctx ok-type))
+                                ((none) (do)))
+                              (match (list-get items 2)
+                                ((some err-type)
+                                  (collect-type-expr-public-type ctx err-type))
+                                ((none) (do)))))
+                          ;; Other types - skip (builtin or handled elsewhere)
+                          (else (do)))))
+                    (else (do))))
+                ((none) (do))))))
+        (else (do)))))
+
+  (fn collect-c-type-if-user-defined ((ctx (Ptr TranspileContext)) (c-type String))
+    (@intent "Check if a C type string references a user-defined type and collect it")
+    (@spec (((Ptr TranspileContext) String) -> Unit))
+    (@pre {ctx != nil})
+    ;; This handles return types which are already C-formatted (e.g., "mylib_Config*")
+    ;; Strip pointer suffix and check if it's a user-defined type
+    (let ((arena (. (deref ctx) arena))
+          (base-type (strip-pointer-suffix arena c-type)))
+      ;; Skip builtin C types
+      (when (and (not (string-eq base-type "void"))
+                 (not (string-eq base-type "int"))
+                 (not (string-eq base-type "int8_t"))
+                 (not (string-eq base-type "int16_t"))
+                 (not (string-eq base-type "int32_t"))
+                 (not (string-eq base-type "int64_t"))
+                 (not (string-eq base-type "uint8_t"))
+                 (not (string-eq base-type "uint16_t"))
+                 (not (string-eq base-type "uint32_t"))
+                 (not (string-eq base-type "uint64_t"))
+                 (not (string-eq base-type "char"))
+                 (not (string-eq base-type "float"))
+                 (not (string-eq base-type "double"))
+                 (not (string-eq base-type "bool"))
+                 (not (string-eq base-type "slop_string"))
+                 (not (string-eq base-type "slop_bytes"))
+                 (not (string-eq base-type "slop_arena"))
+                 (not (starts-with base-type "slop_")))  ;; Skip runtime types
+        (ctx-add-public-type ctx base-type))))
+
+  (fn strip-pointer-suffix ((arena Arena) (s String))
+    (@intent "Remove trailing * from a type string")
+    (@spec ((Arena String) -> String))
+    (let ((len (cast Int (string-len s))))
+      (if (and (> len 0) (== (@ (. s data) (- len 1)) 42))  ;; '*' = 42
+        (substring arena s 0 (cast (Int 0 ..) (- len 1)))
+        s)))
 
   ;; ============================================================
   ;; Parameter Binding
@@ -1088,7 +1237,9 @@
                       (let ((raw-name (. name-sym name))
                             (base-name (to-c-name arena raw-name))
                             ;; Add module prefix to function name
-                            (fn-name (ctx-prefix-type ctx base-name)))
+                            (mangled-name (ctx-prefix-type ctx base-name))
+                            ;; Check for :c-name override
+                            (fn-name (extract-fn-c-name arena items mangled-name)))
                         ;; Get params
                         (match (list-get items 2)
                           ((some params-expr)
@@ -1437,14 +1588,52 @@
       (while (< i len)
         (match (list-get items i)
           ((some item)
-            (let ((is-last (== i (- len 1)))
-                  ;; Only treat last statement as return if function is non-void
-                  (is-return (and is-last (not is-void-fn))))
-              ;; Skip annotations
-              (when (not (is-annotation item))
-                (transpile-stmt ctx item is-return))))
+            ;; Check for :c-name attribute - skip it and its value
+            (if (is-c-name-attr item)
+              (set! i (+ i 1))  ;; Skip the :c-name value that follows
+              (do
+                (let ((is-last (is-last-body-item items i))
+                      ;; Only treat last statement as return if function is non-void
+                      (is-return (and is-last (not is-void-fn))))
+                  ;; Skip annotations
+                  (when (not (is-annotation item))
+                    (transpile-stmt ctx item is-return))))))
           ((none) (do)))
         (set! i (+ i 1)))))
+
+  (fn is-c-name-attr ((expr (Ptr SExpr)))
+    (@intent "Check if expression is the :c-name keyword")
+    (@spec (((Ptr SExpr)) -> Bool))
+    (@pre {expr != nil})
+    (match (deref expr)
+      ((symbol sym) (string-eq (. sym name) ":c-name"))
+      (else false)))
+
+  (fn is-last-body-item ((items (List (Ptr SExpr))) (current-i Int))
+    (@intent "Check if current index is the last body item (excluding :c-name)")
+    (@spec (((List (Ptr SExpr)) Int) -> Bool))
+    ;; Check if there are any non-annotation, non-:c-name items after current
+    (let ((len (list-len items))
+          (mut i (+ current-i 1))
+          (mut found-body false))
+      (while (and (< i len) (not found-body))
+        (match (list-get items i)
+          ((some item)
+            (if (or (is-annotation item) (is-c-name-attr item))
+              (set! i (+ i 1))
+              ;; Check if this is the :c-name value (string after :c-name)
+              (if (and (> i 0) (is-c-name-attr-at items (- i 1)))
+                (set! i (+ i 1))
+                (set! found-body true))))
+          ((none) (set! i (+ i 1)))))
+      (not found-body)))
+
+  (fn is-c-name-attr-at ((items (List (Ptr SExpr))) (idx Int))
+    (@intent "Check if item at index is :c-name")
+    (@spec (((List (Ptr SExpr)) Int) -> Bool))
+    (match (list-get items idx)
+      ((some item) (is-c-name-attr item))
+      ((none) false)))
 
   (fn find-body-start ((items (List (Ptr SExpr))))
     (@intent "Find index where function body starts (after annotations)")

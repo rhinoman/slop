@@ -95,6 +95,16 @@ TOPICS = {
 ### Impl (implementation without annotations)
 (impl helper ((x Int))
   (+ x 1))
+
+### C Name Override (for external interop)
+(fn slop-parse-int ((s (Ptr Char)))
+  (@intent "Parse integer from string")
+  (@spec (((Ptr Char)) -> Int))
+  (strtol s nil 10)
+  :c-name "parse_int")    ; Emits as parse_int() in C
+
+The :c-name attribute specifies a clean C name for external code.
+Transpiler emits both the clean name and a #define alias.
 """,
 
     'contracts': """## Contracts

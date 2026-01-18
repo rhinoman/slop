@@ -9,7 +9,7 @@
   (import types (SExpr SExprList SExprSymbol))
   (import parser (parse ParseResult))
   (import context (TranspileContext context-new ctx-reset-for-new-module ctx-get-output ctx-get-header ctx-set-prefixing ctx-set-module))
-  (import transpiler (transpile-file generate-c-output))
+  (import transpiler (transpile-file generate-c-output generate-public-header))
   (import strlib (replace-all))
 
   ;; FFI for file I/O and command-line arguments
@@ -286,7 +286,7 @@
     ;; Add comma if not first
     (when (not first)
       (putchar 44))  ;; ,
-    ;; Output: "mod-name": {"header": "...", "impl": "..."}
+    ;; Output: "mod-name": {"header": "...", "impl": "...", "public_header": "..."}
     (print-json-string arena mod-name)
     (putchar 58)   ;; :
     (putchar 123)  ;; {
@@ -301,6 +301,11 @@
     (let ((impl-lines (ctx-get-output ctx))
           (impl-str (lines-to-string arena impl-lines)))
       (print-json-string arena impl-str))
+    (putchar 44)  ;; ,
+    ;; Public header - for library builds with :c-name functions
+    (print-str (cast (Ptr Char) "\"public_header\":"))
+    (let ((public-header-str (generate-public-header ctx mod-name)))
+      (print-json-string arena public-header-str))
     (putchar 125)  ;; }
     (do))
 

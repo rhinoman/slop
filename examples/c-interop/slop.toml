@@ -1,0 +1,7 @@
+[project]
+name = "mylib"
+entry = "mylib.slop"
+
+[build]
+output = "libmylib"
+type = "static"

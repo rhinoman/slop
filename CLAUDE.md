@@ -127,6 +127,7 @@ The goal is a self-hosting slop parser, type checker, and transpiler.  When work
 - It is always better to generate a transpiler error than to emit ambiguous C code and / or some hard-coded default when running into some unimplemented SLOP feature.
 - Errors should be caught as early as possible.  First by the parser, then the type checker, then the transpiler.  It is a FAILURE if an error is caught by the C compiler.
 - The goal is not simply to get something that builds.  We do not workaround code generation issues with hardcoding, default types, rewriting using a different SLOP construct, etc.  
+- The SLOP native tools are the priority for new features, implement there first, the python tools second.
 
 
 ## General guidance
