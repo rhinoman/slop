@@ -39,7 +39,7 @@ SLOP makes the spec the source of truth:
 
 ## Status
 
-The SLOP toolchain is **self-hosting**: the parser, type checker, and transpiler are all written in SLOP and compile themselves. The Python bootstrap implementations in `src/slop/` remain available as fallbacks. Use `--native` with any command to use the SLOP-native tools from `bin/`.
+The SLOP toolchain is **self-hosting**: the parser, type checker, and transpiler are all written in SLOP and compile themselves. Native tools are used by default; the Python bootstrap implementations in `src/slop/` remain available as fallbacks via the `--python` flag.
 
 ## Philosophy
 
@@ -115,7 +115,8 @@ slop/
 │       ├── io/              File I/O
 │       ├── strlib/          String manipulation
 │       ├── math/            Math utilities
-│       └── os/              OS interface (env vars, etc.)
+│       ├── os/              OS interface (env vars, etc.)
+│       └── thread/          Concurrency (channels, spawn/join)
 ├── spec/                    Language specifications
 │   ├── LANGUAGE.md          Grammar, types, semantics
 │   ├── HYBRID_PIPELINE.md   Generation architecture
@@ -135,6 +136,7 @@ slop/
 │   ├── rate-limiter.slop    Token bucket rate limiter
 │   ├── hello.slop           Minimal example
 │   ├── fibonacci.slop       Fibonacci sequence
+│   ├── http-server-threaded/ Multi-threaded HTTP server with worker pool
 │   └── ...                  Additional examples
 └── tests/                   Test suite
 ```
@@ -185,17 +187,18 @@ echo '(ok value)' | slop check-hole -t '(Result T E)'
 
 ### Native Components
 
-SLOP includes native (self-hosted) implementations of core compiler components written in SLOP itself. Use the `--native` flag to use these instead of the Python implementations:
+SLOP includes native (self-hosted) implementations of core compiler components written in SLOP itself. **Native tools are used by default.** Use the `--python` flag to fall back to the Python implementations:
 
 ```bash
-# Use native parser
-slop parse examples/rate-limiter.slop --native
+# These use native tools by default
+slop parse examples/rate-limiter.slop
+slop check examples/rate-limiter.slop
+slop build examples/rate-limiter.slop
 
-# Use native type checker
-slop check examples/rate-limiter.slop --native
-
-# Use native components for full build (parser, transpiler)
-slop build examples/rate-limiter.slop --native
+# Use Python fallback
+slop parse examples/rate-limiter.slop --python
+slop check examples/rate-limiter.slop --python
+slop build examples/rate-limiter.slop --python
 
 # Build the native toolchain from source
 ./build_native_py.sh
@@ -206,7 +209,7 @@ Native component sources are in `lib/compiler/`:
 - `lib/compiler/checker/` - Native type checker
 - `lib/compiler/transpiler/` - Native SLOP-to-C transpiler
 
-Pre-built binaries are installed to `bin/` at the project root. When `--native` is specified, the CLI looks for these binaries. If a native component isn't found, it falls back to the Python implementation.
+Pre-built binaries are installed to `bin/` at the project root. If a native component isn't found, the CLI automatically falls back to the Python implementation.
 
 ## Project Configuration
 
@@ -374,6 +377,26 @@ C's benefits remain:
 Aside from C, an obvious choice for a future target would be typescript.
 WASM would also be easy to do since we're already transpiling to C.
 
+## FFI and C Interoperability
+
+SLOP provides seamless FFI for calling C functions and mapping C struct layouts:
+
+```lisp
+;; Import C functions from headers
+(ffi "sys/socket.h"
+  (socket ((domain Int) (type Int) (protocol Int)) Int)
+  (bind ((fd Int) (addr (Ptr Void)) (len U32)) Int))
+
+;; Map C struct layouts for interop
+(ffi-struct "netinet/in.h" sockaddr_in
+  (sin_family U16)
+  (sin_port U16)
+  (sin_addr U32)
+  (sin_zero (Array U8 8)))
+```
+
+The `ffi-struct` form defines the exact memory layout matching the C struct, enabling direct interop with system libraries. Nested structs are supported via inline `ffi-struct` definitions.
+
 ## Memory Model
 
 Arena allocation handles 90% of cases:
@@ -395,7 +418,10 @@ Arena allocation handles 90% of cases:
 - ✓ SLOP → C transpiler with type flow analysis
 - ✓ Type checker with range inference and path-sensitive analysis
 - ✓ Self-hosting compiler (parser, checker, transpiler written in SLOP)
-- ✓ Standard library (`lib/std/`: strlib, io, math, os)
+- ✓ Standard library (`lib/std/`: strlib, io, math, os, thread)
+- ✓ Concurrency primitives (channels, spawn/join via `lib/std/thread`)
+- ✓ Runtime contract assertions (`SLOP_PRE`/`SLOP_POST` macros)
+- ✓ FFI struct mapping (`ffi-struct` for C struct layouts)
 - ✓ Hole extraction, classification, and tiered model routing
 - ✓ LLM providers (Ollama, OpenAI-compatible, Interactive, Multi-provider)
 - ✓ Hole filler with quality scoring and pattern library
@@ -405,7 +431,6 @@ Arena allocation handles 90% of cases:
 - ✓ Test suite
 
 **Not Yet Implemented:**
-- Concurrency primitives (Channel based)
 - Property-based testing generation
 - Contract verification with body analysis (verifies contract consistency, not implementation)
 

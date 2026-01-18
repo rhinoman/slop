@@ -39,6 +39,8 @@
     ctx-set-current-result-type ctx-get-current-result-type ctx-clear-current-result-type
     ;; Current function return type (for typed none in returns)
     ctx-set-current-return-type ctx-get-current-return-type ctx-clear-current-return-type
+    ;; Capture return value mode (for postconditions)
+    ctx-set-capture-retval ctx-is-capture-retval
     ;; Option/List type tracking
     OptionType ListType
     ctx-register-option-type ctx-has-option-type ctx-get-option-types
@@ -167,7 +169,9 @@
       ;; Inline record types (anonymous struct types)
       (inline-records (List InlineRecord))
       ;; Gensym counter for unique variable names
-      (gensym-counter Int)))
+      (gensym-counter Int)
+      ;; Flag to capture return values to _retval (for postconditions)
+      (capture-to-retval Bool)))
 
   (type EnumVariant (record
     (variant-name String)
@@ -244,6 +248,7 @@
       (set! (deref ctx) result-type-aliases (list-new arena ResultTypeAlias))
       (set! (deref ctx) inline-records (list-new arena InlineRecord))
       (set! (deref ctx) gensym-counter 0)
+      (set! (deref ctx) capture-to-retval false)
       ctx))
 
   (fn ctx-reset-for-new-module ((ctx (Ptr TranspileContext)) (mod-name String))
@@ -733,6 +738,22 @@
     (@spec (((Ptr TranspileContext)) -> Unit))
     (@pre {ctx != nil})
     (set! (deref ctx) current-return-c-type (Option String) none))
+
+  ;; ============================================================
+  ;; Capture Return Value Mode (for postconditions)
+  ;; ============================================================
+
+  (fn ctx-set-capture-retval ((ctx (Ptr TranspileContext)) (enabled Bool))
+    (@intent "Enable or disable capture-to-retval mode for postconditions")
+    (@spec (((Ptr TranspileContext) Bool) -> Unit))
+    (@pre {ctx != nil})
+    (set! (deref ctx) capture-to-retval enabled))
+
+  (fn ctx-is-capture-retval ((ctx (Ptr TranspileContext)))
+    (@intent "Check if capture-to-retval mode is enabled")
+    (@spec (((Ptr TranspileContext)) -> Bool))
+    (@pre {ctx != nil})
+    (. (deref ctx) capture-to-retval))
 
   ;; ============================================================
   ;; Option Type Tracking

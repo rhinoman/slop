@@ -534,6 +534,7 @@ These ARE in strlib and need `(import strlib ...)`:
 | `float-to-string` | Float to string |
 | `compare`, `compare-ignore-case` | String comparison |
 | `join`, `reverse`, `repeat` | Advanced operations |
+| `fill-bytes` | Fill memory region with byte value |
 """,
 
     'cli': """## CLI Reference
@@ -551,14 +552,18 @@ These ARE in strlib and need `(import strlib ...)`:
 | `slop ref [TOPIC]` | Show language reference |
 | `slop doc FILE` | Generate documentation |
 
-### Native Components (--native flag)
+### Native Components (default)
 
-SLOP includes self-hosted compiler components written in SLOP. Use `--native` to use these instead of Python implementations:
+SLOP includes self-hosted compiler components written in SLOP. **Native tools are used by default.** Use `--python` to fall back to Python implementations:
 
 ```bash
-slop parse FILE --native      # Use native parser
-slop check FILE --native      # Use native type checker
-slop build FILE --native      # Use native parser + transpiler
+slop parse FILE               # Uses native parser (default)
+slop check FILE               # Uses native type checker (default)
+slop build FILE               # Uses native parser + transpiler (default)
+
+slop parse FILE --python      # Use Python parser
+slop check FILE --python      # Use Python type checker
+slop build FILE --python      # Use Python toolchain
 ```
 
 Native components are in `lib/compiler/`:
@@ -566,7 +571,7 @@ Native components are in `lib/compiler/`:
 - `slop-checker` - Type checker with diagnostics
 - `slop-transpiler` - SLOP to C transpiler
 
-If a native component isn't found, falls back to Python.
+If a native component isn't found, automatically falls back to Python.
 
 ### Common Options
 
@@ -574,7 +579,7 @@ If a native component isn't found, falls back to Python.
 |--------|----------|-------------|
 | `-o, --output` | transpile, build | Output file path |
 | `-I, --include` | transpile, build | Add module search path |
-| `--native` | parse, check, build | Use native components |
+| `--python` | parse, check, build | Use Python fallback |
 | `--debug` | build | Include debug symbols |
 | `--holes` | parse | Show only holes |
 | `-v, --verbose` | fill, verify | Increase verbosity |
@@ -584,8 +589,8 @@ If a native component isn't found, falls back to Python.
 With `slop.toml`, commands use project settings:
 
 ```bash
-slop build                    # Uses [project].entry
-slop build --native           # Native components + config
+slop build                    # Uses [project].entry, native tools
+slop build --python           # Python toolchain + config
 slop fill                     # Uses entry from config
 ```
 

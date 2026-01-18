@@ -1062,3 +1062,112 @@ class TestScopedPtr:
         assert "ptr->socket" in c_code
         assert "ptr->read_buf" in c_code
         assert "ptr->write_buf" in c_code
+
+
+class TestNativeTranspilerContracts:
+    """Test that native transpiler generates contract checks"""
+
+    @pytest.fixture
+    def native_transpiler(self):
+        """Check if native transpiler is available"""
+        from pathlib import Path
+        binary = Path(__file__).parent.parent / "bin" / "slop-transpiler"
+        if not binary.exists():
+            pytest.skip("Native transpiler not available")
+        return binary
+
+    def run_native_transpile(self, native_bin, source: str) -> str:
+        """Run native transpiler on source and return C code"""
+        import subprocess
+        import json
+        import tempfile
+        import os
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.slop', delete=False) as f:
+            f.write(source)
+            f.flush()
+            temp_path = f.name
+
+        try:
+            result = subprocess.run(
+                [str(native_bin), temp_path],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode != 0:
+                pytest.fail(f"Native transpiler failed: {result.stderr}")
+            data = json.loads(result.stdout)
+            # Combine header and impl from all modules
+            parts = []
+            for mod_data in data.values():
+                parts.append(mod_data.get('header', ''))
+                parts.append(mod_data.get('impl', ''))
+            return '\n'.join(parts)
+        finally:
+            os.unlink(temp_path)
+
+    def test_native_emits_precondition(self, native_transpiler):
+        """Native transpiler emits SLOP_PRE for @pre"""
+        source = """
+        (module test
+          (fn safe-div ((x Int) (y Int))
+            (@intent "Divide safely")
+            (@spec ((Int Int) -> Int))
+            (@pre (!= y 0))
+            (/ x y)))
+        """
+        c_code = self.run_native_transpile(native_transpiler, source)
+        assert "SLOP_PRE" in c_code
+        assert "(y != 0)" in c_code
+
+    def test_native_emits_postcondition(self, native_transpiler):
+        """Native transpiler emits SLOP_POST for @post"""
+        source = """
+        (module test
+          (fn positive ((x Int))
+            (@intent "Return positive value")
+            (@spec ((Int) -> Int))
+            (@post (>= $result 0))
+            (if (< x 0) (- 0 x) x)))
+        """
+        c_code = self.run_native_transpile(native_transpiler, source)
+        assert "SLOP_POST" in c_code
+        assert "_retval" in c_code
+
+    def test_native_emits_range_bounds_check(self, native_transpiler):
+        """Native transpiler emits bounds check for range types"""
+        source = """
+        (module test
+          (type Percentage (Int 0 .. 100)))
+        """
+        c_code = self.run_native_transpile(native_transpiler, source)
+        assert "typedef" in c_code
+        assert "Percentage" in c_code
+        assert "Percentage_new" in c_code
+        assert "SLOP_PRE" in c_code
+        assert "v >= 0" in c_code
+        assert "v <= 100" in c_code
+
+    def test_native_selects_smallest_c_type_for_range(self, native_transpiler):
+        """Native transpiler selects smallest C type for range"""
+        source = """
+        (module test
+          (type Byte (Int 0 .. 255)))
+        """
+        c_code = self.run_native_transpile(native_transpiler, source)
+        assert "uint8_t" in c_code
+
+    def test_native_emits_multiple_preconditions(self, native_transpiler):
+        """Native transpiler emits multiple SLOP_PRE for multiple @pre"""
+        source = """
+        (module test
+          (fn clamp ((x Int) (min-val Int) (max-val Int))
+            (@intent "Clamp value")
+            (@spec ((Int Int Int) -> Int))
+            (@pre (<= min-val max-val))
+            (@pre (>= x 0))
+            (if (< x min-val) min-val (if (> x max-val) max-val x))))
+        """
+        c_code = self.run_native_transpile(native_transpiler, source)
+        # Should have two SLOP_PRE calls
+        assert c_code.count("SLOP_PRE") >= 2

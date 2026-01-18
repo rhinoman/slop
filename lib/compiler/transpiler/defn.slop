@@ -18,12 +18,13 @@
     ;; Helpers
     is-type-form is-function-form get-return-type get-result-type-name build-param-str)
 
-  (import types (SExpr SExprList SExprSymbol SExprString SExprNumber))
+  (import types (SExpr SExprList SExprSymbol SExprString SExprNumber RangeBounds))
   (import context (TranspileContext ctx-emit ctx-emit ctx-indent ctx-dedent
                    ctx-register-type ctx-register-func ctx-register-field-type
                    ctx-str ctx-str3 ctx-str4 ctx-str5
                    ctx-set-current-result-type ctx-clear-current-result-type
                    ctx-set-current-return-type ctx-get-current-return-type ctx-clear-current-return-type
+                   ctx-set-capture-retval ctx-is-capture-retval
                    ctx-lookup-result-type-alias ctx-lookup-type
                    ctx-push-scope ctx-pop-scope ctx-bind-var
                    ctx-prefixing-enabled ctx-get-module ctx-prefix-type
@@ -32,7 +33,8 @@
   (import ctype (to-c-type to-c-name type-to-identifier is-builtin-c-type))
   (import stmt (transpile-stmt))
   (import expr (transpile-expr))
-  (import strlib (starts-with ends-with substring))
+  (import strlib (starts-with ends-with substring replace))
+  (import parser (pretty-print))
 
   ;; ============================================================
   ;; Form Detection
@@ -615,14 +617,19 @@
     (@pre {type-expr != nil})
     (let ((arena (. (deref ctx) arena)))
       ;; Check if it's an Array type - requires special handling
-      (if (is-array-type type-expr)
-        (emit-array-typedef ctx qualified-name type-expr)
+      (cond
+        ((is-array-type type-expr)
+          (emit-array-typedef ctx qualified-name type-expr))
+        ;; Check if it's a range type like (Int 0 .. 100)
+        ((is-range-type type-expr)
+          (emit-range-typedef ctx raw-name qualified-name type-expr))
         ;; Standard typedef
-        (let ((c-type (to-c-type-prefixed ctx type-expr)))
-          (ctx-emit ctx (ctx-str5 ctx "typedef " c-type " " qualified-name ";"))
-          (ctx-emit ctx "")
-          ;; Register type
-          (ctx-register-type ctx (TypeEntry raw-name qualified-name c-type false false false))))))
+        (else
+          (let ((c-type (to-c-type-prefixed ctx type-expr)))
+            (ctx-emit ctx (ctx-str5 ctx "typedef " c-type " " qualified-name ";"))
+            (ctx-emit ctx "")
+            ;; Register type
+            (ctx-register-type ctx (TypeEntry raw-name qualified-name c-type false false false)))))))
 
   (fn is-array-type ((type-expr (Ptr SExpr)))
     (@intent "Check if type expression is an Array type")
@@ -685,6 +692,156 @@
       (else "0")))
 
   ;; ============================================================
+  ;; Range Type Handling
+  ;; ============================================================
+
+  (fn is-range-type ((type-expr (Ptr SExpr)))
+    (@intent "Check if type expression is a range type like (Int 0 .. 100)")
+    (@spec (((Ptr SExpr)) -> Bool))
+    (@pre {type-expr != nil})
+    (match (deref type-expr)
+      ((list lst)
+        (let ((items (. lst items))
+              (len (list-len items))
+              (mut found-dots false)
+              (mut i 0))
+          ;; Look for '..' symbol in the items
+          (while (and (< i len) (not found-dots))
+            (match (list-get items i)
+              ((some item)
+                (match (deref item)
+                  ((symbol sym)
+                    (when (string-eq (. sym name) "..")
+                      (set! found-dots true)))
+                  (else (do))))
+              ((none) (do)))
+            (set! i (+ i 1)))
+          found-dots))
+      (else false)))
+
+  (fn parse-range-bounds ((type-expr (Ptr SExpr)))
+    (@intent "Parse range bounds from type like (Int 0 .. 100)")
+    (@spec (((Ptr SExpr)) -> RangeBounds))
+    (@pre {type-expr != nil})
+    (let ((mut min-val 0)
+          (mut max-val 0)
+          (mut has-min false)
+          (mut has-max false)
+          (mut found-dots false))
+      (match (deref type-expr)
+        ((list lst)
+          (let ((items (. lst items))
+                (len (list-len items))
+                (mut i 1))  ;; Skip the base type (first item)
+            (while (< i len)
+              (match (list-get items i)
+                ((some item)
+                  (match (deref item)
+                    ((number num)
+                      (if (not found-dots)
+                        ;; Number before '..' is min
+                        (do
+                          (set! min-val (string-to-int (. num raw)))
+                          (set! has-min true))
+                        ;; Number after '..' is max
+                        (do
+                          (set! max-val (string-to-int (. num raw)))
+                          (set! has-max true))))
+                    ((symbol sym)
+                      (when (string-eq (. sym name) "..")
+                        (set! found-dots true)))
+                    (else (do))))
+                ((none) (do)))
+              (set! i (+ i 1)))))
+        (else (do)))
+      ;; Return record - field order: has-min, has-max, min-val, max-val
+      (RangeBounds has-min has-max min-val max-val)))
+
+  (fn string-to-int ((s String))
+    (@intent "Convert string to integer")
+    (@spec ((String) -> Int))
+    (let ((len (cast Int (string-len s)))
+          (mut result 0)
+          (mut i 0)
+          (mut negative false))
+      ;; Handle negative sign
+      (when (and (> len 0) (== (@ (. s data) 0) 45))  ;; '-' = 45
+        (set! negative true)
+        (set! i 1))
+      (while (< i len)
+        (let ((c (@ (. s data) i)))
+          (when (and (>= c 48) (<= c 57))  ;; '0'-'9' = 48-57
+            (set! result (+ (* result 10) (- (cast Int c) 48)))))
+        (set! i (+ i 1)))
+      (if negative (- 0 result) result)))
+
+  (fn select-smallest-c-type ((min-val I64) (max-val I64) (has-min Bool) (has-max Bool))
+    (@intent "Select smallest C type that fits the range")
+    (@spec ((I64 I64 Bool Bool) -> String))
+    (cond
+      ;; Both bounds specified - can optimize
+      ((and has-min has-max)
+        (cond
+          ;; uint8_t: 0 to 255
+          ((and (>= min-val 0) (<= max-val 255))
+            "uint8_t")
+          ;; uint16_t: 0 to 65535
+          ((and (>= min-val 0) (<= max-val 65535))
+            "uint16_t")
+          ;; int8_t: -128 to 127
+          ((and (>= min-val (- 0 128)) (<= max-val 127))
+            "int8_t")
+          ;; int16_t: -32768 to 32767
+          ((and (>= min-val (- 0 32768)) (<= max-val 32767))
+            "int16_t")
+          ;; Default to int64_t
+          (else "int64_t")))
+      ;; Default to int64_t for unbounded ranges
+      (else "int64_t")))
+
+  (fn emit-range-typedef ((ctx (Ptr TranspileContext)) (raw-name String) (qualified-name String) (type-expr (Ptr SExpr)))
+    (@intent "Emit typedef and _new constructor for range type")
+    (@spec (((Ptr TranspileContext) String String (Ptr SExpr)) -> Unit))
+    (@pre {ctx != nil})
+    (@pre {type-expr != nil})
+    (let ((arena (. (deref ctx) arena))
+          (bounds RangeBounds (parse-range-bounds type-expr))
+          (min-val I64 (. bounds min-val))
+          (max-val I64 (. bounds max-val))
+          (has-min Bool (. bounds has-min))
+          (has-max Bool (. bounds has-max))
+          (c-type (select-smallest-c-type min-val max-val has-min has-max)))
+      ;; Emit typedef
+      (ctx-emit ctx (ctx-str5 ctx "typedef " c-type " " qualified-name ";"))
+      (ctx-emit ctx "")
+      ;; Emit _new constructor
+      (ctx-emit ctx (ctx-str5 ctx "static inline " qualified-name " " qualified-name "_new(int64_t v) {"))
+      (ctx-indent ctx)
+      ;; Emit bounds check using SLOP_PRE
+      (cond
+        ;; Both bounds
+        ((and has-min has-max)
+          (let ((min-str (int-to-string arena min-val))
+                (max-str (int-to-string arena max-val)))
+            (ctx-emit ctx (ctx-str ctx "SLOP_PRE(v >= " (ctx-str ctx min-str (ctx-str ctx " && v <= " (ctx-str ctx max-str (ctx-str ctx ", \"" (ctx-str ctx qualified-name (ctx-str ctx " in range " (ctx-str ctx min-str (ctx-str ctx ".." (ctx-str ctx max-str "\");")))))))))))))
+        ;; Only min bound
+        (has-min
+          (let ((min-str (int-to-string arena min-val)))
+            (ctx-emit ctx (ctx-str ctx "SLOP_PRE(v >= " (ctx-str ctx min-str (ctx-str ctx ", \"" (ctx-str ctx qualified-name (ctx-str ctx " >= " (ctx-str ctx min-str "\");")))))))))
+        ;; Only max bound
+        (has-max
+          (let ((max-str (int-to-string arena max-val)))
+            (ctx-emit ctx (ctx-str ctx "SLOP_PRE(v <= " (ctx-str ctx max-str (ctx-str ctx ", \"" (ctx-str ctx qualified-name (ctx-str ctx " <= " (ctx-str ctx max-str "\");")))))))))
+        (else (do)))
+      ;; Emit return
+      (ctx-emit ctx (ctx-str ctx "return (" (ctx-str ctx qualified-name ")v;")))
+      (ctx-dedent ctx)
+      (ctx-emit ctx "}")
+      (ctx-emit ctx "")
+      ;; Register type
+      (ctx-register-type ctx (TypeEntry raw-name qualified-name c-type false false false))))
+
+  ;; ============================================================
   ;; Function Definition
   ;; ============================================================
 
@@ -730,7 +887,11 @@
           ;; Check for Result type first - if so, use the prefixed Result type name
           (result-type-opt (get-result-type-name ctx items))
           ;; Get raw return type
-          (raw-return (get-return-type ctx items)))
+          (raw-return (get-return-type ctx items))
+          ;; Collect contract annotations
+          (preconditions (collect-preconditions arena items))
+          (postconditions (collect-postconditions arena items))
+          (assumptions (collect-assumptions arena items)))
       ;; Determine actual return type, preferring Result type name if available
       (let ((return-type String (match result-type-opt
                                   ((some result-name) result-name)
@@ -738,7 +899,10 @@
             ;; Special case: main returns int
             (actual-return (if (string-eq fn-name "main") "int" return-type))
             ;; Build parameter string
-            (param-str (build-param-str ctx params-expr)))
+            (param-str (build-param-str ctx params-expr))
+            ;; Check if we need _retval (has postconditions/assumptions and non-void return)
+            (has-post (or (> (list-len postconditions) 0) (> (list-len assumptions) 0)))
+            (needs-retval (and has-post (not (string-eq actual-return "void")))))
         ;; Set current return type for typed none in return statements
         (ctx-set-current-return-type ctx actual-return)
         ;; Set current result type if present, otherwise clear any previous
@@ -753,8 +917,25 @@
         ;; Push new scope and bind parameters
         (ctx-push-scope ctx)
         (bind-params-to-scope ctx params-expr)
+        ;; Emit preconditions
+        (emit-preconditions ctx preconditions)
+        ;; Declare _retval if needed for postconditions
+        (when needs-retval
+          (ctx-emit ctx (ctx-str ctx actual-return " _retval;")))
+        ;; Set capture mode if we need _retval
+        (when needs-retval
+          (ctx-set-capture-retval ctx true))
         ;; Emit body (skip name, params, and annotations)
         (emit-function-body ctx items)
+        ;; Clear capture mode
+        (when needs-retval
+          (ctx-set-capture-retval ctx false))
+        ;; Emit postconditions and assumptions
+        (emit-postconditions ctx postconditions)
+        (emit-assumptions ctx assumptions)
+        ;; Emit return _retval if we captured it
+        (when needs-retval
+          (ctx-emit ctx "return _retval;"))
         ;; Pop scope
         (ctx-pop-scope ctx)
         (ctx-dedent ctx)
@@ -1305,5 +1486,259 @@
                   (else false)))
               ((none) false)))))
       (else false)))
+
+  ;; ============================================================
+  ;; Contract Annotation Extraction
+  ;; ============================================================
+
+  (fn is-pre-form ((expr (Ptr SExpr)))
+    (@intent "Check if expression is a @pre annotation")
+    (@spec (((Ptr SExpr)) -> Bool))
+    (@pre {expr != nil})
+    (match (deref expr)
+      ((list lst)
+        (let ((items (. lst items)))
+          (if (< (list-len items) 1)
+            false
+            (match (list-get items 0)
+              ((some head)
+                (match (deref head)
+                  ((symbol sym) (string-eq (. sym name) "@pre"))
+                  (else false)))
+              ((none) false)))))
+      (else false)))
+
+  (fn is-post-form ((expr (Ptr SExpr)))
+    (@intent "Check if expression is a @post annotation")
+    (@spec (((Ptr SExpr)) -> Bool))
+    (@pre {expr != nil})
+    (match (deref expr)
+      ((list lst)
+        (let ((items (. lst items)))
+          (if (< (list-len items) 1)
+            false
+            (match (list-get items 0)
+              ((some head)
+                (match (deref head)
+                  ((symbol sym) (string-eq (. sym name) "@post"))
+                  (else false)))
+              ((none) false)))))
+      (else false)))
+
+  (fn is-assume-form ((expr (Ptr SExpr)))
+    (@intent "Check if expression is an @assume annotation")
+    (@spec (((Ptr SExpr)) -> Bool))
+    (@pre {expr != nil})
+    (match (deref expr)
+      ((list lst)
+        (let ((items (. lst items)))
+          (if (< (list-len items) 1)
+            false
+            (match (list-get items 0)
+              ((some head)
+                (match (deref head)
+                  ((symbol sym) (string-eq (. sym name) "@assume"))
+                  (else false)))
+              ((none) false)))))
+      (else false)))
+
+  (fn get-annotation-condition ((expr (Ptr SExpr)))
+    (@intent "Extract condition expression from @pre/@post/@assume annotation")
+    (@spec (((Ptr SExpr)) -> (Option (Ptr SExpr))))
+    (@pre {expr != nil})
+    ;; Annotation has form (@pre condition) or (@post condition)
+    (let ((mut result (Option (Ptr SExpr)) none))
+      (match (deref expr)
+        ((list lst)
+          (let ((items (. lst items)))
+            (when (>= (list-len items) 2)
+              (match (list-get items 1)
+                ((some val) (set! result (some val)))
+                ((none) (do))))))
+        (else (do)))
+      result))
+
+  (fn collect-preconditions ((arena Arena) (items (List (Ptr SExpr))))
+    (@intent "Collect all @pre conditions from function items")
+    (@spec ((Arena (List (Ptr SExpr))) -> (List (Ptr SExpr))))
+    (let ((result (list-new arena (Ptr SExpr)))
+          (len (list-len items))
+          (mut i 3))  ;; Start after name and params
+      (while (< i len)
+        (match (list-get items i)
+          ((some item)
+            (when (is-pre-form item)
+              (match (get-annotation-condition item)
+                ((some cond) (list-push result cond))
+                ((none) (do)))))
+          ((none) (do)))
+        (set! i (+ i 1)))
+      result))
+
+  (fn collect-postconditions ((arena Arena) (items (List (Ptr SExpr))))
+    (@intent "Collect all @post conditions from function items")
+    (@spec ((Arena (List (Ptr SExpr))) -> (List (Ptr SExpr))))
+    (let ((result (list-new arena (Ptr SExpr)))
+          (len (list-len items))
+          (mut i 3))
+      (while (< i len)
+        (match (list-get items i)
+          ((some item)
+            (when (is-post-form item)
+              (match (get-annotation-condition item)
+                ((some cond) (list-push result cond))
+                ((none) (do)))))
+          ((none) (do)))
+        (set! i (+ i 1)))
+      result))
+
+  (fn collect-assumptions ((arena Arena) (items (List (Ptr SExpr))))
+    (@intent "Collect all @assume conditions from function items")
+    (@spec ((Arena (List (Ptr SExpr))) -> (List (Ptr SExpr))))
+    (let ((result (list-new arena (Ptr SExpr)))
+          (len (list-len items))
+          (mut i 3))
+      (while (< i len)
+        (match (list-get items i)
+          ((some item)
+            (when (is-assume-form item)
+              (match (get-annotation-condition item)
+                ((some cond) (list-push result cond))
+                ((none) (do)))))
+          ((none) (do)))
+        (set! i (+ i 1)))
+      result))
+
+  (fn has-postconditions ((items (List (Ptr SExpr))))
+    (@intent "Check if function has any @post or @assume annotations")
+    (@spec (((List (Ptr SExpr))) -> Bool))
+    (let ((len (list-len items))
+          (mut i 3)
+          (mut found false))
+      (while (and (< i len) (not found))
+        (match (list-get items i)
+          ((some item)
+            (when (or (is-post-form item) (is-assume-form item))
+              (set! found true)))
+          ((none) (do)))
+        (set! i (+ i 1)))
+      found))
+
+  ;; ============================================================
+  ;; Contract Emission
+  ;; ============================================================
+
+  (fn emit-preconditions ((ctx (Ptr TranspileContext)) (preconditions (List (Ptr SExpr))))
+    (@intent "Emit SLOP_PRE macro calls for all preconditions")
+    (@spec (((Ptr TranspileContext) (List (Ptr SExpr))) -> Unit))
+    (@pre {ctx != nil})
+    (let ((arena (. (deref ctx) arena))
+          (len (list-len preconditions))
+          (mut i 0))
+      (while (< i len)
+        (match (list-get preconditions i)
+          ((some cond-expr)
+            ;; Transpile the condition to C
+            (let ((cond-c (transpile-expr ctx cond-expr))
+                  ;; Get the original expression as string for the error message
+                  (expr-str (pretty-print arena cond-expr))
+                  ;; Escape double quotes in the string
+                  (escaped-str (escape-for-c-string arena expr-str)))
+              (ctx-emit ctx (ctx-str5 ctx "SLOP_PRE((" cond-c "), \"" escaped-str "\");"))))
+          ((none) (do)))
+        (set! i (+ i 1)))))
+
+  (fn emit-postconditions ((ctx (Ptr TranspileContext)) (postconditions (List (Ptr SExpr))))
+    (@intent "Emit SLOP_POST macro calls for all postconditions")
+    (@spec (((Ptr TranspileContext) (List (Ptr SExpr))) -> Unit))
+    (@pre {ctx != nil})
+    (let ((arena (. (deref ctx) arena))
+          (len (list-len postconditions))
+          (mut i 0))
+      (while (< i len)
+        (match (list-get postconditions i)
+          ((some cond-expr)
+            ;; Transpile the condition to C
+            (let ((cond-c-raw (transpile-expr ctx cond-expr))
+                  ;; Replace $result and _result with _retval
+                  (cond-c (replace arena (replace arena cond-c-raw "_result" "_retval") "$result" "_retval"))
+                  ;; Get the original expression as string for the error message
+                  (expr-str (pretty-print arena cond-expr))
+                  ;; Escape double quotes in the string
+                  (escaped-str (escape-for-c-string arena expr-str)))
+              (ctx-emit ctx (ctx-str5 ctx "SLOP_POST((" cond-c "), \"" escaped-str "\");"))))
+          ((none) (do)))
+        (set! i (+ i 1)))))
+
+  (fn emit-assumptions ((ctx (Ptr TranspileContext)) (assumptions (List (Ptr SExpr))))
+    (@intent "Emit SLOP_POST macro calls for all assumptions (same as postconditions)")
+    (@spec (((Ptr TranspileContext) (List (Ptr SExpr))) -> Unit))
+    (@pre {ctx != nil})
+    (let ((arena (. (deref ctx) arena))
+          (len (list-len assumptions))
+          (mut i 0))
+      (while (< i len)
+        (match (list-get assumptions i)
+          ((some cond-expr)
+            ;; Transpile the condition to C
+            (let ((cond-c-raw (transpile-expr ctx cond-expr))
+                  ;; Replace $result and _result with _retval
+                  (cond-c (replace arena (replace arena cond-c-raw "_result" "_retval") "$result" "_retval"))
+                  ;; Get the original expression as string for the error message
+                  (expr-str (pretty-print arena cond-expr))
+                  ;; Escape double quotes in the string
+                  (escaped-str (escape-for-c-string arena expr-str)))
+              (ctx-emit ctx (ctx-str5 ctx "SLOP_POST((" cond-c "), \"" escaped-str "\");"))))
+          ((none) (do)))
+        (set! i (+ i 1)))))
+
+  (fn escape-for-c-string ((arena Arena) (s String))
+    (@intent "Escape special characters in string for C string literal")
+    (@spec ((Arena String) -> String))
+    (let ((len (cast Int (. s len)))
+          ;; Allocate extra space for escapes
+          (buf (cast (Ptr U8) (arena-alloc arena (+ (* len 2) 1))))
+          (mut out-idx 0)
+          (mut in-idx 0))
+      (while (< in-idx len)
+        (let ((c (@ (. s data) in-idx)))
+          (cond
+            ;; Backslash -> \\
+            ((== c 92)
+              (do
+                (set! (@ buf out-idx) 92)
+                (set! out-idx (+ out-idx 1))
+                (set! (@ buf out-idx) 92)
+                (set! out-idx (+ out-idx 1))))
+            ;; Double quote -> \"
+            ((== c 34)
+              (do
+                (set! (@ buf out-idx) 92)
+                (set! out-idx (+ out-idx 1))
+                (set! (@ buf out-idx) 34)
+                (set! out-idx (+ out-idx 1))))
+            ;; Newline -> \n
+            ((== c 10)
+              (do
+                (set! (@ buf out-idx) 92)
+                (set! out-idx (+ out-idx 1))
+                (set! (@ buf out-idx) 110)
+                (set! out-idx (+ out-idx 1))))
+            ;; Tab -> \t
+            ((== c 9)
+              (do
+                (set! (@ buf out-idx) 92)
+                (set! out-idx (+ out-idx 1))
+                (set! (@ buf out-idx) 116)
+                (set! out-idx (+ out-idx 1))))
+            ;; Other characters: copy as-is
+            (else
+              (do
+                (set! (@ buf out-idx) c)
+                (set! out-idx (+ out-idx 1))))))
+        (set! in-idx (+ in-idx 1)))
+      ;; Null terminate
+      (set! (@ buf out-idx) 0)
+      (String buf (cast U64 out-idx))))
 
 ) ;; end module

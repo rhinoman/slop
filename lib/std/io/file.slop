@@ -121,7 +121,7 @@
     (@example ((File handle 'read true)) -> (ok true))
 
     (do
-      (set! (deref f) is-open false)
+      (set! (. (deref f) is-open) false)
       (let ((result (fclose (. (deref f) handle))))
         (if (== result 0)
           (ok true)

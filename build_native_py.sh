@@ -4,15 +4,15 @@
 
 # Build the parser
 cd lib/compiler/parser
-slop build
+slop build --python
 mv ./slop-parser ../../../bin
 
 ## Build the checker
 cd ../checker
-slop build
+slop build --python
 mv ./slop-checker ../../../bin
 
 ## Build the transpiler
 cd ../transpiler
-slop build
+slop build --python
 mv ./slop-transpiler ../../../bin

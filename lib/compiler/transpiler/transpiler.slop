@@ -1509,13 +1509,18 @@
                             (c-name (ctx-prefix-type ctx base-c-name)))
                         (match (list-get items 2)
                           ((some body-expr)
-                            ;; Check if Array type - needs special handling
-                            (if (is-array-type-body body-expr)
-                              (emit-array-typedef-to-header ctx c-name body-expr)
-                              ;; Get the C type for the body (with prefixing)
-                              (let ((c-type (to-c-type-prefixed ctx body-expr)))
-                                (ctx-emit-header ctx (ctx-str5 ctx "typedef " c-type " " c-name ";"))
-                                (ctx-emit-header ctx ""))))
+                            (cond
+                              ;; Check if Array type - needs special handling
+                              ((is-array-type-body body-expr)
+                                (emit-array-typedef-to-header ctx c-name body-expr))
+                              ;; Check if range type - needs _new constructor
+                              ((is-range-type-body body-expr)
+                                (emit-range-typedef-to-header ctx type-name c-name body-expr))
+                              ;; Standard typedef
+                              (else
+                                (let ((c-type (to-c-type-prefixed ctx body-expr)))
+                                  (ctx-emit-header ctx (ctx-str5 ctx "typedef " c-type " " c-name ";"))
+                                  (ctx-emit-header ctx "")))))
                           ((none) (do)))))
                     (else (do))))
                 ((none) (do))))))
@@ -1577,6 +1582,159 @@
       ((number num)
         (. num raw))
       (else "0")))
+
+  ;; ============================================================
+  ;; Range Type Handling for Header
+  ;; ============================================================
+
+  (fn is-range-type-body ((body-expr (Ptr SExpr)))
+    (@intent "Check if type body is a range type like (Int 0 .. 100)")
+    (@spec (((Ptr SExpr)) -> Bool))
+    (@pre {body-expr != nil})
+    (match (deref body-expr)
+      ((list lst)
+        (let ((items (. lst items))
+              (len (list-len items))
+              (mut found-dots false)
+              (mut i 0))
+          ;; Look for '..' symbol in the items
+          (while (and (< i len) (not found-dots))
+            (match (list-get items i)
+              ((some item)
+                (match (deref item)
+                  ((symbol sym)
+                    (when (string-eq (. sym name) "..")
+                      (set! found-dots true)))
+                  (else (do))))
+              ((none) (do)))
+            (set! i (+ i 1)))
+          found-dots))
+      (else false)))
+
+  (type RangeBoundsHeader (record
+    (min Int)
+    (max Int)
+    (has-min Bool)
+    (has-max Bool)))
+
+  (fn parse-range-bounds-header ((body-expr (Ptr SExpr)))
+    (@intent "Parse range bounds from type like (Int 0 .. 100)")
+    (@spec (((Ptr SExpr)) -> RangeBoundsHeader))
+    (@pre {body-expr != nil})
+    (let ((mut min-val 0)
+          (mut max-val 0)
+          (mut has-min false)
+          (mut has-max false)
+          (mut found-dots false))
+      (match (deref body-expr)
+        ((list lst)
+          (let ((items (. lst items))
+                (len (list-len items))
+                (mut i 1))  ;; Skip the base type (first item)
+            (while (< i len)
+              (match (list-get items i)
+                ((some item)
+                  (match (deref item)
+                    ((number num)
+                      (if (not found-dots)
+                        ;; Number before '..' is min
+                        (do
+                          (set! min-val (string-to-int-header (. num raw)))
+                          (set! has-min true))
+                        ;; Number after '..' is max
+                        (do
+                          (set! max-val (string-to-int-header (. num raw)))
+                          (set! has-max true))))
+                    ((symbol sym)
+                      (when (string-eq (. sym name) "..")
+                        (set! found-dots true)))
+                    (else (do))))
+                ((none) (do)))
+              (set! i (+ i 1)))))
+        (else (do)))
+      (RangeBoundsHeader min-val max-val has-min has-max)))
+
+  (fn string-to-int-header ((s String))
+    (@intent "Convert string to integer")
+    (@spec ((String) -> Int))
+    (let ((len (cast Int (string-len s)))
+          (mut result 0)
+          (mut i 0)
+          (mut negative false))
+      ;; Handle negative sign
+      (when (and (> len 0) (== (@ (. s data) 0) 45))  ;; '-' = 45
+        (set! negative true)
+        (set! i 1))
+      (while (< i len)
+        (let ((c (@ (. s data) i)))
+          (when (and (>= c 48) (<= c 57))  ;; '0'-'9' = 48-57
+            (set! result (+ (* result 10) (- (cast Int c) 48)))))
+        (set! i (+ i 1)))
+      (if negative (- 0 result) result)))
+
+  (fn select-smallest-c-type-header ((min-val Int) (max-val Int) (has-min Bool) (has-max Bool))
+    (@intent "Select smallest C type that fits the range")
+    (@spec ((Int Int Bool Bool) -> String))
+    (cond
+      ;; Both bounds specified - can optimize
+      ((and has-min has-max)
+        (cond
+          ;; uint8_t: 0 to 255
+          ((and (>= min-val 0) (<= max-val 255))
+            "uint8_t")
+          ;; uint16_t: 0 to 65535
+          ((and (>= min-val 0) (<= max-val 65535))
+            "uint16_t")
+          ;; int8_t: -128 to 127
+          ((and (>= min-val (- 0 128)) (<= max-val 127))
+            "int8_t")
+          ;; int16_t: -32768 to 32767
+          ((and (>= min-val (- 0 32768)) (<= max-val 32767))
+            "int16_t")
+          ;; Default to int64_t
+          (else "int64_t")))
+      ;; Default to int64_t for unbounded ranges
+      (else "int64_t")))
+
+  (fn emit-range-typedef-to-header ((ctx (Ptr TranspileContext)) (raw-name String) (c-name String) (body-expr (Ptr SExpr)))
+    (@intent "Emit typedef and _new constructor for range type to header")
+    (@spec (((Ptr TranspileContext) String String (Ptr SExpr)) -> Unit))
+    (@pre {ctx != nil})
+    (@pre {body-expr != nil})
+    (let ((arena (. (deref ctx) arena))
+          (bounds RangeBoundsHeader (parse-range-bounds-header body-expr))
+          (min-val Int (. bounds min))
+          (max-val Int (. bounds max))
+          (has-min Bool (. bounds has-min))
+          (has-max Bool (. bounds has-max))
+          (c-type (select-smallest-c-type-header min-val max-val has-min has-max)))
+      ;; Emit typedef
+      (ctx-emit-header ctx (ctx-str5 ctx "typedef " c-type " " c-name ";"))
+      (ctx-emit-header ctx "")
+      ;; Emit _new constructor
+      (ctx-emit-header ctx (ctx-str5 ctx "static inline " c-name " " c-name "_new(int64_t v) {"))
+      (ctx-indent ctx)
+      ;; Emit bounds check using SLOP_PRE
+      (cond
+        ;; Both bounds
+        ((and has-min has-max)
+          (let ((min-str (int-to-string arena min-val))
+                (max-str (int-to-string arena max-val)))
+            (ctx-emit-header ctx (ctx-str ctx "SLOP_PRE(v >= " (ctx-str ctx min-str (ctx-str ctx " && v <= " (ctx-str ctx max-str (ctx-str ctx ", \"" (ctx-str ctx c-name (ctx-str ctx " in range " (ctx-str ctx min-str (ctx-str ctx ".." (ctx-str ctx max-str "\");")))))))))))))
+        ;; Only min bound
+        (has-min
+          (let ((min-str (int-to-string arena min-val)))
+            (ctx-emit-header ctx (ctx-str ctx "SLOP_PRE(v >= " (ctx-str ctx min-str (ctx-str ctx ", \"" (ctx-str ctx c-name (ctx-str ctx " >= " (ctx-str ctx min-str "\");")))))))))
+        ;; Only max bound
+        (has-max
+          (let ((max-str (int-to-string arena max-val)))
+            (ctx-emit-header ctx (ctx-str ctx "SLOP_PRE(v <= " (ctx-str ctx max-str (ctx-str ctx ", \"" (ctx-str ctx c-name (ctx-str ctx " <= " (ctx-str ctx max-str "\");")))))))))
+        (else (do)))
+      ;; Emit return
+      (ctx-emit-header ctx (ctx-str ctx "return (" (ctx-str ctx c-name ")v;")))
+      (ctx-dedent ctx)
+      (ctx-emit-header ctx "}")
+      (ctx-emit-header ctx "")))
 
   (fn emit-forward-decls-header ((ctx (Ptr TranspileContext)) (items (List (Ptr SExpr))) (start Int))
     (@intent "Emit forward declarations for types to header")

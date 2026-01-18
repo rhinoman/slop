@@ -19,7 +19,7 @@
   (import types (SExpr SExprList SExprSymbol SExprString SExprNumber))
   (import context (TranspileContext ctx-emit ctx-indent ctx-dedent ctx-push-scope ctx-pop-scope
                    ctx-bind-var ctx-lookup-var ctx-lookup-type ctx-str ctx-str3 ctx-str4 ctx-str5 VarEntry
-                   ctx-get-current-return-type
+                   ctx-get-current-return-type ctx-is-capture-retval
                    to-c-type-prefixed))
   (import ctype (to-c-type to-c-name))
   (import expr (transpile-expr infer-expr-c-type))
@@ -990,6 +990,9 @@
                         (set! final-code s6)))))
                 ((none) (do)))))
           ((none) (do))))
-      (ctx-emit ctx (ctx-str3 ctx "return " final-code ";"))))
+      ;; Check if we're capturing to _retval (postconditions mode) or returning
+      (if (ctx-is-capture-retval ctx)
+        (ctx-emit ctx (ctx-str3 ctx "_retval = " final-code ";"))
+        (ctx-emit ctx (ctx-str3 ctx "return " final-code ";")))))
 
 ) ;; end module
