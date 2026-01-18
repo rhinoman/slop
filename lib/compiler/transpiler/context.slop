@@ -53,9 +53,6 @@
     ResultTypeAlias ctx-register-result-type-alias ctx-lookup-result-type-alias
     ;; Function C name alias tracking
     FuncCNameAlias ctx-add-c-name-alias ctx-get-c-name-aliases extract-fn-c-name
-    ;; Public API tracking (for library header generation)
-    PublicFuncInfo ctx-add-public-func ctx-get-public-funcs ctx-has-public-funcs
-    ctx-add-public-type ctx-get-public-types
     ;; Inline record tracking
     InlineRecord ctx-register-inline-record ctx-get-inline-records
     ;; Import tracking
@@ -175,10 +172,6 @@
       (inline-records (List InlineRecord))
       ;; Function C name aliases for :c-name support
       (c-name-aliases (List FuncCNameAlias))
-      ;; Public functions for library header generation
-      (public-funcs (List PublicFuncInfo))
-      ;; Public types referenced by :c-name functions (for library header)
-      (public-types (List String))
       ;; Gensym counter for unique variable names
       (gensym-counter Int)
       ;; Flag to capture return values to _retval (for postconditions)
@@ -217,12 +210,6 @@
     (raw-name String)      ;; SLOP function name
     (mangled-name String)  ;; Module-prefixed C name
     (clean-name String)))  ;; User-specified :c-name
-
-  ;; Public function info (for library header generation)
-  (type PublicFuncInfo (record
-    (clean-name String)    ;; User-specified :c-name (the public C function name)
-    (param-str String)     ;; C parameter string (e.g., "int64_t x, char* s")
-    (return-type String))) ;; C return type (e.g., "int64_t", "mylib_Config*")
 
   (type InlineRecord (record
     (type-name String)    ;; Generated type name (e.g., "_anon_record_12345678")
@@ -270,8 +257,6 @@
       (set! (deref ctx) result-type-aliases (list-new arena ResultTypeAlias))
       (set! (deref ctx) inline-records (list-new arena InlineRecord))
       (set! (deref ctx) c-name-aliases (list-new arena FuncCNameAlias))
-      (set! (deref ctx) public-funcs (list-new arena PublicFuncInfo))
-      (set! (deref ctx) public-types (list-new arena String))
       (set! (deref ctx) gensym-counter 0)
       (set! (deref ctx) capture-to-retval false)
       ctx))
@@ -307,8 +292,6 @@
       (set! (deref ctx) thread-types (list-new arena ThreadType))
       (set! (deref ctx) inline-records (list-new arena InlineRecord))
       (set! (deref ctx) c-name-aliases (list-new arena FuncCNameAlias))
-      (set! (deref ctx) public-funcs (list-new arena PublicFuncInfo))
-      (set! (deref ctx) public-types (list-new arena String))
       ;; Set new module name
       (set! (deref ctx) current-module (Option String) (some mod-name))
       ;; KEEP preserved: types, funcs, enum-variants, result-type-aliases, pointer-vars
@@ -992,53 +975,6 @@
         (set! i (+ i 1)))
       ;; Return found C name or default
       (if found-c-name c-name default-name)))
-
-  ;; ============================================================
-  ;; Public API Tracking (for library header generation)
-  ;; ============================================================
-
-  (fn ctx-add-public-func ((ctx (Ptr TranspileContext)) (info PublicFuncInfo))
-    (@intent "Register a public function for library header generation")
-    (@spec (((Ptr TranspileContext) PublicFuncInfo) -> Unit))
-    (@pre {ctx != nil})
-    (list-push (. (deref ctx) public-funcs) info))
-
-  (fn ctx-get-public-funcs ((ctx (Ptr TranspileContext)))
-    (@intent "Get all registered public functions")
-    (@spec (((Ptr TranspileContext)) -> (List PublicFuncInfo)))
-    (@pre {ctx != nil})
-    (. (deref ctx) public-funcs))
-
-  (fn ctx-has-public-funcs ((ctx (Ptr TranspileContext)))
-    (@intent "Check if there are any public functions registered")
-    (@spec (((Ptr TranspileContext)) -> Bool))
-    (@pre {ctx != nil})
-    (> (list-len (. (deref ctx) public-funcs)) 0))
-
-  (fn ctx-add-public-type ((ctx (Ptr TranspileContext)) (type-name String))
-    (@intent "Register a type as referenced by a public API function")
-    (@spec (((Ptr TranspileContext) String) -> Unit))
-    (@pre {ctx != nil})
-    ;; Check if already registered
-    (let ((types (. (deref ctx) public-types))
-          (len (list-len types))
-          (mut i 0)
-          (mut found false))
-      (while (and (< i len) (not found))
-        (match (list-get types i)
-          ((some t)
-            (when (string-eq t type-name)
-              (set! found true)))
-          ((none) (do)))
-        (set! i (+ i 1)))
-      (when (not found)
-        (list-push (. (deref ctx) public-types) type-name))))
-
-  (fn ctx-get-public-types ((ctx (Ptr TranspileContext)))
-    (@intent "Get all types referenced by public API functions")
-    (@spec (((Ptr TranspileContext)) -> (List String)))
-    (@pre {ctx != nil})
-    (. (deref ctx) public-types))
 
   ;; ============================================================
   ;; String Building Helpers

@@ -12,7 +12,7 @@
     prescan-module process-imports process-exports
     emit-all-types emit-all-functions
     ;; Output generation
-    generate-c-output generate-public-header
+    generate-c-output
     ;; Result type helpers (for defn.slop)
     build-result-type-name)
 
@@ -31,7 +31,6 @@
                    ctx-get-inline-records InlineRecord
                    ctx-add-c-name-alias ctx-get-c-name-aliases FuncCNameAlias extract-fn-c-name
                    ctx-add-import ctx-get-imports
-                   PublicFuncInfo ctx-get-public-funcs ctx-has-public-funcs ctx-get-public-types
                    ctx-str ctx-str3 ctx-str4 ctx-str5 TypeEntry FuncEntry FuncParamType
                    to-c-type-prefixed
                    ctx-mark-type-emitted ctx-is-type-emitted
@@ -2997,90 +2996,6 @@
           ((none) (do)))
         (set! i (+ i 1)))
       result))
-
-  (fn generate-public-header ((ctx (Ptr TranspileContext)) (module-name String))
-    (@intent "Generate public API header for library builds")
-    (@spec (((Ptr TranspileContext) String) -> String))
-    (@pre {ctx != nil})
-    ;; Only generate if there are public functions (functions with :c-name)
-    (if (not (ctx-has-public-funcs ctx))
-      ""
-      (let ((arena (. (deref ctx) arena))
-            (c-module-name (to-c-name arena module-name))
-            (guard (ctx-str3 ctx (string-to-upper arena c-module-name) "_PUBLIC_H" ""))
-            (mut result ""))
-        ;; Header guard open
-        (set! result (ctx-str3 ctx result "#ifndef " guard))
-        (set! result (ctx-str ctx result "\n"))
-        (set! result (ctx-str3 ctx result "#define " guard))
-        (set! result (ctx-str ctx result "\n\n"))
-        ;; Standard includes
-        (set! result (ctx-str ctx result "#include <stdint.h>\n"))
-        (set! result (ctx-str ctx result "#include <stdbool.h>\n"))
-        (set! result (ctx-str ctx result "#include <string.h>\n\n"))
-        ;; String helper (for slop_string interop)
-        (set! result (ctx-str ctx result "/* String type for SLOP interop */\n"))
-        (set! result (ctx-str ctx result "typedef struct { uint8_t* data; size_t len; } slop_string;\n\n"))
-        (set! result (ctx-str ctx result "static inline slop_string slop_str(const char* s) {\n"))
-        (set! result (ctx-str ctx result "    return (slop_string){ .data = (uint8_t*)s, .len = strlen(s) };\n"))
-        (set! result (ctx-str ctx result "}\n\n"))
-        ;; Emit public types (TODO: for now just a placeholder - would need to emit actual type definitions)
-        (let ((public-types (ctx-get-public-types ctx))
-              (type-count (list-len public-types)))
-          (when (> type-count 0)
-            (set! result (ctx-str ctx result "/* Types used by public API */\n"))
-            ;; Note: Full type emission would require storing type definitions in context
-            ;; For now, just emit forward declarations for struct types
-            (let ((mut i 0))
-              (while (< i type-count)
-                (match (list-get public-types i)
-                  ((some type-name)
-                    (let ((c-type-name (to-c-name arena type-name)))
-                      ;; Emit forward declaration - consumers will need the full header too
-                      (set! result (ctx-str5 ctx result "/* Forward decl: " c-type-name " - see module header for definition */\n" ""))))
-                  ((none) (do)))
-                (set! i (+ i 1))))
-            (set! result (ctx-str ctx result "\n"))))
-        ;; Emit public function declarations
-        (set! result (ctx-str ctx result "/* Public API functions */\n"))
-        (let ((public-funcs (ctx-get-public-funcs ctx))
-              (func-count (list-len public-funcs))
-              (mut i 0))
-          (while (< i func-count)
-            (match (list-get public-funcs i)
-              ((some info)
-                (let ((fn-name (. info clean-name))
-                      (param-str (. info param-str))
-                      (return-type (. info return-type)))
-                  ;; Emit: return_type fn_name(params);
-                  (set! result (ctx-str ctx result return-type))
-                  (set! result (ctx-str ctx result " "))
-                  (set! result (ctx-str ctx result fn-name))
-                  (set! result (ctx-str ctx result "("))
-                  (set! result (ctx-str ctx result (if (string-eq param-str "") "void" param-str)))
-                  (set! result (ctx-str ctx result ");\n"))))
-              ((none) (do)))
-            (set! i (+ i 1))))
-        ;; Header guard close
-        (set! result (ctx-str ctx result "\n#endif\n"))
-        result)))
-
-  (fn string-to-upper ((arena Arena) (s String))
-    (@intent "Convert string to uppercase")
-    (@spec ((Arena String) -> String))
-    (let ((len (cast Int (string-len s)))
-          (buf (arena-alloc arena (+ (cast U64 len) 1)))
-          (mut i 0))
-      (while (< i len)
-        (let ((c (@ (. s data) i)))
-          ;; Convert lowercase to uppercase (a-z: 97-122 -> A-Z: 65-90)
-          (if (and (>= c 97) (<= c 122))
-            (set! (@ (cast (Ptr U8) buf) i) (cast U8 (- c 32)))
-            (set! (@ (cast (Ptr U8) buf) i) c)))
-        (set! i (+ i 1)))
-      ;; Null terminate
-      (set! (@ (cast (Ptr U8) buf) len) 0)
-      (String (cast (Ptr U8) buf) (cast U64 len))))
 
   ;; ============================================================
   ;; File-level Transpilation

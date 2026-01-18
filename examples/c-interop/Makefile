@@ -23,4 +23,4 @@ run: main
 	./main
 
 clean:
-	rm -f main libmylib.a libmylib.c slop_mylib.h mylib_public.h
+	rm -f main libmylib.a libmylib.c slop_mylib.h
