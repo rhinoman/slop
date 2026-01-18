@@ -137,6 +137,7 @@ slop/
 │   ├── hello.slop           Minimal example
 │   ├── fibonacci.slop       Fibonacci sequence
 │   ├── http-server-threaded/ Multi-threaded HTTP server with worker pool
+│   ├── c-interop/           Calling SLOP libraries from C
 │   └── ...                  Additional examples
 └── tests/                   Test suite
 ```
@@ -379,7 +380,11 @@ WASM would also be easy to do since we're already transpiling to C.
 
 ## FFI and C Interoperability
 
-SLOP provides seamless FFI for calling C functions and mapping C struct layouts:
+SLOP provides seamless bidirectional FFI with C.
+
+### Calling C from SLOP
+
+Import C functions from headers and map C struct layouts:
 
 ```lisp
 ;; Import C functions from headers
@@ -396,6 +401,63 @@ SLOP provides seamless FFI for calling C functions and mapping C struct layouts:
 ```
 
 The `ffi-struct` form defines the exact memory layout matching the C struct, enabling direct interop with system libraries. Nested structs are supported via inline `ffi-struct` definitions.
+
+### Calling SLOP from C
+
+Build SLOP modules as libraries and call them from C code using the `:c-name` attribute:
+
+```lisp
+(module mylib
+  (type Config (record (timeout Int) (retries Int)))
+
+  (fn add-numbers ((a Int) (b Int))
+    (@intent "Add two numbers")
+    (@spec ((Int Int) -> Int))
+    (+ a b)
+    :c-name "mylib_add")
+
+  (fn create-config ((timeout Int) (retries Int))
+    (@intent "Create a config struct")
+    (@spec ((Int Int) -> Config))
+    (Config timeout retries)
+    :c-name "mylib_create_config"))
+```
+
+Build as a static or shared library:
+
+```bash
+# Build static library
+slop build mylib.slop --library static -o libmylib
+
+# Build shared library
+slop build mylib.slop --library shared -o libmylib
+```
+
+This generates:
+- `libmylib.a` or `libmylib.so` - The compiled library
+- `slop_mylib.h` - Module header with all type definitions
+- `mylib_public.h` - Public API header with clean function names
+
+The public header provides a clean C interface:
+
+```c
+#include "slop_mylib.h"    // Type definitions
+#include "mylib_public.h"  // Public API declarations
+
+int main(void) {
+    int64_t sum = mylib_add(10, 20);
+    mylib_Config cfg = mylib_create_config(60, 5);
+    return 0;
+}
+```
+
+Compile and link:
+
+```bash
+cc -o main main.c -L. -lmylib -I/path/to/slop/src/slop/runtime
+```
+
+See `examples/c-interop/` for a complete working example.
 
 ## Memory Model
 
@@ -422,6 +484,7 @@ Arena allocation handles 90% of cases:
 - ✓ Concurrency primitives (channels, spawn/join via `lib/std/thread`)
 - ✓ Runtime contract assertions (`SLOP_PRE`/`SLOP_POST` macros)
 - ✓ FFI struct mapping (`ffi-struct` for C struct layouts)
+- ✓ C interop libraries (`:c-name` for clean exports, public header generation)
 - ✓ Hole extraction, classification, and tiered model routing
 - ✓ LLM providers (Ollama, OpenAI-compatible, Interactive, Multi-provider)
 - ✓ Hole filler with quality scoring and pattern library

@@ -52,7 +52,8 @@ class TestMath:
             tmpdir_path = Path(tmpdir)
             c_files = []
 
-            for mod_name, (header, impl) in results.items():
+            for mod_name, result_tuple in results.items():
+                header, impl = result_tuple[0], result_tuple[1]
                 # Write header (prefixed with slop_ to match transpiler includes)
                 c_mod_name = mod_name.replace('-', '_')
                 header_path = tmpdir_path / f"slop_{c_mod_name}.h"
@@ -84,7 +85,8 @@ class TestMath:
             if compile_result.returncode != 0:
                 # Print the generated C for debugging
                 print("=== Generated C files ===")
-                for mod_name, (header, impl) in results.items():
+                for mod_name, result_tuple in results.items():
+                    header, impl = result_tuple[0], result_tuple[1]
                     print(f"\n--- {mod_name}.h ---")
                     for i, line in enumerate(header.split("\n"), 1):
                         print(f"{i:4}: {line}")

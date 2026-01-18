@@ -137,7 +137,7 @@ literal     = number | string | 'true | 'false | 'nil
 ### 3.4 Function Definitions
 
 ```
-(fn name ((param1 Type1) (param2 Type2) ...) 
+(fn name ((param1 Type1) (param2 Type2) ...)
   annotations*
   body)
 
@@ -150,7 +150,17 @@ literal     = number | string | 'true | 'false | 'nil
 ; Memory context (explicit when needed)
 (fn name ((arena Arena) (param Type) ...)
   ...)  ; Allocations use arena
+
+; C name override for external interop
+(fn slop-parse-int ((s (Ptr Char)))
+  (@intent "Parse integer")
+  (@spec (((Ptr Char)) -> Int))
+  body
+  :c-name "parse_int")  ; Emits as parse_int() in C
 ```
+
+The `:c-name` attribute allows specifying a clean C name for external code to call.
+The transpiler emits both the clean name and a #define alias for the SLOP-prefixed name.
 
 ### 3.5 Annotations
 
