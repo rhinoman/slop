@@ -435,14 +435,12 @@ slop build mylib.slop --library shared -o libmylib
 
 This generates:
 - `libmylib.a` or `libmylib.so` - The compiled library
-- `slop_mylib.h` - Module header with all type definitions
-- `mylib_public.h` - Public API header with clean function names
+- `slop_mylib.h` - Module header with type definitions and `#define` aliases for `:c-name` functions
 
-The public header provides a clean C interface:
+Use the module header in your C code:
 
 ```c
-#include "slop_mylib.h"    // Type definitions
-#include "mylib_public.h"  // Public API declarations
+#include "slop_mylib.h"
 
 int main(void) {
     int64_t sum = mylib_add(10, 20);
