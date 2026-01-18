@@ -43,7 +43,8 @@
     char-at
     char-is-symbol-start
     char-is-symbol-char
-    char-is-operator)
+    char-is-operator
+    fill-bytes)
 
   (ffi "ctype.h"
     (isalpha ((c Int)) Int)
@@ -899,4 +900,11 @@
       (== c 94)
       (== c 37)
       (== c 63)
-      (== c 46))))
+      (== c 46)))
+
+  (fn fill-bytes ((ptr (Ptr U8)) (value U8) (len (Int 0 ..)))
+    (@intent "Fill memory region with a byte value")
+    (@spec (((Ptr U8) U8 (Int 0 ..)) -> Unit))
+    (do
+      (memset (cast (Ptr Void) ptr) (cast Int value) (cast U64 len))
+      unit)))

@@ -14,6 +14,9 @@
   ;; Import thread library
   (import thread (chan-buffered send recv spawn-with-chan ChanError))
 
+  ;; Import string library
+  (import strlib (contains fill-bytes))
+
   ;; FFI for sockets - use :c-name to alias to actual C functions
   ;; Channel send/recv from thread import become thread_send/thread_recv in C
   (ffi "sys/socket.h"
@@ -27,10 +30,6 @@
 
   (ffi "unistd.h"
     (close ((fd Int)) Int))
-
-  (ffi "string.h"
-    (strstr ((haystack (Ptr U8)) (needle (Ptr U8))) (Ptr U8))
-    (memset ((ptr (Ptr Void)) (val Int) (len U64)) (Ptr Void)))
 
   (ffi "arpa/inet.h"
     (htons ((port U16)) U16))
@@ -81,14 +80,16 @@
           ;; Handle this client request
           (with-arena 4096
             (let ((buf (arena-alloc arena 4096)))
-              ;; Read HTTP request
-              (sock-recv client buf 4095 0)
-
-              ;; Route and send response
-              (let ((resp (if (!= (strstr buf (. "GET /health" data)) nil)
-                            (response-ok)
-                            (response-404))))
-                (sock-send client (cast (Ptr Void) (. resp data)) (. resp len) 0))
+              ;; Read HTTP request and capture bytes read
+              (let ((bytes-read (sock-recv client buf 4095 0)))
+                (when (> bytes-read 0)
+                  ;; Convert buffer to String for pattern matching
+                  (let ((request (String (cast (Ptr U8) buf) (cast U64 bytes-read))))
+                    ;; Route and send response
+                    (let ((resp (if (contains request "GET /health")
+                                  (response-ok)
+                                  (response-404))))
+                      (sock-send client (cast (Ptr Void) (. resp data)) (. resp len) 0)))))
 
               ;; Close client connection
               (close client))))
@@ -122,7 +123,7 @@
             (setsockopt sock 1 2 (cast (Ptr Void) opt) 4)
 
             ;; Zero out sockaddr_in
-            (memset addr 0 (cast U64 (sizeof sockaddr_in)))
+            (fill-bytes (cast (Ptr U8) addr) 0 (sizeof sockaddr_in))
 
             ;; Configure address (AF_INET=2, INADDR_ANY=0)
             (set! addr.sin_family 2)

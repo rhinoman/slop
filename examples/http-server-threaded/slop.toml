@@ -3,7 +3,7 @@ name = "http-server-threaded"
 entry = "http-server-threaded.slop"
 
 [build]
-include = ["../../lib/std/thread" ]
+include = ["../../lib/std/thread", "../../lib/std/strlib"]
 
 [build.link]
 libraries = ["pthread"]
